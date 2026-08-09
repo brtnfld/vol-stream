@@ -42,6 +42,19 @@
 #include "H5PLextern.h"
 #include "H5VLstream.h"
 
+/* Pin the VOL class struct version.
+ *
+ * The connector compiles H5VL_VERSION into its class struct, and a library
+ * expecting a different one rejects it at load time -- the failure that broke
+ * the ADIOS2 connector when H5VL_VERSION moved. Fail at compile time with a
+ * readable message instead, since the load-time error is opaque.
+ */
+#ifndef H5VL_STREAM_SKIP_VERSION_CHECK
+#if H5VL_VERSION < 2 || H5VL_VERSION > 3
+#error "vol-stream is tested against H5VL_VERSION 2 and 3. Define H5VL_STREAM_SKIP_VERSION_CHECK to build anyway, and expect to audit the H5VL_class_t layout."
+#endif
+#endif
+
 /**********/
 /* Macros */
 /**********/
@@ -58,6 +71,20 @@
 typedef struct H5VL_stream_t {
     hid_t under_vol_id; /* ID for underlying VOL connector */
     void *under_object; /* Info object for underlying VOL connector */
+
+    /* Step state.
+     *
+     * Meaningful only on file objects. Every wrapper is calloc'd and
+     * H5F_STEP_NOT_IN_STEP is 0, so non-file objects correctly carry "no step".
+     *
+     * M1 tracks state without capturing anything: this makes step_status
+     * truthful and lets misordered calls be rejected, which M2 relies on, while
+     * leaving the bytes written completely unchanged.
+     */
+    H5F_step_status_t step_state;
+    uint64_t          physical_step; /* next step number to assign */
+    uint64_t         *logical_ids;   /* ids carried by the open step */
+    size_t            n_logical;
 } H5VL_stream_t;
 
 /* The pass through VOL wrapper context */
@@ -470,6 +497,7 @@ H5VL_stream_free_obj(H5VL_stream_t *obj)
 
     H5Eset_current_stack(err_id);
 
+    free(obj->logical_ids);
     free(obj);
 
     return 0;
@@ -1960,9 +1988,47 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
      * bracketing -- which is exactly what the M1 exit gate asserts.
      */
     if (args->op_type == H5VL_stream_op_begin_step) {
+        H5VL_stream_args_begin_step_t *sargs = (H5VL_stream_args_begin_step_t *)args->args;
+
+        if (!sargs)
+            return -1;
+
+        /* Nested steps are not a thing: a step is the unit of atomicity, so an
+         * unclosed one is a bug in the caller rather than something to
+         * silently absorb. */
+        if (o->step_state != H5F_STEP_NOT_IN_STEP)
+            return -1;
+
+        /* Take our own copy of the logical ids -- the caller's array is only
+         * required to live for the duration of the call. */
+        free(o->logical_ids);
+        o->logical_ids = NULL;
+        o->n_logical   = 0;
+
+        if (sargs->n_logical > 0) {
+            if (NULL == (o->logical_ids = (uint64_t *)malloc(sargs->n_logical * sizeof(uint64_t))))
+                return -1;
+            memcpy(o->logical_ids, sargs->logical_ids, sargs->n_logical * sizeof(uint64_t));
+            o->n_logical = sargs->n_logical;
+        }
+
+        o->step_state = H5F_STEP_IN_STEP;
         return 0;
     }
     else if (args->op_type == H5VL_stream_op_end_step) {
+        if (o->step_state != H5F_STEP_IN_STEP)
+            return -1;
+
+        /* M2 emits the manifest here. At M1 the transition itself is the whole
+         * operation, which is what keeps the written bytes identical. */
+        o->step_state = H5F_STEP_COMMITTING;
+
+        free(o->logical_ids);
+        o->logical_ids = NULL;
+        o->n_logical   = 0;
+
+        o->physical_step++;
+        o->step_state = H5F_STEP_NOT_IN_STEP;
         return 0;
     }
     else if (args->op_type == H5VL_stream_op_step_status) {
@@ -1970,10 +2036,24 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
 
         if (!sargs || !sargs->status)
             return -1;
-        *sargs->status = H5F_STEP_NOT_IN_STEP;
+
+        *sargs->status = o->step_state;
         return 0;
     }
     else if (args->op_type == H5VL_stream_op_subscribe) {
+        H5VL_stream_args_subscribe_t *sargs = (H5VL_stream_args_subscribe_t *)args->args;
+
+        if (!sargs)
+            return -1;
+
+        /* Validate now, act in M8: a subscription naming a path that cannot be
+         * expressed should fail where the caller made the mistake. */
+        for (size_t i = 0; i < sargs->count; i++) {
+            if (!sargs->paths[i] || sargs->paths[i][0] == '\0')
+                return -1;
+            if (H5Sget_simple_extent_ndims(sargs->spaces[i]) < 0)
+                return -1;
+        }
         return 0;
     }
 

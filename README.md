@@ -4,10 +4,11 @@ An HDF5 VOL connector for **streaming** — step-based, reader-driven data movem
 between a running simulation and whatever consumes its output, without going
 through a filesystem.
 
-> **Status: M0.** This is the pass-through skeleton. Every callback forwards to the
-> underlying connector unchanged, so behaviour is identical to native HDF5. The
-> step API is registered and discoverable but is a no-op. Nothing here is a
-> supported HDF Group product, and the design is not yet reviewed.
+> **Status: M1.** Every callback forwards to the underlying connector unchanged, so
+> behaviour is identical to native HDF5 — asserted byte-for-byte. The step API is
+> registered, discoverable, and tracks step state, but captures no data yet.
+> Nothing here is a supported HDF Group product, and the design is not yet
+> reviewed.
 
 ## Why
 
@@ -103,7 +104,7 @@ VOL, which also ships `H5F*` calls from an out-of-tree connector.
 |---|---|
 | `H5Fbegin_step(fid, n, ids)` | Open a step, carrying zero or more *logical* step ids |
 | `H5Fend_step(fid)` | Commit it atomically |
-| `H5Fstep_status(fid, &st)` | Query step state |
+| `H5Fstep_status(fid, &st)` | Query step state (`NOT_IN_STEP`, `IN_STEP`, `COMMITTING`, `EOS`) |
 | `H5Fsubscribe(fid, n, paths, spaces, plists)` | Reader declares interest |
 
 The logical ids are deliberately separate from the connector's monotone physical
@@ -140,8 +141,19 @@ set up a keystore.
 
 ## Testing
 
-`ctest` runs a smoke test that checks the connector loads, is actually the one in
-use, round-trips data, and has its step operations registered and queryable.
+`ctest` runs two tests. The **smoke** test checks the connector loads, is
+actually the one in use, round-trips data, and has its step operations registered
+and queryable. The **step** test is the M1 gate: it writes the same content three
+ways — native, through the connector, and through the connector with every write
+bracketed in a step — and requires all three files to be **byte-identical**, then
+exercises the step state machine including the calls that must be refused.
+
+Byte-identity needs `H5Pset_obj_track_times(..., false)` on both the FCPL and the
+DCPL. Object headers store four timestamps by default, and disabling them on the
+dataset alone is not enough because the root group is created with the file — so
+two otherwise identical files written seconds apart differ in 8 bytes. The test
+also tampers with a copy and requires the comparison to catch it, so a passing
+byte-identity assertion means something.
 
 The real **M0 exit gate** is HDF5's own API test suite, run natively and through
 the connector, requiring the two to be *indistinguishable* — not merely that the
@@ -156,8 +168,8 @@ is meant to catch. It needs an HDF5 built with `-DHDF5_TEST_API=ON`:
 
 | | Milestone | Status |
 |---|---|---|
-| M0 | Skeleton, CI, regression net | **in progress** |
-| M1 | Step API surface, as no-ops | partially landed |
+| M0 | Skeleton, CI, regression net | done |
+| M1 | Step API surface and step state | done |
 | M2 | flatcc manifest, capture, replay invariant | |
 | M3 | Decoupled reader | |
 | M4 | Mercury transport, Margo progress, deferred I/O | |

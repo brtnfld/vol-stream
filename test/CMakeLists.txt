@@ -1,8 +1,12 @@
-add_executable(t_smoke t_smoke.c)
-target_link_libraries(t_smoke PRIVATE vol_stream)
+foreach(t t_smoke t_step)
+  add_executable(${t} ${t}.c)
+  target_link_libraries(${t} PRIVATE vol_stream)
+endforeach()
 
 add_test(NAME smoke COMMAND t_smoke)
-set_tests_properties(smoke PROPERTIES
+add_test(NAME step COMMAND t_step)
+
+set_tests_properties(smoke step PROPERTIES
   ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
 )
 
