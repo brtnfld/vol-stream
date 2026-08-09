@@ -1,0 +1,13 @@
+# build trees
+bld/
+bld*/
+build/
+_build/
+
+# never commit signing keys
+*.pem
+keystore/
+
+# test artifacts
+*.h5
+api-suite-results/

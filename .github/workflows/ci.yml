@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build and smoke-test against several HDF5 versions.
+  #
+  # Version skew is the failure mode with precedent: the ADIOS2 connector broke
+  # when H5VL_VERSION moved and its declared version no longer matched. It is 3
+  # today and will move again, so this matrix exists from M0 rather than after
+  # the first bug report.
+  # ---------------------------------------------------------------------------
+  build:
+    name: hdf5 ${{ matrix.hdf5 }} / ${{ matrix.mpi }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - hdf5: develop
+            mpi: mpich
+          - hdf5: hdf5_1_14
+            mpi: mpich
+          # Intercommunicator and dynamic-process behaviour differ between MPI
+          # implementations in practice, so both are tested from the start.
+          - hdf5: develop
+            mpi: openmpi
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          if [ "${{ matrix.mpi }}" = "mpich" ]; then
+            sudo apt-get install -y mpich libmpich-dev
+          else
+            sudo apt-get install -y openmpi-bin libopenmpi-dev
+          fi
+          sudo apt-get install -y cmake ninja-build zlib1g-dev
+
+      - name: Build HDF5 ${{ matrix.hdf5 }}
+        run: |
+          git clone --depth 1 --branch ${{ matrix.hdf5 }} \
+            https://github.com/HDFGroup/hdf5.git hdf5-src
+          cmake -S hdf5-src -B hdf5-build -G Ninja \
+            -DCMAKE_INSTALL_PREFIX=$PWD/hdf5-install \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DHDF5_ENABLE_PARALLEL=ON \
+            -DBUILD_TESTING=ON \
+            -DHDF5_TEST_API=ON \
+            -DHDF5_BUILD_TOOLS=ON \
+            -DHDF5_BUILD_EXAMPLES=OFF \
+            -DHDF5_BUILD_FORTRAN=OFF \
+            -DHDF5_BUILD_CPP_LIB=OFF
+          cmake --build hdf5-build --parallel
+          cmake --install hdf5-build
+
+      - name: Report H5VL_VERSION
+        run: |
+          grep -E "define H5VL_VERSION" hdf5-install/include/H5VLpublic.h || true
+
+      - name: Build vol-stream
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_PREFIX_PATH=$PWD/hdf5-install \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build --parallel
+
+      - name: Smoke test
+        run: ctest --test-dir build --output-on-failure
+
+      # -----------------------------------------------------------------------
+      # The M0 exit gate. Runs HDF5's own API suite natively and through the
+      # connector and requires the two to be indistinguishable -- not merely
+      # that the connector run passes, since a pass silently becoming a skip is
+      # exactly the regression this is meant to catch.
+      # -----------------------------------------------------------------------
+      - name: API conformance gate
+        run: |
+          ./test/run_api_suite.sh \
+            --api-bin  $PWD/hdf5-build/bin \
+            --plugin-dir $PWD/build \
+            --outdir  $PWD/api-results
+
+      - name: Upload API suite logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-results-${{ matrix.hdf5 }}-${{ matrix.mpi }}
+          path: api-results/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Sanitizers. A background progress thread plus a step queue is the classic
+  # place for races, so TSan is in the matrix before the queue exists rather
+  # than after it misbehaves.
+  # ---------------------------------------------------------------------------
+  sanitizers:
+    name: ${{ matrix.san }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        san: [address, undefined, thread]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build zlib1g-dev libhdf5-dev
+
+      - name: Build with -fsanitize=${{ matrix.san }}
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_FLAGS="-fsanitize=${{ matrix.san }} -fno-omit-frame-pointer -g"
+          cmake --build build --parallel
+
+      - name: Smoke test
+        run: ctest --test-dir build --output-on-failure

@@ -1,0 +1,169 @@
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ * Copyright by The HDF Group.                                               *
+ * All rights reserved.                                                      *
+ *                                                                           *
+ * This file is part of vol-stream, and is derived from the HDF5 pass-through *
+ * VOL connector (src/H5VLpassthru.h).  The full HDF5 copyright notice,       *
+ * including terms governing use, modification, and redistribution, is        *
+ * contained in the LICENSE file, which can be found at the root of the       *
+ * source code distribution tree, or in https://www.hdfgroup.org/licenses.    *
+ * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+/*
+ * Purpose:     Public header for the vol-stream VOL connector.
+ *
+ *              M0 status: this is the pass-through skeleton.  Every callback
+ *              forwards to the underlying connector unchanged, so behaviour is
+ *              identical to native HDF5.  The step API declared below is
+ *              registered and queryable but is a no-op until M1/M2.
+ */
+
+#ifndef H5VLstream_H
+#define H5VLstream_H
+
+#include "H5VLpublic.h" /* Virtual Object Layer */
+
+/* Identifier for the vol-stream connector */
+#define H5VL_STREAM (H5OPEN H5VL_STREAM_g)
+
+/* Characteristics of the vol-stream connector.
+ *
+ * NOTE: H5VL_STREAM_VALUE is PROVISIONAL.  Values below H5_VOL_RESERVED (256)
+ * are reserved for HDF5 library use; anything at or above it is available, but
+ * there is no automatic collision check between third-party connectors.  An
+ * official value should be requested from The HDF Group before any release.
+ */
+#define H5VL_STREAM_NAME    "vol-stream"
+#define H5VL_STREAM_VALUE   1091 /* provisional; see note above */
+#define H5VL_STREAM_VERSION 0
+
+/* vol-stream connector info */
+typedef struct H5VL_stream_info_t {
+    hid_t under_vol_id;   /* VOL ID for underlying connector   */
+    void *under_vol_info; /* VOL info for underlying connector */
+} H5VL_stream_info_t;
+
+/* The connector is built with hidden visibility so its ~140 internal callbacks
+ * stay private; the public step API below is exported deliberately.
+ */
+#if defined(_MSC_VER)
+#define H5VL_STREAM_API __declspec(dllexport)
+#elif defined(__GNUC__) && (__GNUC__ >= 4)
+#define H5VL_STREAM_API __attribute__((visibility("default")))
+#else
+#define H5VL_STREAM_API
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Global holding the connector ID (set when the connector registers) */
+H5VL_STREAM_API extern hid_t H5VL_STREAM_g;
+
+/*-------------------------------------------------------------------------
+ * Step API
+ *
+ * These are thin wrappers over H5VLfile_optional_op(), invoking operations
+ * the connector registers with H5VLregister_opt_operation() at init time.
+ * No HDF5 library change is required for any of this.
+ *
+ * The H5F* naming follows the convention set by the HDF5 Async VOL, which
+ * also ships H5F-namespaced calls from an out-of-tree connector.  A step is a
+ * file-scoped transaction, so the file namespace is where it belongs.
+ *
+ * M0: registered, queryable via H5VLquery_optional(), and no-ops.
+ *-------------------------------------------------------------------------*/
+
+/* Operation names as registered in the optional-op registry.  Namespaced so
+ * two connectors cannot collide, and so a future connector wanting source
+ * compatibility can register the same strings.
+ */
+#define H5VL_STREAM_OP_BEGIN_STEP  "vol-stream:begin_step"
+#define H5VL_STREAM_OP_END_STEP    "vol-stream:end_step"
+#define H5VL_STREAM_OP_STEP_STATUS "vol-stream:step_status"
+#define H5VL_STREAM_OP_SUBSCRIBE   "vol-stream:subscribe"
+
+/** Status of the current step */
+typedef enum H5F_step_status_t {
+    H5F_STEP_NOT_IN_STEP = 0, /**< No step is open                     */
+    H5F_STEP_IN_STEP     = 1, /**< A step is open and accepting writes */
+    H5F_STEP_COMMITTING  = 2, /**< end_step in progress                */
+    H5F_STEP_EOS         = 3  /**< Writer closed; no further steps     */
+} H5F_step_status_t;
+
+/**
+ * \brief Open a step on \p file_id.
+ *
+ * Collective over the file's communicator when the file was opened with MPI.
+ *
+ * \param file_id      File opened through the vol-stream connector
+ * \param n_logical    Number of logical step ids (may be 0)
+ * \param logical_ids  Logical step ids this step carries, or NULL
+ *
+ * \return \herr_t
+ *
+ * \note The logical ids are deliberately separate from the connector's own
+ *       monotone physical step counter.  A restart from a checkpoint replays
+ *       logical ids that have already been seen, and a single monotone counter
+ *       cannot represent that -- a problem openPMD hit in production against
+ *       ADIOS2 and solved with an explicit annotation.
+ */
+H5VL_STREAM_API herr_t H5Fbegin_step(hid_t file_id, size_t n_logical, const uint64_t *logical_ids);
+
+/**
+ * \brief Commit the open step on \p file_id.
+ *
+ * Waits for every deferred operation issued since H5Fbegin_step(), validates
+ * the step, and publishes it atomically.  Collective, as above.
+ *
+ * \param file_id  File opened through the vol-stream connector
+ * \return \herr_t
+ */
+H5VL_STREAM_API herr_t H5Fend_step(hid_t file_id);
+
+/**
+ * \brief Query the step state of \p file_id.
+ *
+ * \param file_id  File opened through the vol-stream connector
+ * \param status   Out: current step status
+ * \return \herr_t
+ */
+H5VL_STREAM_API herr_t H5Fstep_status(hid_t file_id, H5F_step_status_t *status);
+
+/**
+ * \brief Declare reader interest in part of a stream.
+ *
+ * Each entry is an object path plus a dataspace whose selection bounds the
+ * region wanted, and optionally a dataset creation property list requesting a
+ * filter pipeline -- which is how per-subscriber precision is expressed
+ * without a new codec.  The writer marshals only what is subscribed.
+ *
+ * \param file_id  File opened through the vol-stream connector for reading
+ * \param count    Number of entries
+ * \param paths    Object paths
+ * \param spaces   Dataspace IDs carrying the wanted selection
+ * \param plists   DCPL IDs requesting a filter pipeline, or NULL
+ * \return \herr_t
+ *
+ * \note M0/M1 accept and record subscriptions without acting on them; the
+ *       protocol lands in M8.
+ */
+H5VL_STREAM_API herr_t H5Fsubscribe(hid_t file_id, size_t count, const char *const *paths, const hid_t *spaces,
+                    const hid_t *plists);
+
+/**
+ * \brief Register the vol-stream connector and return its ID.
+ *
+ * Not needed when loading the connector as a plugin via HDF5_VOL_CONNECTOR;
+ * provided for applications that link it directly.
+ *
+ * \return Connector ID on success, H5I_INVALID_HID on failure
+ */
+H5VL_STREAM_API hid_t H5VL_stream_register(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* H5VLstream_H */

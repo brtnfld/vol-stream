@@ -1,0 +1,46 @@
+# Pinned development environment for vol-stream.
+#
+# Checked in from M0 so a build is reproducible and an upstream change shows up
+# as a CI failure on the floating environment rather than as a broken install
+# for a user. CI runs this pinned environment and a floating one; see
+# .github/workflows/ci.yml.
+#
+#   spack env create vol-stream spack/spack.yaml
+#   spack env activate vol-stream
+#   spack install
+#
+# The Mochi packages needed from M4 onward are not all in builtin Spack. Add
+# their namespace first:
+#
+#   git clone https://github.com/mochi-hpc/mochi-spack-packages
+#   spack repo add mochi-spack-packages
+#
+spack:
+  specs:
+    # M0-M3: the connector needs only HDF5 itself.
+    # HDF5_TEST_API is what produces the h5_api_test_* binaries the M0 exit
+    # gate runs; without it there is nothing to compare against.
+    - hdf5@develop +mpi +hl api_tests=true
+    - mpich
+    - cmake
+    - pkgconf
+
+    # M2: manifest framing. flatcc is FlatBuffers for C -- zero-copy reads and
+    # real schema evolution, so adding the M8 predicate field later is a
+    # compatible change rather than a format break.
+    # - flatcc
+
+    # M4-M5: transport, progress engine, and group membership. Mercury and
+    # Argobots are builtin Spack packages; margo, ssg and bake come from the
+    # Mochi namespace above.
+    # - mercury
+    # - argobots
+    # - mochi-margo
+    # - mochi-ssg
+
+    # M7: queue spill to node-local storage.
+    # - mochi-bake
+
+  view: true
+  concretizer:
+    unify: true
