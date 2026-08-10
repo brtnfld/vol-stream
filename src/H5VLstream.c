@@ -2758,22 +2758,31 @@ herr_t
 H5VL_stream_introspect_get_cap_flags(const void *_info, uint64_t *cap_flags)
 {
     const H5VL_stream_info_t *info = (const H5VL_stream_info_t *)_info;
+    H5VL_stream_info_t       *default_info = NULL;
     herr_t                          ret_value;
 
 #ifdef ENABLE_STREAM_LOGGING
     printf("------- VOL-STREAM INTROSPECT GetCapFlags\n");
 #endif
 
-    /* Make sure the underneath VOL of this vol-stream is specified */
+    /* H5Pget_vol_cap_flags() can reach here with no connector info at all --
+     * e.g. after H5Pset_vol(fapl, vol_id, NULL), which is one of the two
+     * natural no-info ways to use a connector documented at
+     * H5VL__stream_default_info(). Default to native there, same as
+     * file_create/file_open/file_specific, instead of failing a call that
+     * should be harmless.
+     */
     if (!info) {
-        printf("\nH5VLstream.c line %d in %s: info for vol-stream can't be null\n", __LINE__,
-               __func__);
-        return -1;
+        if (NULL == (default_info = H5VL__stream_default_info()))
+            return -1;
+        info = default_info;
     }
 
     if (H5Iis_valid(info->under_vol_id) <= 0) {
         printf("\nH5VLstream.c line %d in %s: not a valid underneath VOL ID for vol-stream\n",
                __LINE__, __func__);
+        if (default_info)
+            H5VL_stream_info_free(default_info);
         return -1;
     }
 
@@ -2783,6 +2792,9 @@ H5VL_stream_introspect_get_cap_flags(const void *_info, uint64_t *cap_flags)
     /* Bitwise OR our capability flags in */
     if (ret_value >= 0)
         *cap_flags |= H5VL_stream_g.cap_flags;
+
+    if (default_info)
+        H5VL_stream_info_free(default_info);
 
     return ret_value;
 } /* end H5VL_stream_introspect_get_cap_flags() */

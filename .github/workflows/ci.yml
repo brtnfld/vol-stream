@@ -118,11 +118,31 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build zlib1g-dev libhdf5-dev
+          sudo apt-get install -y cmake ninja-build zlib1g-dev
+
+      # Ubuntu's libhdf5-dev is 1.10.10, below the 1.14 floor CMakeLists.txt
+      # enforces, so find_package(HDF5) fails before the sanitizer build ever
+      # starts. Build the same pinned release the main matrix uses instead of
+      # relying on the system package.
+      - name: Build HDF5 hdf5_1_14
+        run: |
+          git clone --depth 1 --branch hdf5_1_14 \
+            https://github.com/HDFGroup/hdf5.git hdf5-src
+          cmake -S hdf5-src -B hdf5-build -G Ninja \
+            -DCMAKE_INSTALL_PREFIX=$PWD/hdf5-install \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DHDF5_BUILD_TOOLS=OFF \
+            -DHDF5_BUILD_EXAMPLES=OFF \
+            -DHDF5_BUILD_FORTRAN=OFF \
+            -DHDF5_BUILD_CPP_LIB=OFF
+          cmake --build hdf5-build --parallel
+          cmake --install hdf5-build
 
       - name: Build with -fsanitize=${{ matrix.san }}
         run: |
           cmake -S . -B build -G Ninja \
+            -DCMAKE_PREFIX_PATH=$PWD/hdf5-install \
             -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_C_FLAGS="-fsanitize=${{ matrix.san }} -fno-omit-frame-pointer -g"
           cmake --build build --parallel
