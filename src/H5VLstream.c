@@ -42,6 +42,12 @@
 #include "H5PLextern.h"
 #include "H5VLstream.h"
 
+/* Generated from src/vol_stream.fbs by flatcc (see CMakeLists.txt). Pulls in
+ * vol_stream_reader.h and flatcc/flatcc_builder.h transitively -- the step
+ * manifest schema, and the builder/reader API used to serialize and decode it.
+ */
+#include "vol_stream_builder.h"
+
 /* Pin the VOL class struct version.
  *
  * The connector compiles H5VL_VERSION into its class struct, and a library
@@ -67,25 +73,77 @@
 /* Typedefs */
 /************/
 
-/* The pass through VOL info object */
-typedef struct H5VL_stream_t {
-    hid_t under_vol_id; /* ID for underlying VOL connector */
-    void *under_object; /* Info object for underlying VOL connector */
+/* Forward declarations: H5VL_stream_pending_entry_t and H5VL_stream_t refer to
+ * each other (a pending entry remembers the still-open placeholder wrapper
+ * that owns it; a wrapper remembers the file_state it was captured under). */
+typedef struct H5VL_stream_t             H5VL_stream_t;
+typedef struct H5VL_stream_file_state_t  H5VL_stream_file_state_t;
 
-    /* Step state.
-     *
-     * Meaningful only on file objects. Every wrapper is calloc'd and
-     * H5F_STEP_NOT_IN_STEP is 0, so non-file objects correctly carry "no step".
-     *
-     * M1 tracks state without capturing anything: this makes step_status
-     * truthful and lets misordered calls be rejected, which M2 relies on, while
-     * leaving the bytes written completely unchanged.
+/* One buffered create/write, captured while a step is open and not yet
+ * replayed into the real file. See the M2 architecture note above
+ * H5VL_stream_file_optional().
+ *
+ * kind is a vs_Kind_enum_t (DsetCreate, DsetWrite, or Attr -- M2 populates
+ * only these three). type_id/space_id/dcpl_id/dapl_id are live copies held
+ * only until end_step encodes and closes them; dcpl_id/dapl_id are
+ * H5I_INVALID_HID on a DsetWrite entry, which never has its own DCPL/DAPL.
+ */
+typedef struct H5VL_stream_pending_entry_t {
+    int            kind;
+    char          *path;
+    hid_t          type_id;
+    hid_t          space_id;
+    hid_t          dcpl_id;
+    hid_t          dapl_id;
+    uint8_t       *payload;
+    size_t         payload_len;
+    H5VL_stream_t *owner_wrapper; /* still-open placeholder handle, or NULL */
+} H5VL_stream_pending_entry_t;
+
+/* Step state and the pending-entry buffer for one open file. Refcounted: the
+ * file's own wrapper and every dataset/attribute/group/datatype wrapper
+ * opened under it borrow this pointer, so it outlives the file wrapper if a
+ * child object is still open when the file closes.
+ */
+struct H5VL_stream_file_state_t {
+    unsigned                     refcount;
+    H5F_step_status_t            step_state;
+    uint64_t                     physical_step; /* next step number to assign */
+    uint64_t                    *logical_ids;   /* ids carried by the open step */
+    size_t                       n_logical;
+    uint64_t                     wall_time_ns;  /* caller-supplied, see H5Fbegin_step */
+    H5VL_stream_pending_entry_t *pending;        /* growable array */
+    size_t                       n_pending;
+    size_t                       cap_pending;
+};
+
+/* Whether a wrapped object is a real, opened/created underlying object, or a
+ * bookkeeping placeholder standing in for a create+write deferred into the
+ * pending step manifest. H5VL_STREAM_OBJ_LIVE is 0, the calloc() default, so
+ * every object not explicitly made a placeholder is correctly LIVE. */
+typedef enum H5VL_stream_obj_state_t {
+    H5VL_STREAM_OBJ_LIVE        = 0,
+    H5VL_STREAM_OBJ_PLACEHOLDER = 1
+} H5VL_stream_obj_state_t;
+
+/* The pass through VOL info object */
+struct H5VL_stream_t {
+    hid_t under_vol_id; /* ID for underlying VOL connector */
+    void *under_object; /* Info object for underlying VOL connector; NULL while
+                          * obj_state == H5VL_STREAM_OBJ_PLACEHOLDER */
+
+    /* M2 step-capture bookkeeping. file_state is borrowed and refcounted (see
+     * H5VL__stream_file_state_incref/decref); path is this object's absolute
+     * path from the file root ("" for the file itself), or NULL when it
+     * cannot be resolved (BY_NAME/BY_IDX/BY_TOKEN entry points, object_open,
+     * wrap_object) -- capture is simply skipped for those, never incorrect.
      */
-    H5F_step_status_t step_state;
-    uint64_t          physical_step; /* next step number to assign */
-    uint64_t         *logical_ids;   /* ids carried by the open step */
-    size_t            n_logical;
-} H5VL_stream_t;
+    H5VL_stream_file_state_t *file_state;
+    char                     *path;
+    H5VL_stream_obj_state_t   obj_state;
+    size_t                    pending_index; /* valid only when obj_state ==
+                                               * H5VL_STREAM_OBJ_PLACEHOLDER */
+} /* H5VL_stream_t -- see forward-declared typedef above */;
 
 /* The pass through VOL wrapper context */
 typedef struct H5VL_stream_wrap_ctx_t {
@@ -100,6 +158,21 @@ typedef struct H5VL_stream_wrap_ctx_t {
 /* Helper routines */
 static H5VL_stream_t *H5VL_stream_new_obj(void *under_obj, hid_t under_vol_id);
 static herr_t               H5VL_stream_free_obj(H5VL_stream_t *obj);
+
+/* M2: step-capture helpers */
+static H5VL_stream_file_state_t *H5VL__stream_file_state_new(void);
+static void  H5VL__stream_file_state_incref(H5VL_stream_file_state_t *fs);
+static void  H5VL__stream_file_state_decref(H5VL_stream_file_state_t *fs);
+static void  H5VL__stream_pending_entry_clear(H5VL_stream_pending_entry_t *e);
+static void  H5VL__stream_pending_discard_all(H5VL_stream_file_state_t *fs);
+static char *H5VL__stream_child_path(const char *parent_path, const char *name);
+static H5VL_stream_t *H5VL__stream_new_child_obj(void *under_obj, hid_t under_vol_id,
+                             H5VL_stream_file_state_t *file_state, const char *parent_path,
+                             const char *name);
+static size_t H5VL__stream_pending_append(H5VL_stream_file_state_t *fs,
+                             const H5VL_stream_pending_entry_t *entry);
+static hid_t  H5VL__stream_resolve_space(hid_t space_id, hid_t fallback_space_id);
+static herr_t H5VL__stream_replay_step(H5VL_stream_t *file_obj);
 
 /* "Management" callbacks */
 static herr_t H5VL_stream_init(hid_t vipl_id);
@@ -277,6 +350,7 @@ static int H5VL_stream_op_subscribe   = -1;
 typedef struct H5VL_stream_args_begin_step_t {
     size_t          n_logical;
     const uint64_t *logical_ids;
+    uint64_t        wall_time_ns;
 } H5VL_stream_args_begin_step_t;
 
 typedef struct H5VL_stream_args_step_status_t {
@@ -497,11 +571,906 @@ H5VL_stream_free_obj(H5VL_stream_t *obj)
 
     H5Eset_current_stack(err_id);
 
-    free(obj->logical_ids);
+    free(obj->path);
+    if (obj->file_state)
+        H5VL__stream_file_state_decref(obj->file_state);
     free(obj);
 
     return 0;
 } /* end H5VL__stream_free_obj() */
+
+/*-------------------------------------------------------------------------
+ * M2 step-capture helpers
+ *
+ * Together these give every wrapped object a borrowed, refcounted pointer to
+ * its file's step state (H5VL_stream_file_state_t) and its own absolute path
+ * from the file root, without changing H5VL_stream_new_obj()'s signature at
+ * its ~30 existing call sites -- H5VL__stream_new_child_obj() wraps it.
+ *-------------------------------------------------------------------------
+ */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_file_state_new
+ *
+ * Purpose:     Allocate step state for a newly created/opened file. Returned
+ *              with refcount 1, representing the file wrapper's own
+ *              reference; H5VL__stream_new_child_obj() adds one more per
+ *              child object opened under the file.
+ *
+ * Return:      Success:    New, zeroed file state (step_state == 0 ==
+ *                           H5F_STEP_NOT_IN_STEP)
+ *              Failure:    NULL
+ *-------------------------------------------------------------------------
+ */
+static H5VL_stream_file_state_t *
+H5VL__stream_file_state_new(void)
+{
+    H5VL_stream_file_state_t *fs;
+
+    if (NULL == (fs = (H5VL_stream_file_state_t *)calloc(1, sizeof(H5VL_stream_file_state_t))))
+        return NULL;
+
+    fs->refcount = 1;
+
+    return fs;
+} /* end H5VL__stream_file_state_new() */
+
+static void
+H5VL__stream_file_state_incref(H5VL_stream_file_state_t *fs)
+{
+    fs->refcount++;
+} /* end H5VL__stream_file_state_incref() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_pending_entry_clear
+ *
+ * Purpose:     Release everything a pending entry owns: its live hid_t
+ *              copies (captured but never yet encoded), path, and payload.
+ *              Safe to call on an entry whose fields are still zeroed.
+ *-------------------------------------------------------------------------
+ */
+static void
+H5VL__stream_pending_entry_clear(H5VL_stream_pending_entry_t *e)
+{
+    if (e->type_id > 0)
+        H5Tclose(e->type_id);
+    if (e->space_id > 0)
+        H5Sclose(e->space_id);
+    if (e->dcpl_id > 0)
+        H5Pclose(e->dcpl_id);
+    if (e->dapl_id > 0)
+        H5Pclose(e->dapl_id);
+    free(e->path);
+    free(e->payload);
+    memset(e, 0, sizeof(*e));
+} /* end H5VL__stream_pending_entry_clear() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_pending_discard_all
+ *
+ * Purpose:     Drop every pending entry without replaying it -- used at
+ *              end_step after a successful replay, and at file_close if a
+ *              step was left open (an unclosed step was never durably
+ *              committed, consistent with the M1 stance that an unclosed
+ *              step is a bug in the caller rather than something to rescue).
+ *-------------------------------------------------------------------------
+ */
+static void
+H5VL__stream_pending_discard_all(H5VL_stream_file_state_t *fs)
+{
+    size_t i;
+
+    for (i = 0; i < fs->n_pending; i++)
+        H5VL__stream_pending_entry_clear(&fs->pending[i]);
+
+    free(fs->pending);
+    fs->pending     = NULL;
+    fs->n_pending   = 0;
+    fs->cap_pending = 0;
+} /* end H5VL__stream_pending_discard_all() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_file_state_decref
+ *
+ * Purpose:     Drop a reference; frees the pending-entry buffer and the
+ *              struct itself once the last wrapper (file or child) referring
+ *              to it closes.
+ *-------------------------------------------------------------------------
+ */
+static void
+H5VL__stream_file_state_decref(H5VL_stream_file_state_t *fs)
+{
+    if (--fs->refcount > 0)
+        return;
+
+    H5VL__stream_pending_discard_all(fs);
+    free(fs->logical_ids);
+    free(fs);
+} /* end H5VL__stream_file_state_decref() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_child_path
+ *
+ * Purpose:     Build an absolute path for a child of parent_path (the file
+ *              root's own path is ""). Returns NULL (propagating
+ *              "unresolvable") if parent_path is NULL.
+ *
+ * Return:      Success:    malloc'd path the caller owns
+ *              Failure:    NULL
+ *-------------------------------------------------------------------------
+ */
+static char *
+H5VL__stream_child_path(const char *parent_path, const char *name)
+{
+    char  *path;
+    size_t len;
+
+    if (!parent_path || !name)
+        return NULL;
+
+    len  = strlen(parent_path) + 1 /* '/' */ + strlen(name) + 1 /* '\0' */;
+    if (NULL == (path = (char *)malloc(len)))
+        return NULL;
+
+    snprintf(path, len, "%s/%s", parent_path, name);
+
+    return path;
+} /* end H5VL__stream_child_path() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_new_child_obj
+ *
+ * Purpose:     H5VL_stream_new_obj(), plus the M2 path/file_state bookkeeping
+ *              a child object (dataset, attribute, group, datatype) needs.
+ *              file_state may be NULL (an untraceable parent, e.g. the result
+ *              of wrap_object()); parent_path may be NULL (an unresolvable
+ *              creation entry point, e.g. BY_NAME/BY_IDX/BY_TOKEN) -- either
+ *              way the child is simply left without that piece of
+ *              bookkeeping rather than failing, so a non-BY_SELF create still
+ *              passes through correctly, just uncaptured.
+ *
+ * Return:      Success:    Pointer to the new wrapper
+ *              Failure:    NULL
+ *-------------------------------------------------------------------------
+ */
+static H5VL_stream_t *
+H5VL__stream_new_child_obj(void *under_obj, hid_t under_vol_id, H5VL_stream_file_state_t *file_state,
+                            const char *parent_path, const char *name)
+{
+    H5VL_stream_t *new_obj;
+
+    if (NULL == (new_obj = H5VL_stream_new_obj(under_obj, under_vol_id)))
+        return NULL;
+
+    if (file_state) {
+        new_obj->file_state = file_state;
+        H5VL__stream_file_state_incref(file_state);
+    }
+    new_obj->path = H5VL__stream_child_path(parent_path, name);
+
+    return new_obj;
+} /* end H5VL__stream_new_child_obj() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_pending_append
+ *
+ * Purpose:     Append a pending entry (by value -- the caller hands off
+ *              ownership of entry->path/payload/hid_t copies) to a file's
+ *              step buffer, growing it as needed.
+ *
+ * Return:      Success:    Index of the newly appended entry
+ *              Failure:    (size_t)-1
+ *-------------------------------------------------------------------------
+ */
+static size_t
+H5VL__stream_pending_append(H5VL_stream_file_state_t *fs, const H5VL_stream_pending_entry_t *entry)
+{
+    if (fs->n_pending == fs->cap_pending) {
+        size_t                        new_cap = fs->cap_pending ? fs->cap_pending * 2 : 8;
+        H5VL_stream_pending_entry_t *grown;
+
+        if (NULL == (grown = (H5VL_stream_pending_entry_t *)realloc(
+                         fs->pending, new_cap * sizeof(H5VL_stream_pending_entry_t))))
+            return (size_t)-1;
+
+        fs->pending     = grown;
+        fs->cap_pending = new_cap;
+    }
+
+    fs->pending[fs->n_pending] = *entry;
+
+    return fs->n_pending++;
+} /* end H5VL__stream_pending_append() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_resolve_space
+ *
+ * Purpose:     H5S_ALL (0) is a request to use "the obvious dataspace", not a
+ *              real dataspace id -- H5Sencode2() on it fails outright. Every
+ *              capture path reading a file_space_id/mem_space_id argument
+ *              must resolve it through this first.
+ *-------------------------------------------------------------------------
+ */
+static hid_t
+H5VL__stream_resolve_space(hid_t space_id, hid_t fallback_space_id)
+{
+    return (space_id == H5S_ALL) ? fallback_space_id : space_id;
+} /* end H5VL__stream_resolve_space() */
+
+/*-------------------------------------------------------------------------
+ * H5Tencode/H5Sencode2/H5Pencode2 all use a two-call size-then-fill idiom,
+ * with slightly different signatures (H5Tencode takes no fapl; H5Sencode2
+ * and H5Pencode2 do). Wrapping each lets H5VL__stream_replay_step() below
+ * read as the entry-by-entry replay logic it is.
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_encode_type(hid_t type_id, uint8_t **buf, size_t *len)
+{
+    size_t nalloc = 0;
+
+    if (H5Tencode(type_id, NULL, &nalloc) < 0)
+        return -1;
+    if (NULL == (*buf = (uint8_t *)malloc(nalloc)))
+        return -1;
+    if (H5Tencode(type_id, *buf, &nalloc) < 0) {
+        free(*buf);
+        *buf = NULL;
+        return -1;
+    }
+    *len = nalloc;
+    return 0;
+} /* end H5VL__stream_encode_type() */
+
+static herr_t
+H5VL__stream_encode_space(hid_t space_id, uint8_t **buf, size_t *len)
+{
+    size_t nalloc = 0;
+
+    if (H5Sencode2(space_id, NULL, &nalloc, H5P_DEFAULT) < 0)
+        return -1;
+    if (NULL == (*buf = (uint8_t *)malloc(nalloc)))
+        return -1;
+    if (H5Sencode2(space_id, *buf, &nalloc, H5P_DEFAULT) < 0) {
+        free(*buf);
+        *buf = NULL;
+        return -1;
+    }
+    *len = nalloc;
+    return 0;
+} /* end H5VL__stream_encode_space() */
+
+static herr_t
+H5VL__stream_encode_dcpl(hid_t dcpl_id, uint8_t **buf, size_t *len)
+{
+    size_t nalloc = 0;
+
+    if (H5Pencode2(dcpl_id, NULL, &nalloc, H5P_DEFAULT) < 0)
+        return -1;
+    if (NULL == (*buf = (uint8_t *)malloc(nalloc)))
+        return -1;
+    if (H5Pencode2(dcpl_id, *buf, &nalloc, H5P_DEFAULT) < 0) {
+        free(*buf);
+        *buf = NULL;
+        return -1;
+    }
+    *len = nalloc;
+    return 0;
+} /* end H5VL__stream_encode_dcpl() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_replay_ensure_group
+ *
+ * Purpose:     Open the group at abs_path under the file, creating it (and
+ *              any missing ancestors) if it does not exist yet. Used to land
+ *              a dataset's parent and an attribute's parent group that was
+ *              not itself created by a DsetCreate entry replayed earlier in
+ *              the same pass.
+ *
+ *              Walks one path component at a time rather than creating the
+ *              whole path in a single H5VLgroup_create() call with
+ *              H5Pset_create_intermediate_group() set: that property is read
+ *              from HDF5's internal API-context state (H5CX), which only the
+ *              *public* H5Gcreate2()/H5Dcreate2() wrappers populate from an
+ *              LCPL before dispatching -- calling the H5VL*-level create
+ *              functions directly, as replay does throughout, bypasses that
+ *              plumbing entirely and the property is silently not honored.
+ *              A single-level create against an already-resolved parent has
+ *              no such dependency, so walking sidesteps the problem rather
+ *              than working around it.
+ *
+ * Return:      Success:    Underlying group object (caller closes it)
+ *              Failure:    NULL
+ *-------------------------------------------------------------------------
+ */
+static void *
+H5VL__stream_replay_ensure_group(void *file_under, hid_t under_vol_id, const char *abs_path)
+{
+    H5VL_loc_params_t loc_params;
+    void              *cur;
+    int                cur_is_file;
+    const char        *p = abs_path;
+
+    memset(&loc_params, 0, sizeof(loc_params));
+    loc_params.type = H5VL_OBJECT_BY_SELF;
+
+    cur         = file_under;
+    cur_is_file = 1;
+
+    while (*p == '/')
+        p++;
+
+    while (*p) {
+        const char *slash    = strchr(p, '/');
+        size_t      seg_len  = slash ? (size_t)(slash - p) : strlen(p);
+        char        seg[256];
+        void       *next;
+        hid_t       err_id;
+
+        if (seg_len == 0 || seg_len >= sizeof(seg)) {
+            if (!cur_is_file)
+                H5VLgroup_close(cur, under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+            return NULL;
+        }
+        memcpy(seg, p, seg_len);
+        seg[seg_len] = '\0';
+
+        loc_params.obj_type = cur_is_file ? H5I_FILE : H5I_GROUP;
+
+        /* A missing group is the common case -- most of /step/<n>/ is fresh
+         * every step -- so probe quietly: swap in a scratch error stack
+         * (discarded on restore, so the caller's own stack sees no residue)
+         * and disable auto-print for the duration (the stack swap alone
+         * only stops the error from lingering -- HDF5's error macros print
+         * each frame synchronously as it is pushed, regardless of which
+         * stack it lands on). */
+        {
+            H5E_auto2_t old_func;
+            void       *old_data;
+
+            H5Eget_auto2(H5E_DEFAULT, &old_func, &old_data);
+            H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
+            err_id = H5Eget_current_stack();
+            next   = H5VLgroup_open(cur, &loc_params, under_vol_id, seg, H5P_GROUP_ACCESS_DEFAULT,
+                                    H5P_DATASET_XFER_DEFAULT, NULL);
+            H5Eset_current_stack(err_id);
+            H5Eset_auto2(H5E_DEFAULT, old_func, old_data);
+        }
+
+        if (!next)
+            next = H5VLgroup_create(cur, &loc_params, under_vol_id, seg, H5P_LINK_CREATE_DEFAULT,
+                                    H5P_GROUP_CREATE_DEFAULT, H5P_GROUP_ACCESS_DEFAULT,
+                                    H5P_DATASET_XFER_DEFAULT, NULL);
+
+        if (!cur_is_file)
+            H5VLgroup_close(cur, under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+
+        if (!next)
+            return NULL;
+
+        cur         = next;
+        cur_is_file = 0;
+
+        p = slash ? slash + 1 : p + seg_len;
+    }
+
+    return cur_is_file ? NULL : cur; /* abs_path had no components -- nothing to return */
+} /* end H5VL__stream_replay_ensure_group() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_replay_step
+ *
+ * Purpose:     The M2 core. Encodes file_obj->file_state's pending entries
+ *              into a flatcc Step manifest, then decodes that manifest back
+ *              and replays it -- creating real objects group-based under
+ *              /step/<physical_step>/ from the *decoded* ids, never the live
+ *              ones captured at create/write time. That decode round trip is
+ *              the point: it is what proves the manifest -- not just the
+ *              connector's own bookkeeping -- faithfully reproduces HDF5's
+ *              data model (types, selections, chunking/filters).
+ *
+ *              Entries replay in original capture order. A DsetWrite or Attr
+ *              entry always has a DsetCreate entry earlier in the same pass:
+ *              a placeholder (the only source of either) can only be created
+ *              by dataset_create()/attr_create() while IN_STEP. Replay finds
+ *              it by scanning already-replayed entries for a matching path
+ *              rather than needing a separate index.
+ *
+ * Return:      Success:    0
+ *              Failure:    -1 (the caller discards the pending buffer either
+ *                          way -- a partial replay is not salvaged)
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_replay_step(H5VL_stream_t *file_obj)
+{
+    H5VL_stream_file_state_t *fs = file_obj->file_state;
+    flatcc_builder_t           B;
+    int                        builder_ready = 0;
+    vs_Entry_ref_t            *entry_refs    = NULL;
+    uint8_t                   *payload_buf   = NULL;
+    size_t                     payload_cap   = 0;
+    size_t                     payload_len   = 0;
+    void                     **replay_under  = NULL;
+    uint8_t                   *needs_close   = NULL;
+    uint8_t                   *manifest_buf  = NULL;
+    size_t                     manifest_len  = 0;
+    char                      *step_root     = NULL;
+    unsigned                   maj, minor, rel;
+    size_t                     i;
+    herr_t                     ret_value = 0;
+
+    if (NULL ==
+        (entry_refs = (vs_Entry_ref_t *)malloc((fs->n_pending ? fs->n_pending : 1) * sizeof(vs_Entry_ref_t)))) {
+        ret_value = -1;
+        goto done;
+    }
+
+    flatcc_builder_init(&B);
+    builder_ready = 1;
+
+    /* Pass 1: encode each pending entry's blobs, build its flatcc Entry, and
+     * append its payload bytes to one contiguous buffer -- payload_off/len
+     * index into it, the schema's "payload stored outside the flatbuffer"
+     * design (dev-plan.md's Step manifest section). */
+    for (i = 0; i < fs->n_pending; i++) {
+        H5VL_stream_pending_entry_t *pe        = &fs->pending[i];
+        uint8_t                     *type_enc  = NULL;
+        uint8_t                     *space_enc = NULL;
+        uint8_t                     *dcpl_enc  = NULL;
+        size_t                       type_len  = 0;
+        size_t                       space_len = 0;
+        size_t                       dcpl_len  = 0;
+        uint64_t                     this_off  = (uint64_t)payload_len;
+
+        if (H5VL__stream_encode_type(pe->type_id, &type_enc, &type_len) < 0 ||
+            H5VL__stream_encode_space(pe->space_id, &space_enc, &space_len) < 0 ||
+            (pe->dcpl_id >= 0 && H5VL__stream_encode_dcpl(pe->dcpl_id, &dcpl_enc, &dcpl_len) < 0)) {
+            free(type_enc);
+            free(space_enc);
+            free(dcpl_enc);
+            ret_value = -1;
+            goto done;
+        }
+
+        if (pe->payload_len > 0) {
+            if (payload_len + pe->payload_len > payload_cap) {
+                size_t   new_cap = payload_cap ? payload_cap * 2 : 4096;
+                uint8_t *grown;
+
+                while (new_cap < payload_len + pe->payload_len)
+                    new_cap *= 2;
+                if (NULL == (grown = (uint8_t *)realloc(payload_buf, new_cap))) {
+                    free(type_enc);
+                    free(space_enc);
+                    free(dcpl_enc);
+                    ret_value = -1;
+                    goto done;
+                }
+                payload_buf = grown;
+                payload_cap = new_cap;
+            }
+            memcpy(payload_buf + payload_len, pe->payload, pe->payload_len);
+            payload_len += pe->payload_len;
+        }
+
+        vs_Entry_start(&B);
+        vs_Entry_kind_add(&B, (vs_Kind_enum_t)pe->kind);
+        vs_Entry_path_create_str(&B, pe->path);
+        vs_Entry_type_enc_create(&B, type_enc, type_len);
+        vs_Entry_space_enc_create(&B, space_enc, space_len);
+        if (dcpl_enc)
+            vs_Entry_dcpl_enc_create(&B, dcpl_enc, dcpl_len);
+        vs_Entry_form_add(&B, vs_Payload_Raw);
+        vs_Entry_payload_off_add(&B, this_off);
+        vs_Entry_payload_len_add(&B, (uint64_t)pe->payload_len);
+        entry_refs[i] = vs_Entry_end(&B);
+
+        free(type_enc);
+        free(space_enc);
+        free(dcpl_enc);
+    }
+
+    H5get_libversion(&maj, &minor, &rel);
+
+    vs_Step_start_as_root(&B);
+    vs_Step_physical_step_add(&B, fs->physical_step);
+    if (fs->n_logical > 0)
+        vs_Step_logical_ids_create(&B, fs->logical_ids, fs->n_logical);
+    vs_Step_wall_time_ns_add(&B, fs->wall_time_ns);
+    vs_Step_hdf5_version_add(&B, (uint32_t)(maj * 1000000u + minor * 1000u + rel));
+    if (fs->n_pending > 0)
+        vs_Step_entries_create(&B, entry_refs, fs->n_pending);
+    vs_Step_payload_bytes_add(&B, (uint64_t)payload_len);
+    vs_Step_end_as_root(&B);
+
+    if (NULL == (manifest_buf = (uint8_t *)flatcc_builder_finalize_buffer(&B, &manifest_len))) {
+        ret_value = -1;
+        goto done;
+    }
+
+    if (NULL == (step_root = (char *)malloc(32))) { /* "/step/" + up to 20 digits + '\0' */
+        ret_value = -1;
+        goto done;
+    }
+    snprintf(step_root, 32, "/step/%llu", (unsigned long long)fs->physical_step);
+
+    /* Pass 2: decode the manifest just built and replay it entry by entry,
+     * using only the decoded ids -- see the function comment above. */
+    {
+        vs_Step_table_t step      = vs_Step_as_root(manifest_buf);
+        vs_Entry_vec_t  entries   = step ? vs_Step_entries(step) : NULL;
+        size_t          n_entries = entries ? vs_Entry_vec_len(entries) : 0;
+
+        if (!step || n_entries != fs->n_pending) {
+            ret_value = -1;
+            goto done;
+        }
+
+        if (n_entries > 0) {
+            if (NULL == (replay_under = (void **)calloc(n_entries, sizeof(void *))) ||
+                NULL == (needs_close = (uint8_t *)calloc(n_entries, sizeof(uint8_t)))) {
+                ret_value = -1;
+                goto done;
+            }
+        }
+
+        for (i = 0; i < n_entries; i++) {
+            vs_Entry_table_t        e     = vs_Entry_vec_at(entries, i);
+            vs_Kind_enum_t           kind  = vs_Entry_kind(e);
+            const char              *path  = vs_Entry_path(e);
+            flatbuffers_uint8_vec_t  type_enc  = vs_Entry_type_enc(e);
+            flatbuffers_uint8_vec_t  space_enc = vs_Entry_space_enc(e);
+            flatbuffers_uint8_vec_t  dcpl_enc  = vs_Entry_dcpl_enc(e);
+            uint64_t                 poff  = vs_Entry_payload_off(e);
+            uint64_t                 plen  = vs_Entry_payload_len(e);
+            hid_t                    dtype = -1, dspace = -1, ddcpl = -1;
+
+            if ((dtype = H5Tdecode2(type_enc, flatbuffers_uint8_vec_len(type_enc))) < 0 ||
+                (dspace = H5Sdecode(space_enc)) < 0) {
+                if (dtype >= 0)
+                    H5Tclose(dtype);
+                ret_value = -1;
+                goto done;
+            }
+            if ((kind == vs_Kind_DsetCreate || kind == vs_Kind_Attr) && dcpl_enc &&
+                flatbuffers_uint8_vec_len(dcpl_enc) > 0) {
+                if ((ddcpl = H5Pdecode(dcpl_enc)) < 0) {
+                    H5Tclose(dtype);
+                    H5Sclose(dspace);
+                    ret_value = -1;
+                    goto done;
+                }
+            }
+
+            if (kind == vs_Kind_DsetCreate) {
+                char              *full_path;
+                size_t             full_len = strlen(step_root) + strlen(path) + 1;
+                H5VL_loc_params_t  loc_params;
+                void              *real;
+
+                if (NULL == (full_path = (char *)malloc(full_len))) {
+                    H5Tclose(dtype);
+                    H5Sclose(dspace);
+                    if (ddcpl >= 0)
+                        H5Pclose(ddcpl);
+                    ret_value = -1;
+                    goto done;
+                }
+                snprintf(full_path, full_len, "%s%s", step_root, path);
+
+                memset(&loc_params, 0, sizeof(loc_params));
+                loc_params.obj_type = H5I_FILE;
+                loc_params.type     = H5VL_OBJECT_BY_SELF;
+
+                {
+                    char *last_slash = strrchr(full_path, '/');
+                    void *parent;
+
+                    *last_slash = '\0'; /* split into ancestor path + leaf name */
+
+                    parent = H5VL__stream_replay_ensure_group(file_obj->under_object, file_obj->under_vol_id,
+                                                               full_path);
+                    *last_slash = '/';
+
+                    if (!parent) {
+                        free(full_path);
+                        H5Tclose(dtype);
+                        H5Sclose(dspace);
+                        if (ddcpl >= 0)
+                            H5Pclose(ddcpl);
+                        ret_value = -1;
+                        goto done;
+                    }
+
+                    loc_params.obj_type = H5I_GROUP;
+
+                    real = H5VLdataset_create(parent, &loc_params, file_obj->under_vol_id, last_slash + 1,
+                                              H5P_LINK_CREATE_DEFAULT, dtype, dspace,
+                                              ddcpl >= 0 ? ddcpl : H5P_DATASET_CREATE_DEFAULT,
+                                              H5P_DATASET_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL);
+                    H5VLgroup_close(parent, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+                }
+                free(full_path);
+
+                if (!real) {
+                    H5Tclose(dtype);
+                    H5Sclose(dspace);
+                    if (ddcpl >= 0)
+                        H5Pclose(ddcpl);
+                    ret_value = -1;
+                    goto done;
+                }
+
+                replay_under[i] = real;
+
+                if (fs->pending[i].owner_wrapper) {
+                    fs->pending[i].owner_wrapper->under_object = real;
+                    fs->pending[i].owner_wrapper->obj_state    = H5VL_STREAM_OBJ_LIVE;
+                }
+                else
+                    needs_close[i] = 1;
+            }
+            else if (kind == vs_Kind_DsetWrite) {
+                void    *real = NULL;
+                size_t   j;
+                hid_t    mem_space = -1;
+                hssize_t n_elem;
+
+                for (j = i; j-- > 0;)
+                    if (vs_Entry_kind(vs_Entry_vec_at(entries, j)) == vs_Kind_DsetCreate &&
+                        strcmp(vs_Entry_path(vs_Entry_vec_at(entries, j)), path) == 0) {
+                        real = replay_under[j];
+                        break;
+                    }
+
+                if (!real || (n_elem = H5Sget_select_npoints(dspace)) < 0) {
+                    H5Tclose(dtype);
+                    H5Sclose(dspace);
+                    ret_value = -1;
+                    goto done;
+                }
+
+                {
+                    hsize_t n_elem_h = (hsize_t)n_elem;
+
+                    if ((mem_space = H5Screate_simple(1, &n_elem_h, NULL)) < 0) {
+                        H5Tclose(dtype);
+                        H5Sclose(dspace);
+                        ret_value = -1;
+                        goto done;
+                    }
+                }
+
+                {
+                    const void *payload_ptr = payload_buf + poff;
+                    herr_t      w = H5VLdataset_write(1, &real, file_obj->under_vol_id, &dtype, &mem_space,
+                                                      &dspace, H5P_DATASET_XFER_DEFAULT, &payload_ptr, NULL);
+                    H5Sclose(mem_space);
+                    (void)plen;
+                    if (w < 0) {
+                        H5Tclose(dtype);
+                        H5Sclose(dspace);
+                        ret_value = -1;
+                        goto done;
+                    }
+                }
+            }
+            else if (kind == vs_Kind_Attr) {
+                const char        *at = strrchr(path, '@');
+                char              *parent_path;
+                char              *full_parent;
+                H5VL_loc_params_t  loc_params;
+                void              *attr;
+
+                if (!at) {
+                    H5Tclose(dtype);
+                    H5Sclose(dspace);
+                    if (ddcpl >= 0)
+                        H5Pclose(ddcpl);
+                    ret_value = -1;
+                    goto done;
+                }
+
+                if (NULL == (parent_path = (char *)malloc((size_t)(at - path) + 1))) {
+                    H5Tclose(dtype);
+                    H5Sclose(dspace);
+                    if (ddcpl >= 0)
+                        H5Pclose(ddcpl);
+                    ret_value = -1;
+                    goto done;
+                }
+                memcpy(parent_path, path, (size_t)(at - path));
+                parent_path[at - path] = '\0';
+
+                {
+                    size_t full_parent_len = strlen(step_root) + strlen(parent_path) + 1;
+
+                    if (NULL == (full_parent = (char *)malloc(full_parent_len))) {
+                        free(parent_path);
+                        H5Tclose(dtype);
+                        H5Sclose(dspace);
+                        if (ddcpl >= 0)
+                            H5Pclose(ddcpl);
+                        ret_value = -1;
+                        goto done;
+                    }
+                    snprintf(full_parent, full_parent_len, "%s%s", step_root, parent_path);
+                }
+                free(parent_path);
+
+                memset(&loc_params, 0, sizeof(loc_params));
+                loc_params.obj_type                     = H5I_FILE;
+                loc_params.type                         = H5VL_OBJECT_BY_NAME;
+                loc_params.loc_data.loc_by_name.name    = full_parent;
+                loc_params.loc_data.loc_by_name.lapl_id = H5P_LINK_ACCESS_DEFAULT;
+
+                /* The first attempt is a routine probe whenever the parent
+                 * hasn't been created by an earlier entry this pass (e.g. an
+                 * attribute directly on the file root, or on a plain group)
+                 * -- suppress it the same way
+                 * H5VL__stream_replay_ensure_group() does. If it fails,
+                 * materialize the parent group and retry for real, with
+                 * normal error visibility. */
+                {
+                    H5E_auto2_t old_func;
+                    void       *old_data;
+                    hid_t       err_id;
+
+                    H5Eget_auto2(H5E_DEFAULT, &old_func, &old_data);
+                    H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
+                    err_id = H5Eget_current_stack();
+
+                    attr = H5VLattr_create(file_obj->under_object, &loc_params, file_obj->under_vol_id, at + 1,
+                                           dtype, dspace, ddcpl >= 0 ? ddcpl : H5P_ATTRIBUTE_CREATE_DEFAULT,
+                                           H5P_ATTRIBUTE_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL);
+
+                    H5Eset_current_stack(err_id);
+                    H5Eset_auto2(H5E_DEFAULT, old_func, old_data);
+                }
+
+                if (!attr) {
+                    void *grp = H5VL__stream_replay_ensure_group(file_obj->under_object,
+                                                                   file_obj->under_vol_id, full_parent);
+                    if (grp) {
+                        attr = H5VLattr_create(file_obj->under_object, &loc_params, file_obj->under_vol_id,
+                                               at + 1, dtype, dspace,
+                                               ddcpl >= 0 ? ddcpl : H5P_ATTRIBUTE_CREATE_DEFAULT,
+                                               H5P_ATTRIBUTE_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL);
+                        H5VLgroup_close(grp, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+                    }
+                }
+                free(full_parent);
+
+                if (!attr) {
+                    H5Tclose(dtype);
+                    H5Sclose(dspace);
+                    if (ddcpl >= 0)
+                        H5Pclose(ddcpl);
+                    ret_value = -1;
+                    goto done;
+                }
+
+                if (plen > 0) {
+                    const void *payload_ptr = payload_buf + poff;
+
+                    if (H5VLattr_write(attr, file_obj->under_vol_id, dtype, payload_ptr,
+                                       H5P_DATASET_XFER_DEFAULT, NULL) < 0) {
+                        H5VLattr_close(attr, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+                        H5Tclose(dtype);
+                        H5Sclose(dspace);
+                        if (ddcpl >= 0)
+                            H5Pclose(ddcpl);
+                        ret_value = -1;
+                        goto done;
+                    }
+                }
+
+                if (fs->pending[i].owner_wrapper) {
+                    fs->pending[i].owner_wrapper->under_object = attr;
+                    fs->pending[i].owner_wrapper->obj_state    = H5VL_STREAM_OBJ_LIVE;
+                }
+                else
+                    H5VLattr_close(attr, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+            }
+
+            H5Tclose(dtype);
+            H5Sclose(dspace);
+            if (ddcpl >= 0)
+                H5Pclose(ddcpl);
+        }
+
+        /* Close every replayed dataset the application is not still holding
+         * open via a placeholder handle -- see H5VL_stream_dataset_close(). */
+        for (i = 0; i < n_entries; i++)
+            if (needs_close[i] && replay_under[i])
+                H5VLdataset_close(replay_under[i], file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+    }
+
+    /* Persist the manifest and payload themselves, for inspectability and
+     * future transport reuse -- after every real entry, so they are never
+     * part of what they describe. H5VL__stream_replay_ensure_group() covers
+     * the empty-step case (no entries at all, so /step/<n>/ was never
+     * otherwise created). */
+    {
+        H5VL_loc_params_t loc_params;
+        hid_t              opaque_type = -1;
+        void              *step_group  = NULL;
+        char               name[32];
+
+        memset(&loc_params, 0, sizeof(loc_params));
+        loc_params.obj_type = H5I_GROUP;
+        loc_params.type     = H5VL_OBJECT_BY_SELF;
+
+        if (NULL == (step_group = H5VL__stream_replay_ensure_group(file_obj->under_object,
+                                                                     file_obj->under_vol_id, step_root)) ||
+            (opaque_type = H5Tcreate(H5T_OPAQUE, 1)) < 0) {
+            if (step_group)
+                H5VLgroup_close(step_group, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+            ret_value = -1;
+            goto done;
+        }
+
+        {
+            hsize_t dims[1] = {(hsize_t)manifest_len};
+            hid_t   space   = H5Screate_simple(1, dims, NULL);
+            void   *mds;
+
+            H5Tset_tag(opaque_type, "vol-stream manifest v1 (flatcc)");
+            snprintf(name, sizeof(name), ".manifest");
+            mds = H5VLdataset_create(step_group, &loc_params, file_obj->under_vol_id, name,
+                                     H5P_LINK_CREATE_DEFAULT, opaque_type, space, H5P_DATASET_CREATE_DEFAULT,
+                                     H5P_DATASET_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL);
+            if (mds) {
+                if (manifest_len > 0) {
+                    const void *bufp = manifest_buf;
+                    H5VLdataset_write(1, &mds, file_obj->under_vol_id, &opaque_type, &space, &space,
+                                      H5P_DATASET_XFER_DEFAULT, &bufp, NULL);
+                }
+                H5VLdataset_close(mds, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+            }
+            H5Sclose(space);
+        }
+
+        {
+            hsize_t dims[1] = {(hsize_t)payload_len};
+            hid_t   space   = H5Screate_simple(1, dims, NULL);
+            void   *pds;
+
+            H5Tset_tag(opaque_type, "vol-stream payload v1 (raw bytes, offsets in .manifest)");
+            snprintf(name, sizeof(name), ".payload");
+            pds = H5VLdataset_create(step_group, &loc_params, file_obj->under_vol_id, name,
+                                     H5P_LINK_CREATE_DEFAULT, opaque_type, space, H5P_DATASET_CREATE_DEFAULT,
+                                     H5P_DATASET_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL);
+            if (pds) {
+                if (payload_len > 0) {
+                    const void *bufp = payload_buf;
+                    H5VLdataset_write(1, &pds, file_obj->under_vol_id, &opaque_type, &space, &space,
+                                      H5P_DATASET_XFER_DEFAULT, &bufp, NULL);
+                }
+                H5VLdataset_close(pds, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+            }
+            H5Sclose(space);
+        }
+
+        H5VLgroup_close(step_group, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+
+        H5Tclose(opaque_type);
+    }
+
+done:
+    if (manifest_buf)
+        flatcc_builder_free(manifest_buf);
+    if (builder_ready)
+        flatcc_builder_clear(&B);
+    free(entry_refs);
+    free(payload_buf);
+    free(replay_under);
+    free(needs_close);
+    free(step_root);
+
+    return ret_value;
+} /* end H5VL__stream_replay_step() */
 
 /*-------------------------------------------------------------------------
  * Function:    H5VL_stream_init
@@ -966,10 +1935,65 @@ H5VL_stream_attr_create(void *obj, const H5VL_loc_params_t *loc_params, const ch
     printf("------- VOL-STREAM ATTRIBUTE Create\n");
 #endif
 
+    /* M2: while a step is open, defer onto the pending manifest instead of
+     * touching the real file -- mirrors H5VL_stream_dataset_create(). The
+     * manifest path uses '@' to separate an attribute from the object
+     * namespace (e.g. "/data@units"); since H5Awrite always overwrites an
+     * attribute atomically, there is exactly one Attr entry per attribute,
+     * mutated in place by attr_write() rather than appended to.
+     *
+     * Capture is allowed whenever the parent's path is resolvable (BY_SELF),
+     * whether that parent is itself a placeholder created this step, the
+     * file root, or a plain live group. Attaching a *new* attribute to a
+     * dataset that was replayed in an *earlier* step has no clean answer
+     * without a versioning scheme this schema does not have yet, and is left
+     * for M3.
+     */
+    if (o->file_state && o->file_state->step_state == H5F_STEP_IN_STEP && o->path &&
+        loc_params->type == H5VL_OBJECT_BY_SELF) {
+        H5VL_stream_pending_entry_t entry;
+        char                             *path;
+        size_t                             path_len;
+        size_t                             idx;
+
+        path_len = strlen(o->path) + 1 /* '@' */ + strlen(name) + 1 /* '\0' */;
+        if (NULL == (path = (char *)malloc(path_len)))
+            return NULL;
+        snprintf(path, path_len, "%s@%s", o->path, name);
+
+        memset(&entry, 0, sizeof(entry));
+        entry.kind     = vs_Kind_Attr;
+        entry.path     = path;
+        entry.type_id  = H5Tcopy(type_id);
+        entry.space_id = H5Scopy(space_id);
+        entry.dcpl_id  = H5Pcopy(acpl_id);
+        entry.dapl_id  = H5I_INVALID_HID;
+        if (entry.type_id < 0 || entry.space_id < 0 || entry.dcpl_id < 0) {
+            H5VL__stream_pending_entry_clear(&entry);
+            return NULL;
+        }
+
+        if ((idx = H5VL__stream_pending_append(o->file_state, &entry)) == (size_t)-1) {
+            H5VL__stream_pending_entry_clear(&entry);
+            return NULL;
+        }
+
+        if (NULL == (attr = H5VL_stream_new_obj(NULL, o->under_vol_id)))
+            return NULL;
+        attr->file_state = o->file_state;
+        H5VL__stream_file_state_incref(o->file_state);
+        attr->path                                = strdup(entry.path);
+        attr->obj_state                           = H5VL_STREAM_OBJ_PLACEHOLDER;
+        attr->pending_index                       = idx;
+        o->file_state->pending[idx].owner_wrapper = attr;
+
+        return (void *)attr;
+    }
+
     under = H5VLattr_create(o->under_object, loc_params, o->under_vol_id, name, type_id, space_id, acpl_id,
                             aapl_id, dxpl_id, req);
     if (under) {
-        attr = H5VL_stream_new_obj(under, o->under_vol_id);
+        attr = H5VL__stream_new_child_obj(under, o->under_vol_id, o->file_state, NULL, NULL);
 
         /* Check for async request */
         if (req && *req)
@@ -1005,7 +2029,7 @@ H5VL_stream_attr_open(void *obj, const H5VL_loc_params_t *loc_params, const char
 
     under = H5VLattr_open(o->under_object, loc_params, o->under_vol_id, name, aapl_id, dxpl_id, req);
     if (under) {
-        attr = H5VL_stream_new_obj(under, o->under_vol_id);
+        attr = H5VL__stream_new_child_obj(under, o->under_vol_id, o->file_state, NULL, NULL);
 
         /* Check for async request */
         if (req && *req)
@@ -1037,6 +2061,11 @@ H5VL_stream_attr_read(void *attr, hid_t mem_type_id, void *buf, hid_t dxpl_id, v
     printf("------- VOL-STREAM ATTRIBUTE Read\n");
 #endif
 
+    /* M2: reads are not legal during IN_STEP for a writer -- see the same
+     * note in H5VL_stream_dataset_read(). */
+    if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER)
+        return -1;
+
     ret_value = H5VLattr_read(o->under_object, o->under_vol_id, mem_type_id, buf, dxpl_id, req);
 
     /* Check for async request */
@@ -1066,6 +2095,41 @@ H5VL_stream_attr_write(void *attr, hid_t mem_type_id, const void *buf, hid_t dxp
     printf("------- VOL-STREAM ATTRIBUTE Write\n");
 #endif
 
+    /* M2: H5Awrite always overwrites an attribute atomically, so a
+     * placeholder attribute has exactly one Attr entry -- fill in (or
+     * replace) its payload in place rather than appending a new entry.
+     *
+     * The payload is sized and copied against the entry's already-captured
+     * file type, not mem_type_id: an attribute write whose memory type needs
+     * real conversion to the file type is not captured correctly in M2 (the
+     * exit-gate matrix's attribute scenarios use matching native types, so
+     * this does not affect them; byte-order conversion is exercised on
+     * datasets instead, via DsetWrite's own mem-type capture).
+     */
+    if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER) {
+        H5VL_stream_pending_entry_t *e = &o->file_state->pending[o->pending_index];
+        hssize_t                      n_elem;
+        size_t                        nbytes;
+
+        if ((n_elem = H5Sget_select_npoints(e->space_id)) < 0)
+            return -1;
+
+        nbytes = (size_t)n_elem * H5Tget_size(e->type_id);
+
+        free(e->payload);
+        e->payload     = NULL;
+        e->payload_len = 0;
+
+        if (nbytes > 0) {
+            if (NULL == (e->payload = (uint8_t *)malloc(nbytes)))
+                return -1;
+            memcpy(e->payload, buf, nbytes);
+            e->payload_len = nbytes;
+        }
+
+        return 0;
+    }
+
     ret_value = H5VLattr_write(o->under_object, o->under_vol_id, mem_type_id, buf, dxpl_id, req);
 
     /* Check for async request */
@@ -1094,6 +2158,26 @@ H5VL_stream_attr_get(void *obj, H5VL_attr_get_args_t *args, hid_t dxpl_id, void 
 #ifdef ENABLE_STREAM_LOGGING
     printf("------- VOL-STREAM ATTRIBUTE Get\n");
 #endif
+
+    /* M2: service directly from the pending entry -- see the same note in
+     * H5VL_stream_dataset_get(). */
+    if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER) {
+        H5VL_stream_pending_entry_t *e = &o->file_state->pending[o->pending_index];
+
+        switch (args->op_type) {
+            case H5VL_ATTR_GET_SPACE:
+                return (args->args.get_space.space_id = H5Scopy(e->space_id)) < 0 ? -1 : 0;
+            case H5VL_ATTR_GET_TYPE:
+                return (args->args.get_type.type_id = H5Tcopy(e->type_id)) < 0 ? -1 : 0;
+            case H5VL_ATTR_GET_ACPL:
+                return (args->args.get_acpl.acpl_id = H5Pcopy(e->dcpl_id)) < 0 ? -1 : 0;
+            case H5VL_ATTR_GET_STORAGE_SIZE:
+                *args->args.get_storage_size.data_size = e->payload_len;
+                return 0;
+            default:
+                return -1;
+        }
+    }
 
     ret_value = H5VLattr_get(o->under_object, o->under_vol_id, args, dxpl_id, req);
 
@@ -1125,6 +2209,11 @@ H5VL_stream_attr_specific(void *obj, const H5VL_loc_params_t *loc_params,
     printf("------- VOL-STREAM ATTRIBUTE Specific\n");
 #endif
 
+    /* M2: not supported against a placeholder -- a documented gap, not part
+     * of the M2 exit-gate matrix. */
+    if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER)
+        return -1;
+
     ret_value = H5VLattr_specific(o->under_object, loc_params, o->under_vol_id, args, dxpl_id, req);
 
     /* Check for async request */
@@ -1154,6 +2243,11 @@ H5VL_stream_attr_optional(void *obj, H5VL_optional_args_t *args, hid_t dxpl_id, 
     printf("------- VOL-STREAM ATTRIBUTE Optional\n");
 #endif
 
+    /* M2: not supported against a placeholder -- a documented gap, not part
+     * of the M2 exit-gate matrix. */
+    if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER)
+        return -1;
+
     ret_value = H5VLattr_optional(o->under_object, o->under_vol_id, args, dxpl_id, req);
 
     /* Check for async request */
@@ -1182,6 +2276,14 @@ H5VL_stream_attr_close(void *attr, hid_t dxpl_id, void **req)
 #ifdef ENABLE_STREAM_LOGGING
     printf("------- VOL-STREAM ATTRIBUTE Close\n");
 #endif
+
+    /* M2: nothing underlying exists yet for a placeholder -- see the same
+     * note in H5VL_stream_dataset_close(). */
+    if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER) {
+        o->file_state->pending[o->pending_index].owner_wrapper = NULL;
+        H5VL_stream_free_obj(o);
+        return 0;
+    }
 
     ret_value = H5VLattr_close(o->under_object, o->under_vol_id, dxpl_id, req);
 
@@ -1219,10 +2321,55 @@ H5VL_stream_dataset_create(void *obj, const H5VL_loc_params_t *loc_params, const
     printf("------- VOL-STREAM DATASET Create\n");
 #endif
 
+    /* M2: while a step is open, defer the create into the pending manifest
+     * instead of touching the real file at all -- see the architecture note
+     * above H5VL_stream_file_optional(). Only the common BY_SELF entry point
+     * (H5Dcreate2(fid_or_gid, name, ...)) is capturable; anything else falls
+     * through to the live pass-through below, uncaptured but still correct.
+     */
+    if (o->file_state && o->file_state->step_state == H5F_STEP_IN_STEP &&
+        loc_params->type == H5VL_OBJECT_BY_SELF) {
+        H5VL_stream_pending_entry_t entry;
+        char                             *path = H5VL__stream_child_path(o->path, name);
+        size_t                             idx;
+
+        if (!path)
+            return NULL;
+
+        memset(&entry, 0, sizeof(entry));
+        entry.kind     = vs_Kind_DsetCreate;
+        entry.path     = path;
+        entry.type_id  = H5Tcopy(type_id);
+        entry.space_id = H5Scopy(space_id);
+        entry.dcpl_id  = H5Pcopy(dcpl_id);
+        entry.dapl_id  = H5Pcopy(dapl_id);
+        if (entry.type_id < 0 || entry.space_id < 0 || entry.dcpl_id < 0 || entry.dapl_id < 0) {
+            H5VL__stream_pending_entry_clear(&entry);
+            return NULL;
+        }
+
+        if ((idx = H5VL__stream_pending_append(o->file_state, &entry)) == (size_t)-1) {
+            H5VL__stream_pending_entry_clear(&entry);
+            return NULL;
+        }
+
+        if (NULL == (dset = H5VL_stream_new_obj(NULL, o->under_vol_id)))
+            return NULL;
+        dset->file_state = o->file_state;
+        H5VL__stream_file_state_incref(o->file_state);
+        dset->path                                = strdup(entry.path);
+        dset->obj_state                           = H5VL_STREAM_OBJ_PLACEHOLDER;
+        dset->pending_index                       = idx;
+        o->file_state->pending[idx].owner_wrapper = dset;
+
+        return (void *)dset;
+    }
+
     under = H5VLdataset_create(o->under_object, loc_params, o->under_vol_id, name, lcpl_id, type_id, space_id,
                                dcpl_id, dapl_id, dxpl_id, req);
     if (under) {
-        dset = H5VL_stream_new_obj(under, o->under_vol_id);
+        dset = H5VL__stream_new_child_obj(under, o->under_vol_id, o->file_state,
+                                           loc_params->type == H5VL_OBJECT_BY_SELF ? o->path : NULL, name);
 
         /* Check for async request */
         if (req && *req)
@@ -1258,7 +2405,8 @@ H5VL_stream_dataset_open(void *obj, const H5VL_loc_params_t *loc_params, const c
 
     under = H5VLdataset_open(o->under_object, loc_params, o->under_vol_id, name, dapl_id, dxpl_id, req);
     if (under) {
-        dset = H5VL_stream_new_obj(under, o->under_vol_id);
+        dset = H5VL__stream_new_child_obj(under, o->under_vol_id, o->file_state,
+                                           loc_params->type == H5VL_OBJECT_BY_SELF ? o->path : NULL, name);
 
         /* Check for async request */
         if (req && *req)
@@ -1292,6 +2440,14 @@ H5VL_stream_dataset_read(size_t count, void *dset[], hid_t mem_type_id[], hid_t 
 #ifdef ENABLE_STREAM_LOGGING
     printf("------- VOL-STREAM DATASET Read\n");
 #endif
+
+    /* M2: a dataset still IN_STEP is a bookkeeping placeholder with nothing
+     * underlying to read yet -- the connector state machine never lists
+     * reads as legal during IN_STEP for a writer, so reject rather than
+     * dereference a NULL under_object. */
+    for (i = 0; i < count; i++)
+        if (((H5VL_stream_t *)dset[i])->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER)
+            return -1;
 
     /* Allocate obj array if necessary */
     if (count > 1)
@@ -1339,11 +2495,89 @@ H5VL_stream_dataset_write(size_t count, void *dset[], hid_t mem_type_id[], hid_t
     void  *obj_local;        /* Local buffer for obj */
     void **obj = &obj_local; /* Array of object pointers */
     size_t i;                /* Local index variable */
+    size_t n_placeholder = 0;
     herr_t ret_value;
 
 #ifdef ENABLE_STREAM_LOGGING
     printf("------- VOL-STREAM DATASET Write\n");
 #endif
+
+    for (i = 0; i < count; i++)
+        if (((H5VL_stream_t *)dset[i])->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER)
+            n_placeholder++;
+
+    /* M2: an H5Dwrite_multi() batch mixing placeholder (deferred-into-step)
+     * and live datasets is not supported -- a combination the exit-gate
+     * matrix does not exercise. Either every dataset in the batch is
+     * captured, or none are. */
+    if (n_placeholder > 0 && n_placeholder < count)
+        return -1;
+
+    if (n_placeholder == count) {
+        /* Every write in this call targets a dataset deferred into the
+         * current step: capture each as its own DsetWrite entry (one entry
+         * per H5Dwrite call, carrying its own selection -- what makes
+         * multiple partial-hyperslab writes to the same dataset in one step
+         * work independently) instead of touching the real file.
+         *
+         * The captured buffer is a flat copy of exactly npoints(file
+         * selection) elements, read starting at buf[i] -- correct for a
+         * *simple* mem_space_id sized to match the file selection's npoints
+         * (the standard partial-write idiom, and what this connector's own
+         * tests use), or for H5S_ALL/H5S_ALL on a whole-dataset write.
+         *
+         * It is NOT correct for mem_space_id == H5S_ALL paired with a
+         * *partial* file_space_id: per H5VLnative_dataset.c, H5S_ALL for the
+         * memory space reuses the file space's selection object outright,
+         * so the effective memory selection is the same hyperslab applied
+         * to buf[i] as if it pointed at a same-extent buffer -- not "the
+         * first npoints elements". Capturing that correctly would need to
+         * honor the selection's offset/stride when copying out of buf[i],
+         * which M2 does not implement; it assumes the simple-mem-space
+         * idiom above instead.
+         */
+        for (i = 0; i < count; i++) {
+            H5VL_stream_t                *o             = (H5VL_stream_t *)dset[i];
+            H5VL_stream_pending_entry_t  *create_entry  = &o->file_state->pending[o->pending_index];
+            hid_t                         resolved_fspace = H5VL__stream_resolve_space(file_space_id[i], create_entry->space_id);
+            hssize_t                      n_elem;
+            H5VL_stream_pending_entry_t   write_entry;
+
+            if ((n_elem = H5Sget_select_npoints(resolved_fspace)) < 0)
+                return -1;
+
+            memset(&write_entry, 0, sizeof(write_entry));
+            write_entry.kind     = vs_Kind_DsetWrite;
+            write_entry.path     = strdup(o->path);
+            write_entry.type_id  = H5Tcopy(mem_type_id[i]);
+            write_entry.space_id = H5Scopy(resolved_fspace);
+            write_entry.dcpl_id  = H5I_INVALID_HID;
+            write_entry.dapl_id  = H5I_INVALID_HID;
+            if (!write_entry.path || write_entry.type_id < 0 || write_entry.space_id < 0) {
+                H5VL__stream_pending_entry_clear(&write_entry);
+                return -1;
+            }
+
+            if (n_elem > 0) {
+                size_t elem_size = H5Tget_size(write_entry.type_id);
+                size_t nbytes    = (size_t)n_elem * elem_size;
+
+                if (NULL == (write_entry.payload = (uint8_t *)malloc(nbytes))) {
+                    H5VL__stream_pending_entry_clear(&write_entry);
+                    return -1;
+                }
+                memcpy(write_entry.payload, buf[i], nbytes);
+                write_entry.payload_len = nbytes;
+            }
+
+            if (H5VL__stream_pending_append(o->file_state, &write_entry) == (size_t)-1) {
+                H5VL__stream_pending_entry_clear(&write_entry);
+                return -1;
+            }
+        }
+
+        return 0;
+    }
 
     /* Allocate obj array if necessary */
     if (count > 1)
@@ -1394,6 +2628,33 @@ H5VL_stream_dataset_get(void *dset, H5VL_dataset_get_args_t *args, hid_t dxpl_id
     printf("------- VOL-STREAM DATASET Get\n");
 #endif
 
+    /* M2: a placeholder has no underlying object to ask -- service directly
+     * from the pending entry's still-live type/space/dcpl/dapl copies
+     * instead, since apps commonly call e.g. H5Dget_space() right after
+     * H5Dcreate2() and before end_step(). */
+    if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER) {
+        H5VL_stream_pending_entry_t *e = &o->file_state->pending[o->pending_index];
+
+        switch (args->op_type) {
+            case H5VL_DATASET_GET_SPACE:
+                return (args->args.get_space.space_id = H5Scopy(e->space_id)) < 0 ? -1 : 0;
+            case H5VL_DATASET_GET_TYPE:
+                return (args->args.get_type.type_id = H5Tcopy(e->type_id)) < 0 ? -1 : 0;
+            case H5VL_DATASET_GET_DCPL:
+                return (args->args.get_dcpl.dcpl_id = H5Pcopy(e->dcpl_id)) < 0 ? -1 : 0;
+            case H5VL_DATASET_GET_DAPL:
+                return (args->args.get_dapl.dapl_id = H5Pcopy(e->dapl_id)) < 0 ? -1 : 0;
+            case H5VL_DATASET_GET_STORAGE_SIZE:
+                *args->args.get_storage_size.storage_size = 0;
+                return 0;
+            case H5VL_DATASET_GET_SPACE_STATUS:
+                *args->args.get_space_status.status = H5D_SPACE_STATUS_NOT_ALLOCATED;
+                return 0;
+            default:
+                return -1;
+        }
+    }
+
     ret_value = H5VLdataset_get(o->under_object, o->under_vol_id, args, dxpl_id, req);
 
     /* Check for async request */
@@ -1423,6 +2684,12 @@ H5VL_stream_dataset_specific(void *obj, H5VL_dataset_specific_args_t *args, hid_
 #ifdef ENABLE_STREAM_LOGGING
     printf("------- VOL-STREAM H5Dspecific\n");
 #endif
+
+    /* M2: not supported against a placeholder (H5Dset_extent, H5Dflush,
+     * H5Drefresh on a not-yet-real object) -- a documented gap, not part of
+     * the M2 exit-gate matrix. */
+    if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER)
+        return -1;
 
     /* Save copy of underlying VOL connector ID, in case of
      * 'refresh' operation destroying the current object
@@ -1458,6 +2725,13 @@ H5VL_stream_dataset_optional(void *obj, H5VL_optional_args_t *args, hid_t dxpl_i
     printf("------- VOL-STREAM DATASET Optional\n");
 #endif
 
+    /* M2: not supported against a placeholder -- a documented gap, not part
+     * of the M2 exit-gate matrix (this is also where filtered-chunk
+     * passthrough, H5Dread_chunk2/H5Dwrite_chunk, would eventually hook in
+     * for a live object). */
+    if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER)
+        return -1;
+
     ret_value = H5VLdataset_optional(o->under_object, o->under_vol_id, args, dxpl_id, req);
 
     /* Check for async request */
@@ -1486,6 +2760,17 @@ H5VL_stream_dataset_close(void *dset, hid_t dxpl_id, void **req)
 #ifdef ENABLE_STREAM_LOGGING
     printf("------- VOL-STREAM DATASET Close\n");
 #endif
+
+    /* M2: nothing underlying exists yet for a placeholder -- just clear the
+     * pending entry's back-pointer (so end_step()'s replay doesn't try to
+     * patch a wrapper that's gone) and free the wrapper. This is the
+     * t_step.c-style "H5Dcreate2, H5Dwrite, H5Dclose, all inside the step"
+     * pattern; closing before end_step is perfectly normal. */
+    if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER) {
+        o->file_state->pending[o->pending_index].owner_wrapper = NULL;
+        H5VL_stream_free_obj(o);
+        return 0;
+    }
 
     ret_value = H5VLdataset_close(o->under_object, o->under_vol_id, dxpl_id, req);
 
@@ -1523,10 +2808,16 @@ H5VL_stream_datatype_commit(void *obj, const H5VL_loc_params_t *loc_params, cons
     printf("------- VOL-STREAM DATATYPE Commit\n");
 #endif
 
+    /* Committed datatypes stay live/pass-through always, even inside a step:
+     * the fixed manifest Kind enum has no value for a standalone commit, and
+     * H5Tencode() serializes a type's structure regardless of committedness
+     * -- a dataset's own type_enc blob already captures a committed type's
+     * shape correctly with no separate entry needed for the named type. */
     under = H5VLdatatype_commit(o->under_object, loc_params, o->under_vol_id, name, type_id, lcpl_id, tcpl_id,
                                 tapl_id, dxpl_id, req);
     if (under) {
-        dt = H5VL_stream_new_obj(under, o->under_vol_id);
+        dt = H5VL__stream_new_child_obj(under, o->under_vol_id, o->file_state,
+                                         loc_params->type == H5VL_OBJECT_BY_SELF ? o->path : NULL, name);
 
         /* Check for async request */
         if (req && *req)
@@ -1562,7 +2853,8 @@ H5VL_stream_datatype_open(void *obj, const H5VL_loc_params_t *loc_params, const 
 
     under = H5VLdatatype_open(o->under_object, loc_params, o->under_vol_id, name, tapl_id, dxpl_id, req);
     if (under) {
-        dt = H5VL_stream_new_obj(under, o->under_vol_id);
+        dt = H5VL__stream_new_child_obj(under, o->under_vol_id, o->file_state,
+                                         loc_params->type == H5VL_OBJECT_BY_SELF ? o->path : NULL, name);
 
         /* Check for async request */
         if (req && *req)
@@ -1743,6 +3035,13 @@ H5VL_stream_file_create(const char *name, unsigned flags, hid_t fcpl_id, hid_t f
     if (under) {
         file = H5VL_stream_new_obj(under, info->under_vol_id);
 
+        /* M2: every file gets fresh step state (refcount 1, the file
+         * wrapper's own reference) and the empty root path. */
+        if (file) {
+            file->file_state = H5VL__stream_file_state_new();
+            file->path       = strdup("");
+        }
+
         /* Check for async request */
         if (req && *req)
             *req = H5VL_stream_new_obj(*req, info->under_vol_id);
@@ -1798,6 +3097,13 @@ H5VL_stream_file_open(const char *name, unsigned flags, hid_t fapl_id, hid_t dxp
     under = H5VLfile_open(name, flags, under_fapl_id, dxpl_id, req);
     if (under) {
         file = H5VL_stream_new_obj(under, info->under_vol_id);
+
+        /* M2: every file gets fresh step state (refcount 1, the file
+         * wrapper's own reference) and the empty root path. */
+        if (file) {
+            file->file_state = H5VL__stream_file_state_new();
+            file->path       = strdup("");
+        }
 
         /* Check for async request */
         if (req && *req)
@@ -1983,61 +3289,77 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
 
     /* Intercept the step operations; everything else forwards untouched.
      *
-     * M0: these are accepted and validated but do nothing.  A step is not yet a
-     * transaction, so the file produced is byte-identical to one written without
-     * bracketing -- which is exactly what the M1 exit gate asserts.
+     * M2: begin_step defers subsequent dataset/attribute creates and writes
+     * into file_state's pending-entry buffer (see H5VL_stream_dataset_create()
+     * and friends); end_step encodes that buffer into a flatcc manifest and
+     * replays it, decoded, group-based under /step/<n>/ -- see
+     * H5VL__stream_replay_step() below.
      */
     if (args->op_type == H5VL_stream_op_begin_step) {
         H5VL_stream_args_begin_step_t *sargs = (H5VL_stream_args_begin_step_t *)args->args;
 
-        if (!sargs)
+        if (!sargs || !o->file_state)
             return -1;
 
         /* Nested steps are not a thing: a step is the unit of atomicity, so an
          * unclosed one is a bug in the caller rather than something to
          * silently absorb. */
-        if (o->step_state != H5F_STEP_NOT_IN_STEP)
+        if (o->file_state->step_state != H5F_STEP_NOT_IN_STEP)
             return -1;
 
         /* Take our own copy of the logical ids -- the caller's array is only
          * required to live for the duration of the call. */
-        free(o->logical_ids);
-        o->logical_ids = NULL;
-        o->n_logical   = 0;
+        free(o->file_state->logical_ids);
+        o->file_state->logical_ids = NULL;
+        o->file_state->n_logical   = 0;
 
         if (sargs->n_logical > 0) {
-            if (NULL == (o->logical_ids = (uint64_t *)malloc(sargs->n_logical * sizeof(uint64_t))))
+            if (NULL ==
+                (o->file_state->logical_ids = (uint64_t *)malloc(sargs->n_logical * sizeof(uint64_t))))
                 return -1;
-            memcpy(o->logical_ids, sargs->logical_ids, sargs->n_logical * sizeof(uint64_t));
-            o->n_logical = sargs->n_logical;
+            memcpy(o->file_state->logical_ids, sargs->logical_ids, sargs->n_logical * sizeof(uint64_t));
+            o->file_state->n_logical = sargs->n_logical;
         }
 
-        o->step_state = H5F_STEP_IN_STEP;
+        o->file_state->wall_time_ns = sargs->wall_time_ns;
+        o->file_state->step_state   = H5F_STEP_IN_STEP;
         return 0;
     }
     else if (args->op_type == H5VL_stream_op_end_step) {
-        if (o->step_state != H5F_STEP_IN_STEP)
+        herr_t replay_ret;
+
+        if (!o->file_state || o->file_state->step_state != H5F_STEP_IN_STEP)
             return -1;
 
-        /* M2 emits the manifest here. At M1 the transition itself is the whole
-         * operation, which is what keeps the written bytes identical. */
-        o->step_state = H5F_STEP_COMMITTING;
+        o->file_state->step_state = H5F_STEP_COMMITTING;
 
-        free(o->logical_ids);
-        o->logical_ids = NULL;
-        o->n_logical   = 0;
+        replay_ret = H5VL__stream_replay_step(o);
 
-        o->physical_step++;
-        o->step_state = H5F_STEP_NOT_IN_STEP;
+        /* Discard the pending buffer either way: a failed replay may have
+         * landed some entries and not others, and there is no partial-step
+         * state worth preserving -- see the same reasoning for an unclosed
+         * step at file_close(). */
+        H5VL__stream_pending_discard_all(o->file_state);
+        free(o->file_state->logical_ids);
+        o->file_state->logical_ids = NULL;
+        o->file_state->n_logical   = 0;
+
+        if (replay_ret < 0) {
+            o->file_state->step_state = H5F_STEP_NOT_IN_STEP;
+            return -1;
+        }
+
+        o->file_state->physical_step++;
+        o->file_state->step_state = H5F_STEP_NOT_IN_STEP;
         return 0;
     }
     else if (args->op_type == H5VL_stream_op_step_status) {
         H5VL_stream_args_step_status_t *sargs = (H5VL_stream_args_step_status_t *)args->args;
 
-        if (!sargs || !sargs->status)
+        if (!sargs || !sargs->status || !o->file_state)
             return -1;
 
-        *sargs->status = o->step_state;
+        *sargs->status = o->file_state->step_state;
         return 0;
     }
     else if (args->op_type == H5VL_stream_op_subscribe) {
@@ -2086,6 +3408,16 @@ H5VL_stream_file_close(void *file, hid_t dxpl_id, void **req)
     printf("------- VOL-STREAM FILE Close\n");
 #endif
 
+    /* M2: a step left open across a file close was never durably committed
+     * -- discard it rather than leak it or replay a step nobody ended. */
+    if (o->file_state && o->file_state->step_state != H5F_STEP_NOT_IN_STEP) {
+        H5VL__stream_pending_discard_all(o->file_state);
+        free(o->file_state->logical_ids);
+        o->file_state->logical_ids = NULL;
+        o->file_state->n_logical   = 0;
+        o->file_state->step_state  = H5F_STEP_NOT_IN_STEP;
+    }
+
     ret_value = H5VLfile_close(o->under_object, o->under_vol_id, dxpl_id, req);
 
     /* Check for async request */
@@ -2124,7 +3456,12 @@ H5VL_stream_group_create(void *obj, const H5VL_loc_params_t *loc_params, const c
     under = H5VLgroup_create(o->under_object, loc_params, o->under_vol_id, name, lcpl_id, gcpl_id, gapl_id,
                              dxpl_id, req);
     if (under) {
-        group = H5VL_stream_new_obj(under, o->under_vol_id);
+        /* Groups stay live/pass-through always, even inside a step: they
+         * exist only to supply path bookkeeping for their children's
+         * manifest entries (H5Pset_create_intermediate_group() rebuilds any
+         * ancestor groups a replayed dataset needs). */
+        group = H5VL__stream_new_child_obj(under, o->under_vol_id, o->file_state,
+                                            loc_params->type == H5VL_OBJECT_BY_SELF ? o->path : NULL, name);
 
         /* Check for async request */
         if (req && *req)
@@ -2160,7 +3497,8 @@ H5VL_stream_group_open(void *obj, const H5VL_loc_params_t *loc_params, const cha
 
     under = H5VLgroup_open(o->under_object, loc_params, o->under_vol_id, name, gapl_id, dxpl_id, req);
     if (under) {
-        group = H5VL_stream_new_obj(under, o->under_vol_id);
+        group = H5VL__stream_new_child_obj(under, o->under_vol_id, o->file_state,
+                                            loc_params->type == H5VL_OBJECT_BY_SELF ? o->path : NULL, name);
 
         /* Check for async request */
         if (req && *req)
@@ -2572,7 +3910,11 @@ H5VL_stream_object_open(void *obj, const H5VL_loc_params_t *loc_params, H5I_type
 
     under = H5VLobject_open(o->under_object, loc_params, o->under_vol_id, opened_type, dxpl_id, req);
     if (under) {
-        new_obj = H5VL_stream_new_obj(under, o->under_vol_id);
+        /* object_open() is inherently a BY_NAME/BY_IDX/BY_TOKEN entry point,
+         * so the result's path is never resolvable here -- it still borrows
+         * file_state (NULL parent_path yields path == NULL, per
+         * H5VL__stream_new_child_obj()). */
+        new_obj = H5VL__stream_new_child_obj(under, o->under_vol_id, o->file_state, NULL, NULL);
 
         /* Check for async request */
         if (req && *req)
@@ -3307,15 +4649,16 @@ H5VL__stream_file_op(hid_t file_id, int op_type, void *op_args)
 } /* end H5VL__stream_file_op() */
 
 herr_t
-H5Fbegin_step(hid_t file_id, size_t n_logical, const uint64_t *logical_ids)
+H5Fbegin_step(hid_t file_id, size_t n_logical, const uint64_t *logical_ids, uint64_t wall_time_ns)
 {
     H5VL_stream_args_begin_step_t op_args;
 
     if (n_logical > 0 && !logical_ids)
         return -1;
 
-    op_args.n_logical   = n_logical;
-    op_args.logical_ids = logical_ids;
+    op_args.n_logical    = n_logical;
+    op_args.logical_ids  = logical_ids;
+    op_args.wall_time_ns = wall_time_ns;
 
     return H5VL__stream_file_op(file_id, H5VL_stream_op_begin_step, &op_args);
 } /* end H5Fbegin_step() */

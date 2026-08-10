@@ -27,8 +27,10 @@ spack:
 
     # M2: manifest framing. flatcc is FlatBuffers for C -- zero-copy reads and
     # real schema evolution, so adding the M8 predicate field later is a
-    # compatible change rather than a format break.
-    # - flatcc
+    # compatible change rather than a format break. CMakeLists.txt falls back
+    # to vendoring v0.6.1 via FetchContent when this isn't in the environment
+    # -- pinned to the same version for behavioral parity either way.
+    - flatcc@0.6.1
 
     # M4-M5: transport, progress engine, and group membership. Mercury and
     # Argobots are builtin Spack packages; margo, ssg and bake come from the

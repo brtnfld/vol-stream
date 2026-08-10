@@ -1,0 +1,34 @@
+// vol_stream.fbs -- compiled by flatcc. Adding a field is a compatible
+// change, so there is no reserved slot to guess the size of.
+//
+// M2 populates Kind.DsetCreate, Kind.DsetWrite and Kind.Attr, with
+// Payload.Raw only. Kind.Group, Kind.Link, Payload.FilteredChunks and
+// Entry.predicate are left unpopulated -- reserved for later milestones
+// (M3 group provenance, a future filtered-chunk passthrough, and M8
+// subscription predicates respectively) without a schema change.
+namespace vs;
+
+enum Kind    : ubyte { DsetCreate, DsetWrite, Attr, Group, Link }
+enum Payload : ubyte { Raw, FilteredChunks }
+
+table Entry {
+  kind:Kind;
+  path:string;
+  type_enc:[ubyte];        // H5Tencode
+  space_enc:[ubyte];       // H5Sencode2 -- carries the selection
+  dcpl_enc:[ubyte];        // H5Pencode2 -- chunking + filter pipeline
+  form:Payload;
+  payload_off:ulong;
+  payload_len:ulong;
+  predicate:[ubyte];       // added in M8; absent in earlier writers
+}
+
+table Step {
+  physical_step:ulong;     // monotone, connector-assigned
+  logical_ids:[ulong];     // decision 1 -- restart-safe
+  wall_time_ns:ulong;      // supplied by caller, never generated
+  hdf5_version:uint;       // which library produced the blobs above
+  entries:[Entry];
+  payload_bytes:ulong;
+}
+root_type Step;

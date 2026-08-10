@@ -161,7 +161,7 @@ main(void)
     {
         const uint64_t logical[2] = {500, 550};
 
-        CHECK(H5Fbegin_step(fid, 2, logical), "H5Fbegin_step with logical ids");
+        CHECK(H5Fbegin_step(fid, 2, logical, 0), "H5Fbegin_step with logical ids");
         printf("  ok    H5Fbegin_step accepted logical ids\n");
     }
 

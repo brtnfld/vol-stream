@@ -5,13 +5,20 @@
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
 /*
- * M1 exit gate.
+ * M1 exit gate, plus the parts of it M2 keeps.
  *
- *   1. Bracketing writes in H5Fbegin_step/H5Fend_step produces a file
- *      byte-identical to one written without bracketing -- and to one written
- *      through native HDF5 with no connector at all.
+ *   1. *Unbracketed* writes through the connector produce a file
+ *      byte-identical to one written through native HDF5 with no connector
+ *      at all -- the pass-through invariant, unaffected by M2 and expected
+ *      to hold forever.
  *
  *   2. The step state machine is truthful and rejects misordered calls.
+ *
+ * M1's third assertion -- that *bracketed* writes were also byte-identical
+ * to unbracketed ones -- no longer holds as of M2: bracketed writes are now
+ * captured into a manifest and replayed group-based under /step/<n>/. The
+ * replacement invariant (h5diff-clean replay against a native reference)
+ * lives in test/t_replay.c.
  *
  * On byte-identical comparison
  * ----------------------------
@@ -102,7 +109,7 @@ write_file(const char *fn, hid_t vol_id, int use_connector, int use_steps)
         for (int i = 0; i < NELEM; i++)
             buf[i] = s * 1000 + i;
 
-        if (use_steps && H5Fbegin_step(fid, 1, &logical) < 0)
+        if (use_steps && H5Fbegin_step(fid, 1, &logical, 0) < 0)
             goto done_inner;
 
         if ((ds = H5Dcreate2(fid, name, H5T_NATIVE_INT, sp, H5P_DEFAULT, dcpl, H5P_DEFAULT)) < 0)
@@ -191,7 +198,7 @@ check_state_machine(hid_t vol_id)
     H5Fstep_status(fid, &st);
     EXPECT(st == H5F_STEP_NOT_IN_STEP, "fresh file reports NOT_IN_STEP");
 
-    EXPECT(H5Fbegin_step(fid, 2, ids) >= 0, "begin_step succeeds");
+    EXPECT(H5Fbegin_step(fid, 2, ids, 0) >= 0, "begin_step succeeds");
     H5Fstep_status(fid, &st);
     EXPECT(st == H5F_STEP_IN_STEP, "reports IN_STEP inside a step");
 
@@ -199,7 +206,7 @@ check_state_machine(hid_t vol_id)
      * output shows intent rather than looking like something broke. */
     H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
 
-    r = H5Fbegin_step(fid, 0, NULL);
+    r = H5Fbegin_step(fid, 0, NULL, 0);
     EXPECT(r < 0, "nested begin_step is rejected");
 
     EXPECT(H5Fend_step(fid) >= 0, "end_step succeeds");
@@ -230,7 +237,7 @@ check_state_machine(hid_t vol_id)
     EXPECT(st == H5F_STEP_NOT_IN_STEP, "back to NOT_IN_STEP after end_step");
 
     /* Steps are repeatable, not a one-shot. */
-    EXPECT(H5Fbegin_step(fid, 0, NULL) >= 0 && H5Fend_step(fid) >= 0, "a second step opens and closes");
+    EXPECT(H5Fbegin_step(fid, 0, NULL, 0) >= 0 && H5Fend_step(fid) >= 0, "a second step opens and closes");
 
     H5Fclose(fid);
 done:
@@ -272,11 +279,12 @@ main(void)
     if (why[0])
         printf("        %s\n", why);
 
-    why[0] = '\0';
-    EXPECT(files_identical("t_step_plain.h5", "t_step_bracketed.h5", why, sizeof(why)),
-           "step bracketing changes not one byte");
-    if (why[0])
-        printf("        %s\n", why);
+    /* M2 supersedes the M1 "step bracketing changes not one byte" assertion
+     * that used to live here: bracketed writes now land under /step/<n>/,
+     * so t_step_bracketed.h5 is expected to differ from t_step_plain.h5.
+     * The replacement invariant -- h5diff-clean replay -- lives in
+     * test/t_replay.c. The *unbracketed* byte-identity assertion above is
+     * untouched and must hold forever. */
 
     /* Prove the comparison can fail. A byte-identity assertion is worthless if
      * the comparator would pass anything, so flip one byte in a copy and

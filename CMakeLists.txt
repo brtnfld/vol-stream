@@ -46,12 +46,80 @@ endif()
 option(VOL_STREAM_ENABLE_LOGGING "Log every VOL callback to stdout" OFF)
 option(VOL_STREAM_BUILD_TESTS "Build the test programs" ON)
 
+# ---------------------------------------------------------------------------
+# flatcc -- manifest framing (M2)
+#
+# The step manifest (src/vol_stream.fbs) is FlatBuffers, chosen so a later
+# field (M8's predicate) is a compatible schema change rather than a wire
+# break. flatcc has no exported CMake package config, so probe for a
+# Spack-provided install first and fall back to vendoring via FetchContent.
+#
+# The vendored build needs two overrides confirmed against the actual
+# v0.6.1 release, not assumed:
+#   - CMAKE_POLICY_VERSION_MINIMUM=3.5: flatcc's own cmake_minimum_required
+#     predates what modern CMake accepts.
+#   - FLATCC_ALLOW_WERROR=OFF: flatccrt fails to build under GCC 15
+#     (-Werror plus a -Wunterminated-string-initialization new in GCC 15,
+#     in a bundled portable/grisu3_print.h shim flatcc doesn't control).
+# ---------------------------------------------------------------------------
+find_program(FLATCC_EXECUTABLE flatcc)
+find_library(FLATCC_RUNTIME_LIBRARY flatccrt)
+find_path(FLATCC_INCLUDE_DIR flatcc/flatcc_builder.h)
+
+if(FLATCC_EXECUTABLE AND FLATCC_RUNTIME_LIBRARY AND FLATCC_INCLUDE_DIR)
+  message(STATUS "flatcc: found (${FLATCC_EXECUTABLE})")
+  set(VOL_STREAM_FLATCC_EXE ${FLATCC_EXECUTABLE})
+  add_library(vol_stream_flatccrt UNKNOWN IMPORTED)
+  set_target_properties(vol_stream_flatccrt PROPERTIES
+    IMPORTED_LOCATION ${FLATCC_RUNTIME_LIBRARY}
+    INTERFACE_INCLUDE_DIRECTORIES ${FLATCC_INCLUDE_DIR})
+  set(VOL_STREAM_FLATCC_RT_TARGET vol_stream_flatccrt)
+else()
+  message(STATUS "flatcc: not found, vendoring v0.6.1 via FetchContent")
+  include(FetchContent)
+  set(FLATCC_TEST OFF CACHE BOOL "" FORCE)
+  set(FLATCC_CXX_TEST OFF CACHE BOOL "" FORCE)
+  set(FLATCC_INSTALL OFF CACHE BOOL "" FORCE)
+  set(FLATCC_ALLOW_WERROR OFF CACHE BOOL "" FORCE)
+  set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+  FetchContent_Declare(flatcc
+    GIT_REPOSITORY https://github.com/dvidelabs/flatcc.git
+    GIT_TAG        v0.6.1
+    GIT_SHALLOW    TRUE)
+  FetchContent_MakeAvailable(flatcc)
+  unset(CMAKE_POLICY_VERSION_MINIMUM)
+  set(VOL_STREAM_FLATCC_EXE $<TARGET_FILE:flatcc_cli>)
+  set(VOL_STREAM_FLATCC_RT_TARGET flatccrt)
+  # flatcc's own CMakeLists.txt uses directory-scoped include_directories()
+  # rather than target_include_directories(), so linking against flatccrt
+  # does not propagate its include path the way a normal target would --
+  # add it explicitly.
+  set(FLATCC_INCLUDE_DIR ${flatcc_SOURCE_DIR}/include)
+endif()
+
+set(VOL_STREAM_FBS ${CMAKE_CURRENT_SOURCE_DIR}/src/vol_stream.fbs)
+set(VOL_STREAM_FBS_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
+set(VOL_STREAM_FBS_GEN_HDR ${VOL_STREAM_FBS_GEN_DIR}/vol_stream_builder.h)
+
+add_custom_command(
+  OUTPUT ${VOL_STREAM_FBS_GEN_HDR}
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${VOL_STREAM_FBS_GEN_DIR}
+  COMMAND ${VOL_STREAM_FLATCC_EXE} -a -o ${VOL_STREAM_FBS_GEN_DIR} ${VOL_STREAM_FBS}
+  DEPENDS ${VOL_STREAM_FBS} $<$<TARGET_EXISTS:flatcc_cli>:flatcc_cli>
+  COMMENT "Generating flatcc headers for vol_stream.fbs"
+  VERBATIM)
+add_custom_target(vol_stream_fbs_gen DEPENDS ${VOL_STREAM_FBS_GEN_HDR})
+
 add_library(vol_stream SHARED src/H5VLstream.c)
+add_dependencies(vol_stream vol_stream_fbs_gen)
 
 target_include_directories(vol_stream
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
     $<INSTALL_INTERFACE:include>
+  PRIVATE
+    ${VOL_STREAM_FBS_GEN_DIR}
+    ${FLATCC_INCLUDE_DIR}
 )
 
 if(HDF5_INCLUDE_DIRS)
@@ -59,6 +127,7 @@ if(HDF5_INCLUDE_DIRS)
 endif()
 
 target_link_libraries(vol_stream PUBLIC ${HDF5_C_LIBRARIES})
+target_link_libraries(vol_stream PRIVATE ${VOL_STREAM_FLATCC_RT_TARGET})
 
 if(MPI_C_FOUND)
   target_link_libraries(vol_stream PUBLIC MPI::MPI_C)
@@ -150,8 +219,9 @@ install(TARGETS vol_stream LIBRARY DESTINATION lib)
 install(FILES src/H5VLstream.h DESTINATION include)
 
 message(STATUS "")
-message(STATUS "vol-stream ${VOL_STREAM_VERSION}  (M0 - pass-through skeleton)")
+message(STATUS "vol-stream ${VOL_STREAM_VERSION}  (M2 - manifest, capture, and the replay invariant)")
 message(STATUS "  HDF5:            ${HDF5_VERSION}")
+message(STATUS "  flatcc:          ${VOL_STREAM_FLATCC_EXE}")
 message(STATUS "  logging:         ${VOL_STREAM_ENABLE_LOGGING}")
 message(STATUS "  tests:           ${VOL_STREAM_BUILD_TESTS}")
 message(STATUS "  h5sign:          ${H5SIGN_EXECUTABLE}")
