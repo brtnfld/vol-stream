@@ -17,6 +17,15 @@
  *              decoded and replayed group-based under /step/<n>/ in the
  *              underlying file.  Unbracketed writes remain a pure pass-through,
  *              identical to native HDF5.
+ *
+ *              M3 status: a file opened read-only is a reader. H5Fbegin_step()
+ *              advances a read cursor instead of starting write capture, and
+ *              subsequent object opens transparently resolve a bare app-given
+ *              path to the correct /step/<k>/<path> replica -- the largest
+ *              physical step at or before the reader's current one that
+ *              actually has an entry for that path. H5Fbegin_logical_step()/
+ *              H5Fget_logical_steps() do the same by logical id instead of
+ *              physical step, skipping restart-superseded occurrences.
  */
 
 #ifndef H5VLstream_H
@@ -81,17 +90,21 @@ H5VL_STREAM_API extern hid_t H5VL_STREAM_g;
  * two connectors cannot collide, and so a future connector wanting source
  * compatibility can register the same strings.
  */
-#define H5VL_STREAM_OP_BEGIN_STEP  "vol-stream:begin_step"
-#define H5VL_STREAM_OP_END_STEP    "vol-stream:end_step"
-#define H5VL_STREAM_OP_STEP_STATUS "vol-stream:step_status"
-#define H5VL_STREAM_OP_SUBSCRIBE   "vol-stream:subscribe"
+#define H5VL_STREAM_OP_BEGIN_STEP         "vol-stream:begin_step"
+#define H5VL_STREAM_OP_END_STEP           "vol-stream:end_step"
+#define H5VL_STREAM_OP_STEP_STATUS        "vol-stream:step_status"
+#define H5VL_STREAM_OP_SUBSCRIBE          "vol-stream:subscribe"
+#define H5VL_STREAM_OP_BEGIN_LOGICAL_STEP "vol-stream:begin_logical_step"
+#define H5VL_STREAM_OP_GET_LOGICAL_STEPS  "vol-stream:get_logical_steps"
 
 /** Status of the current step */
 typedef enum H5F_step_status_t {
     H5F_STEP_NOT_IN_STEP = 0, /**< No step is open                     */
     H5F_STEP_IN_STEP     = 1, /**< A step is open and accepting writes */
     H5F_STEP_COMMITTING  = 2, /**< end_step in progress                */
-    H5F_STEP_EOS         = 3  /**< Writer closed; no further steps     */
+    H5F_STEP_EOS         = 3, /**< Writer closed; no further steps     */
+    H5F_STEP_READING     = 4  /**< M3: reader positioned at a step; begin_step
+                                *   advances it                             */
 } H5F_step_status_t;
 
 /**
@@ -114,6 +127,13 @@ typedef enum H5F_step_status_t {
  *       logical ids that have already been seen, and a single monotone counter
  *       cannot represent that -- a problem openPMD hit in production against
  *       ADIOS2 and solved with an explicit annotation.
+ *
+ * \note M3: on a file opened H5F_ACC_RDONLY, this call is a *reader*
+ *       operation instead -- it advances the read cursor to the next
+ *       physical step (n_logical/logical_ids/wall_time_ns are write-only and
+ *       ignored) and returns -1 once there is no next step. Object opens
+ *       made afterward resolve bare paths against that step; see
+ *       H5Fbegin_logical_step() to jump to a step by logical id instead.
  */
 H5VL_STREAM_API herr_t H5Fbegin_step(hid_t file_id, size_t n_logical, const uint64_t *logical_ids,
                                       uint64_t wall_time_ns);
@@ -137,6 +157,42 @@ H5VL_STREAM_API herr_t H5Fend_step(hid_t file_id);
  * \return \herr_t
  */
 H5VL_STREAM_API herr_t H5Fstep_status(hid_t file_id, H5F_step_status_t *status);
+
+/**
+ * \brief Position a reader's read cursor at the authoritative physical step
+ *        for \p logical_id.
+ *
+ * "Authoritative" is the largest physical step whose manifest carries
+ * \p logical_id -- if a restart rewrote it, this resolves to the later,
+ * superseding occurrence, never an earlier one. \p file_id must be a reader
+ * (opened H5F_ACC_RDONLY); see H5Fbegin_step() for the writer/reader
+ * distinction.
+ *
+ * \param file_id     File opened through the vol-stream connector for reading
+ * \param logical_id  Logical step id to position at
+ * \return \herr_t, -1 if \p logical_id never appears in any step
+ */
+H5VL_STREAM_API herr_t H5Fbegin_logical_step(hid_t file_id, uint64_t logical_id);
+
+/**
+ * \brief Query the deduped, ascending, authoritative-only logical step ids
+ *        present in \p file_id.
+ *
+ * A logical id superseded by a restart (see dev-plan.md decision #1) appears
+ * once here, not once per physical occurrence -- this is the set a reader
+ * would iterate to see the stream's logical history in order, each id
+ * resolvable via H5Fbegin_logical_step().
+ *
+ * Two-call size-then-fill idiom, matching H5Tencode(): call once with
+ * \p logical_ids NULL to get the count in \c *n_logical, then again with a
+ * buffer of at least that size.
+ *
+ * \param file_id     File opened through the vol-stream connector for reading
+ * \param n_logical   INOUT: buffer capacity in, id count out
+ * \param logical_ids OUT: ascending logical ids, or NULL to size only
+ * \return \herr_t
+ */
+H5VL_STREAM_API herr_t H5Fget_logical_steps(hid_t file_id, size_t *n_logical, uint64_t *logical_ids);
 
 /**
  * \brief Declare reader interest in part of a stream.

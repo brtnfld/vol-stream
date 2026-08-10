@@ -1,4 +1,4 @@
-foreach(t t_smoke t_step t_replay)
+foreach(t t_smoke t_step t_replay t_reader)
   add_executable(${t} ${t}.c)
   target_link_libraries(${t} PRIVATE vol_stream)
 endforeach()
@@ -6,6 +6,7 @@ endforeach()
 add_test(NAME smoke COMMAND t_smoke)
 add_test(NAME step COMMAND t_step)
 add_test(NAME replay COMMAND t_replay)
+add_test(NAME reader COMMAND t_reader)
 
 # VOL_STREAM_H5DIFF points t_replay (the M2 replay-invariant gate) at an
 # h5diff binary when it is not on PATH -- e.g. an uninstalled HDF5 build
@@ -13,7 +14,7 @@ add_test(NAME replay COMMAND t_replay)
 # itself (see the HDF5-discovery note at the top of ../CMakeLists.txt).
 set(VOL_STREAM_H5DIFF "" CACHE FILEPATH "h5diff binary used by the t_replay test (default: PATH lookup)")
 
-set_tests_properties(smoke step replay PROPERTIES
+set_tests_properties(smoke step replay reader PROPERTIES
   ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>;VOL_STREAM_H5DIFF=${VOL_STREAM_H5DIFF}"
 )
 
