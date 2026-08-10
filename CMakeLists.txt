@@ -82,11 +82,29 @@ else()
   set(FLATCC_INSTALL OFF CACHE BOOL "" FORCE)
   set(FLATCC_ALLOW_WERROR OFF CACHE BOOL "" FORCE)
   set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+
+  # flatcc_cli is a build-time code generator, invoked below to produce our
+  # own headers -- it is never linked into vol_stream. A sanitizer build
+  # (-fsanitize=... in CMAKE_C_FLAGS, e.g. the CI sanitizer matrix) would
+  # otherwise instrument it too, and running the instrumented tool trips
+  # real, pre-existing UB in flatcc's own code (misaligned loads in its
+  # bundled cmetrohash, a null passed to a never-null codegen parameter)
+  # that aborts the codegen step outright -- unrelated to whether our own
+  # code has any issues. Shadow CMAKE_C_FLAGS (non-cache set(), so it only
+  # affects this directory scope and everything FetchContent pulls in
+  # here) with the -fsanitize= token stripped, then restore it immediately
+  # after so vol_stream itself still gets the real flags.
+  set(_vol_stream_saved_c_flags "${CMAKE_C_FLAGS}")
+  string(REGEX REPLACE "-fsanitize=[A-Za-z,]+" "" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
+
   FetchContent_Declare(flatcc
     GIT_REPOSITORY https://github.com/dvidelabs/flatcc.git
     GIT_TAG        v0.6.1
     GIT_SHALLOW    TRUE)
   FetchContent_MakeAvailable(flatcc)
+
+  set(CMAKE_C_FLAGS "${_vol_stream_saved_c_flags}")
+  unset(_vol_stream_saved_c_flags)
   unset(CMAKE_POLICY_VERSION_MINIMUM)
   set(VOL_STREAM_FLATCC_EXE $<TARGET_FILE:flatcc_cli>)
   set(VOL_STREAM_FLATCC_RT_TARGET flatccrt)

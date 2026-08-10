@@ -12,12 +12,11 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Build and smoke-test against several HDF5 versions.
+  # Build and smoke-test against HDF5 develop.
   #
-  # Version skew is the failure mode with precedent: the ADIOS2 connector broke
-  # when H5VL_VERSION moved and its declared version no longer matched. It is 3
-  # today and will move again, so this matrix exists from M0 rather than after
-  # the first bug report.
+  # Only develop is tracked -- older releases are not a support target, so the
+  # matrix's job is catching drift against HEAD (H5VL_VERSION is 3 today and
+  # will move again), not cross-version compatibility.
   # ---------------------------------------------------------------------------
   build:
     name: hdf5 ${{ matrix.hdf5 }} / ${{ matrix.mpi }}
@@ -27,8 +26,6 @@ jobs:
       matrix:
         include:
           - hdf5: develop
-            mpi: mpich
-          - hdf5: hdf5_1_14
             mpi: mpich
           # Intercommunicator and dynamic-process behaviour differ between MPI
           # implementations in practice, so both are tested from the start.
@@ -73,7 +70,8 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_PREFIX_PATH=$PWD/hdf5-install \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DVOL_STREAM_H5DIFF=$PWD/hdf5-install/bin/h5diff
           cmake --build build --parallel
 
       - name: Smoke test
@@ -122,17 +120,18 @@ jobs:
 
       # Ubuntu's libhdf5-dev is 1.10.10, below the 1.14 floor CMakeLists.txt
       # enforces, so find_package(HDF5) fails before the sanitizer build ever
-      # starts. Build the same pinned release the main matrix uses instead of
-      # relying on the system package.
-      - name: Build HDF5 hdf5_1_14
+      # starts. Build develop instead of relying on the system package --
+      # same version the main matrix uses, since older releases aren't a
+      # support target. HDF5_BUILD_TOOLS=ON so h5diff exists for t_replay.
+      - name: Build HDF5 develop
         run: |
-          git clone --depth 1 --branch hdf5_1_14 \
+          git clone --depth 1 --branch develop \
             https://github.com/HDFGroup/hdf5.git hdf5-src
           cmake -S hdf5-src -B hdf5-build -G Ninja \
             -DCMAKE_INSTALL_PREFIX=$PWD/hdf5-install \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_TESTING=OFF \
-            -DHDF5_BUILD_TOOLS=OFF \
+            -DHDF5_BUILD_TOOLS=ON \
             -DHDF5_BUILD_EXAMPLES=OFF \
             -DHDF5_BUILD_FORTRAN=OFF \
             -DHDF5_BUILD_CPP_LIB=OFF
@@ -144,7 +143,8 @@ jobs:
           cmake -S . -B build -G Ninja \
             -DCMAKE_PREFIX_PATH=$PWD/hdf5-install \
             -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_C_FLAGS="-fsanitize=${{ matrix.san }} -fno-omit-frame-pointer -g"
+            -DCMAKE_C_FLAGS="-fsanitize=${{ matrix.san }} -fno-omit-frame-pointer -g" \
+            -DVOL_STREAM_H5DIFF=$PWD/hdf5-install/bin/h5diff
           cmake --build build --parallel
 
       - name: Smoke test
