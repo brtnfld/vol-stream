@@ -86,12 +86,18 @@ hg_proc_vs_blob_t(hg_proc_t proc, void *data)
     }
 }
 
-/* M8: reader -> writer, "send me path's data" (whole-object granularity,
- * see this file's header comment). */
-MERCURY_GEN_PROC(vs_subscribe_in_t, ((uint64_t)(member_id))((hg_string_t)(path)))
+/* M8: reader -> writer, "send me path's data". M8.5: bounded to the 1-D
+ * element range [sel_start, sel_start+sel_count) -- see this file's M8/M8.5
+ * header comment. */
+MERCURY_GEN_PROC(vs_subscribe_in_t,
+                  ((uint64_t)(member_id))((hg_string_t)(path))((uint64_t)(sel_start))((uint64_t)(sel_count)))
 MERCURY_GEN_PROC(vs_subscribe_out_t, ((int32_t)(status)))
-/* M8: writer -> reader, one entry's actual bytes. */
-MERCURY_GEN_PROC(vs_data_push_in_t, ((uint64_t)(physical_step))((hg_string_t)(path))((vs_blob_t)(payload)))
+/* M8: writer -> reader, one entry's actual bytes. M8.5: elem_start/
+ * elem_count identify which element range of the subscribed object payload
+ * covers -- the overlap between what was written and what was requested,
+ * not necessarily the subscriber's whole requested range. */
+MERCURY_GEN_PROC(vs_data_push_in_t, ((uint64_t)(physical_step))((hg_string_t)(path))((uint64_t)(elem_start))(
+                                          (uint64_t)(elem_count))((vs_blob_t)(payload)))
 MERCURY_GEN_PROC(vs_data_push_out_t, ((int32_t)(status)))
 
 typedef struct vs_tr_pending_t {
@@ -107,21 +113,28 @@ typedef struct vs_tr_lag_entry_t {
     uint64_t         acked_step;
 } vs_tr_lag_entry_t;
 
-/* M8, writer side: one (subscriber, path) pair. A reader with several
- * subscriptions appears once per path, not once per reader -- simplest thing
- * that works for whole-object granularity, and small enough not to need a
- * smarter index. */
+/* M8, writer side: one (subscriber, path, requested range) tuple. A reader
+ * with several subscriptions appears once per path, not once per reader --
+ * simplest thing that works, and small enough not to need a smarter index.
+ * M8.5: sel_start/sel_count is the subscriber's own requested 1-D element
+ * range; [0, UINT64_MAX) means "whole object". */
 typedef struct vs_tr_sub_entry_t {
     ssg_member_id_t member_id;
     char            *path;
+    uint64_t          sel_start;
+    uint64_t          sel_count;
 } vs_tr_sub_entry_t;
 
-/* M8, reader side: one pushed data item queued for vs_tr_reader_wait_data(). */
+/* M8, reader side: one pushed data item queued for vs_tr_reader_wait_data().
+ * M8.5: elem_start/elem_count is the element range buf actually covers (see
+ * vs_data_push_in_t's comment). */
 typedef struct vs_tr_data_item_t {
     uint64_t physical_step;
     char    *path;
     void    *buf;
     uint64_t size;
+    uint64_t elem_start;
+    uint64_t elem_count;
 } vs_tr_data_item_t;
 
 struct vs_tr_t {
@@ -226,7 +239,8 @@ vs_push_pending(vs_tr_t *tr, uint64_t physical_step, uint64_t wall_time_ns)
 /* M8: takes ownership of path/buf on success (frees them itself if the queue
  * cannot grow); the caller's own copies must not be used afterward. */
 static void
-vs_push_data_item(vs_tr_t *tr, uint64_t physical_step, char *path, void *buf, uint64_t size)
+vs_push_data_item(vs_tr_t *tr, uint64_t physical_step, char *path, void *buf, uint64_t size,
+                    uint64_t elem_start, uint64_t elem_count)
 {
     pthread_mutex_lock(&tr->data_lock);
 
@@ -244,6 +258,8 @@ vs_push_data_item(vs_tr_t *tr, uint64_t physical_step, char *path, void *buf, ui
         tr->data_queue[tr->n_data].path          = path;
         tr->data_queue[tr->n_data].buf           = buf;
         tr->data_queue[tr->n_data].size          = size;
+        tr->data_queue[tr->n_data].elem_start    = elem_start;
+        tr->data_queue[tr->n_data].elem_count    = elem_count;
         tr->n_data++;
     }
     else {
@@ -408,10 +424,12 @@ vs_reader_ack_ult(hg_handle_t handle)
 DEFINE_MARGO_RPC_HANDLER(vs_reader_ack_ult)
 
 /* M8: writer-side handler for vs_subscribe_in_t. Same thread discipline as
- * vs_reader_ack_ult -- touches only sub_table under sub_lock. Duplicate
- * subscriptions from the same member for the same path are harmless (a
- * later push would just be sent to that member twice), but are still
- * de-duplicated here to keep vs_tr_writer_push_data()'s fan-out honest. */
+ * vs_reader_ack_ult -- touches only sub_table under sub_lock. A repeat
+ * subscription from the same member for the same path replaces the stored
+ * range rather than adding a second entry -- one (member, path) always
+ * means exactly one requested range in this increment (M8.5 does not
+ * support a single reader subscribing to several disjoint subranges of the
+ * same object). */
 static void
 vs_subscribe_ult(hg_handle_t handle)
 {
@@ -432,6 +450,8 @@ vs_subscribe_ult(hg_handle_t handle)
         for (i = 0; i < tr->n_sub; i++)
             if (tr->sub_table[i].member_id == (ssg_member_id_t)in.member_id &&
                 strcmp(tr->sub_table[i].path, in.path) == 0) {
+                tr->sub_table[i].sel_start = in.sel_start;
+                tr->sub_table[i].sel_count = in.sel_count;
                 found = 1;
                 break;
             }
@@ -453,6 +473,8 @@ vs_subscribe_ult(hg_handle_t handle)
                 if (path_copy) {
                     tr->sub_table[tr->n_sub].member_id = (ssg_member_id_t)in.member_id;
                     tr->sub_table[tr->n_sub].path      = path_copy;
+                    tr->sub_table[tr->n_sub].sel_start = in.sel_start;
+                    tr->sub_table[tr->n_sub].sel_count = in.sel_count;
                     tr->n_sub++;
                 }
             }
@@ -490,7 +512,8 @@ vs_data_push_ult(hg_handle_t handle)
         char *path_copy = in.path ? strdup(in.path) : NULL;
 
         if (path_copy) {
-            vs_push_data_item(tr, in.physical_step, path_copy, in.payload.buf, in.payload.size);
+            vs_push_data_item(tr, in.physical_step, path_copy, in.payload.buf, in.payload.size, in.elem_start,
+                                in.elem_count);
             in.payload.buf = NULL; /* ownership moved -- do not let margo_free_input() free it too */
             out.status      = 0;
         }
@@ -993,7 +1016,7 @@ vs_tr_writer_min_acked_step(vs_tr_t *tr, uint64_t *min_acked_step)
 }
 
 int
-vs_tr_reader_subscribe(vs_tr_t *tr, const char *path)
+vs_tr_reader_subscribe(vs_tr_t *tr, const char *path, uint64_t sel_start, uint64_t sel_count)
 {
     ssg_member_id_t     self_id;
     vs_subscribe_in_t in;
@@ -1006,6 +1029,8 @@ vs_tr_reader_subscribe(vs_tr_t *tr, const char *path)
 
     in.member_id = (uint64_t)self_id;
     in.path       = (hg_string_t)path;
+    in.sel_start  = sel_start;
+    in.sel_count  = sel_count;
 
     /* Same target-the-cached-writer-then-fall-back-to-probing approach as
      * vs_tr_reader_ack_step() -- see that function's comment. */
@@ -1071,13 +1096,14 @@ vs_tr_reader_subscribe(vs_tr_t *tr, const char *path)
 }
 
 int
-vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, const void *buf, uint64_t size)
+vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, const void *buf,
+                        uint64_t elem_size, uint64_t write_start, uint64_t write_count)
 {
     ssg_member_id_t   self_id;
     int                 group_size, i;
-    vs_data_push_in_t in;
+    uint64_t           write_end;
 
-    if (!tr || !path)
+    if (!tr || !path || elem_size == 0)
         return -1;
     if (tr->group_id == SSG_GROUP_ID_INVALID)
         return 0; /* no group -- no subscribers possible, same "proceed" tolerance as broadcast */
@@ -1086,10 +1112,7 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
     if (SSG_SUCCESS != ssg_get_group_size(tr->group_id, &group_size))
         return 0;
 
-    in.physical_step   = physical_step;
-    in.path              = (hg_string_t)path;
-    in.payload.size     = size;
-    in.payload.buf      = (void *)(uintptr_t)buf; /* HG_ENCODE only reads this -- see hg_proc_vs_blob_t() */
+    write_end = write_start + write_count;
 
     for (i = 0; i < group_size; i++) {
         ssg_member_id_t member_id;
@@ -1097,6 +1120,8 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
         hg_handle_t        handle;
         size_t             j;
         int                subscribed = 0;
+        uint64_t           sub_start = 0, sub_end = 0, overlap_start, overlap_end, overlap_count;
+        vs_data_push_in_t in;
 
         if (SSG_SUCCESS != ssg_get_group_member_id_from_rank(tr->group_id, i, &member_id))
             continue;
@@ -1106,6 +1131,12 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
         pthread_mutex_lock(&tr->sub_lock);
         for (j = 0; j < tr->n_sub; j++)
             if (tr->sub_table[j].member_id == member_id && strcmp(tr->sub_table[j].path, path) == 0) {
+                sub_start = tr->sub_table[j].sel_start;
+                /* UINT64_MAX sel_count means "whole object" -- keep sub_end
+                 * at the UINT64_MAX sentinel too rather than computing
+                 * sel_start + sel_count, which would overflow. */
+                sub_end   = (tr->sub_table[j].sel_count == UINT64_MAX) ? UINT64_MAX
+                                                                        : sub_start + tr->sub_table[j].sel_count;
                 subscribed = 1;
                 break;
             }
@@ -1113,6 +1144,28 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
 
         if (!subscribed)
             continue;
+
+        /* M8.5: only the overlap between what this member asked for and
+         * what was just written -- never the whole write, and never
+         * anything the member did not ask for. A subscriber whose range
+         * does not touch this write at all gets nothing this call, not an
+         * empty push (see this function's header comment). */
+        overlap_start = (sub_start > write_start) ? sub_start : write_start;
+        overlap_end   = (sub_end < write_end) ? sub_end : write_end;
+        if (overlap_start >= overlap_end)
+            continue;
+        overlap_count = overlap_end - overlap_start;
+
+        in.physical_step = physical_step;
+        in.path             = (hg_string_t)path;
+        in.elem_start       = overlap_start;
+        in.elem_count       = overlap_count;
+        in.payload.size    = overlap_count * elem_size;
+        /* HG_ENCODE only reads this -- see hg_proc_vs_blob_t(). Slicing by
+         * byte offset into buf: buf's own first element is write_start, so
+         * the overlap begins (overlap_start - write_start) elements in. */
+        in.payload.buf =
+            (void *)((const uint8_t *)buf + (overlap_start - write_start) * elem_size);
 
         if (SSG_SUCCESS != ssg_get_group_member_addr(tr->group_id, member_id, &addr))
             continue;
@@ -1136,7 +1189,8 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
 
 int
 vs_tr_reader_wait_data(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physical_step, char **out_path,
-                         void **out_buf, uint64_t *out_size)
+                         void **out_buf, uint64_t *out_size, uint64_t *out_elem_start,
+                         uint64_t *out_elem_count)
 {
     struct timespec deadline;
     int             ret = -1;
@@ -1171,6 +1225,10 @@ vs_tr_reader_wait_data(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physical_step
             free(tr->data_queue[0].buf);
         if (out_size)
             *out_size = tr->data_queue[0].size;
+        if (out_elem_start)
+            *out_elem_start = tr->data_queue[0].elem_start;
+        if (out_elem_count)
+            *out_elem_count = tr->data_queue[0].elem_count;
         memmove(&tr->data_queue[0], &tr->data_queue[1], (tr->n_data - 1) * sizeof(*tr->data_queue));
         tr->n_data--;
         ret = 0;

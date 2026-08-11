@@ -62,6 +62,15 @@ mkdir -p "$OUTDIR"
 cd "$OUTDIR" || exit 2
 rm -f t_parallel.h5
 
+# MPICH's default UCX transport probes for real InfiniBand hardware
+# (ibv_create_srq() etc.) and aborts outright on a plain cloud VM that has
+# none -- confirmed in CI ("ibv_create_srq() failed: Operation not
+# supported", MPI_Init() itself failing before a single rank starts).
+# Restricting to tcp/shared-memory/self transports is the standard fix and
+# is exactly what na+sm-over-a-single-node needs anyway; harmless for Open
+# MPI (a plain env var UCX-unaware MPI simply never reads).
+export UCX_TLS=tcp,self,sm
+
 GLOBAL_SIZE=$((WRITER_RANKS * PER_RANK))
 
 echo "vol-stream M6 exit gate (first increment): ${WRITER_RANKS} writers -> ${READER_RANKS} readers"

@@ -27,11 +27,21 @@
  * checking every value against a closed-form expected result is a more
  * direct exactness check than a file-level diff would add.
  *
- * Heterogeneous per-rank object sets (rank 0 creating a dataset rank 1
- * never touches) and the Subfiling-style I/O-concentrator aggregation
- * topology are out of scope for this increment -- see
- * H5VL__stream_replay_step()'s comment for why this simpler case does not
- * need cross-rank manifest aggregation at all.
+ * M6.5 (docs/dev-plan.md): each writer rank r ALSO creates its own
+ * genuinely private dataset "priv<r>_<step>" -- a name no other rank ever
+ * touches -- alongside the shared one above. That is heterogeneous per-rank
+ * object creation, which needs H5VL__stream_replay_step_parallel()'s
+ * cross-rank manifest aggregation (see its comment): under M6's own
+ * first-increment scope, every rank had to create the identical object set
+ * for ordinary parallel-HDF5 collective-create semantics to suffice on
+ * their own. The reader job's rank 0 verifies every private dataset from
+ * every writer rank still exists and is correct, on top of the shared
+ * dataset's own M×N redistribution check.
+ *
+ * Still out of scope: the Subfiling-style I/O-concentrator aggregation
+ * topology (every rank still does its own raw-data I/O directly -- correct,
+ * just not the aggregation-point architecture dev-plan.md's M6 section
+ * names for scale).
  */
 
 #include <mpi.h>
@@ -102,9 +112,10 @@ do_write(const char *fname, int global_size)
     }
 
     for (s = 0; s < NSTEPS; s++) {
-        char           name[32];
+        char           name[32], priv_name[32];
         const uint64_t logical = (uint64_t)(100 + s);
-        hid_t          ds, fspace_sel;
+        hid_t          ds, fspace_sel, priv_space, priv_ds;
+        int            priv_val;
 
         snprintf(name, sizeof(name), "d%d", s);
         for (i = 0; i < per_rank; i++)
@@ -134,6 +145,25 @@ do_write(const char *fname, int global_size)
 
         H5Sclose(fspace_sel);
         H5Dclose(ds);
+
+        /* M6.5: a genuinely private object -- no other rank ever creates or
+         * writes "priv<world_rank>_<s>", exercising cross-rank manifest
+         * aggregation for real rather than just deduplicating identical
+         * creates. */
+        snprintf(priv_name, sizeof(priv_name), "priv%d_%d", world_rank, s);
+        priv_val = world_rank * 10000 + s;
+        if ((priv_space = H5Screate(H5S_SCALAR)) < 0) {
+            fprintf(stderr, "rank %d: FAIL create priv dataspace %d\n", world_rank, s);
+            return 1;
+        }
+        if ((priv_ds = H5Dcreate2(fid, priv_name, H5T_NATIVE_INT, priv_space, H5P_DEFAULT, H5P_DEFAULT,
+                                   H5P_DEFAULT)) < 0 ||
+            H5Dwrite(priv_ds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, &priv_val) < 0) {
+            fprintf(stderr, "rank %d: FAIL create/write priv dataset %d\n", world_rank, s);
+            return 1;
+        }
+        H5Dclose(priv_ds);
+        H5Sclose(priv_space);
 
         if (H5Fend_step(fid) < 0) {
             fprintf(stderr, "rank %d: FAIL end_step %d\n", world_rank, s);
@@ -237,6 +267,40 @@ do_read(const char *fname, int global_size, int writer_ranks)
         H5Sclose(memspace);
         H5Sclose(filespace);
         H5Dclose(ds);
+
+        /* M6.5: every writer rank's private dataset must exist and be
+         * correct -- the direct proof that heterogeneous per-rank creates
+         * actually landed via cross-rank manifest aggregation, not just
+         * the shared dataset's own M×N redistribution. Rank 0 only:
+         * nothing here needs redistributing, and HDF5's independent
+         * (non-collective) metadata-read default makes an unbalanced
+         * per-rank open safe. */
+        if (world_rank == 0) {
+            int w;
+
+            for (w = 0; w < writer_ranks; w++) {
+                char  priv_name[32];
+                hid_t priv_ds;
+                int   priv_val = -1, expected_priv = w * 10000 + s;
+
+                snprintf(priv_name, sizeof(priv_name), "priv%d_%d", w, s);
+                if ((priv_ds = H5Dopen2(fid, priv_name, H5P_DEFAULT)) < 0) {
+                    fprintf(stderr, "  FAIL  open private dataset '%s'\n", priv_name);
+                    nerrors++;
+                    continue;
+                }
+                if (H5Dread(priv_ds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, &priv_val) < 0) {
+                    fprintf(stderr, "  FAIL  read private dataset '%s'\n", priv_name);
+                    nerrors++;
+                }
+                else if (priv_val != expected_priv) {
+                    fprintf(stderr, "  FAIL  private dataset '%s': got %d expected %d\n", priv_name,
+                            priv_val, expected_priv);
+                    nerrors++;
+                }
+                H5Dclose(priv_ds);
+            }
+        }
     }
 
     free(buf);
@@ -247,8 +311,8 @@ do_read(const char *fname, int global_size, int writer_ranks)
     MPI_Allreduce(&nerrors, &total_errors, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
     if (total_errors == 0 && world_rank == 0)
         printf("  ok    read phase: %d ranks (decomposition independent of the %d writer ranks), "
-               "all values correct\n",
-               world_size, writer_ranks);
+               "all shared + %d private per-rank values correct\n",
+               world_size, writer_ranks, writer_ranks);
 
     return total_errors > 0 ? 1 : 0;
 }

@@ -357,12 +357,16 @@ H5VL_STREAM_API herr_t H5Fsubscribe(hid_t file_id, size_t count, const char *con
                     const hid_t *plists);
 
 /**
- * \brief M8, first increment: reader only. Block until the writer pushes
- *        data for a subscribed path, or \p timeout_ms elapses.
+ * \brief M8/M8.5: reader only. Block until the writer pushes data for a
+ *        subscribed path, or \p timeout_ms elapses.
  *
  * Only paths named in a prior H5Fsubscribe() call on this file ever produce
  * an item here. Several items may be queued (one per subscribed path per
- * step that writes it); each call drains exactly one, oldest first.
+ * step that writes it); each call drains exactly one, oldest first. A
+ * subscription bounded to a subrange (M8.5) may receive several pushes per
+ * step -- one per writer entry overlapping that range, each with its own
+ * \p elem_start / \p elem_count -- rather than one push covering the whole
+ * requested range at once.
  *
  * \param file_id       File opened through the vol-stream connector for
  *                      reading, with the transport enabled
@@ -373,11 +377,14 @@ H5VL_STREAM_API herr_t H5Fsubscribe(hid_t file_id, size_t count, const char *con
  * \param buf           OUT: the pushed bytes, newly malloc()'d -- caller
  *                      frees with free()
  * \param size          OUT: length of \p buf in bytes
+ * \param elem_start    OUT: first (1-D) element index \p buf covers
+ * \param elem_count    OUT: number of elements \p buf covers
  * \return \herr_t, -1 on timeout or if the transport is unavailable for this
  *         file
  */
 H5VL_STREAM_API herr_t H5Fget_subscribed_data(hid_t file_id, uint64_t timeout_ms, uint64_t *physical_step,
-                                                char **path, void **buf, size_t *size);
+                                                char **path, void **buf, size_t *size, uint64_t *elem_start,
+                                                uint64_t *elem_count);
 
 /**
  * \brief M4/M5: reader only. Block until the writer's transport announces a

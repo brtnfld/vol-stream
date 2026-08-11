@@ -170,30 +170,40 @@ int vs_tr_reader_ack_step(vs_tr_t *tr, uint64_t physical_step);
  * that only ever jumps via H5Fbegin_logical_step() never appears here. */
 int vs_tr_writer_min_acked_step(vs_tr_t *tr, uint64_t *min_acked_step);
 
-/* Reader side: declare interest in path (whole-object granularity -- see
- * this file's M8 comment). Best-effort like vs_tr_reader_ack_step(): a
- * failed RPC just means this subscription is not registered and no data for
- * path will arrive, not a fatal error to the caller. Returns 0 if the RPC
- * was delivered and acknowledged, -1 otherwise. */
-int vs_tr_reader_subscribe(vs_tr_t *tr, const char *path);
+/* Reader side: declare interest in path, bounded to the 1-D element range
+ * [sel_start, sel_start + sel_count) -- M8.5's subvolume routing (see this
+ * file's M8/M8.5 comment); pass sel_start=0, sel_count=UINT64_MAX for the
+ * whole object. Best-effort like vs_tr_reader_ack_step(): a failed RPC just
+ * means this subscription is not registered and no data for path will
+ * arrive, not a fatal error to the caller. Returns 0 if the RPC was
+ * delivered and acknowledged, -1 otherwise. */
+int vs_tr_reader_subscribe(vs_tr_t *tr, const char *path, uint64_t sel_start, uint64_t sel_count);
 
-/* Writer side: push buf (size bytes, path's payload for physical_step) to
- * every group member currently subscribed to path. Not an error for there
- * to be no subscribers (the ordinary case for most paths on most steps) --
+/* Writer side: push the subset of buf that overlaps each subscriber's own
+ * requested range to that subscriber (M8.5) -- buf holds write_count
+ * elements of elem_size bytes each, starting at global element offset
+ * write_start; a subscriber whose [sel_start, sel_start+sel_count) does not
+ * overlap [write_start, write_start+write_count) at all receives nothing
+ * for this call, not an empty push. Not an error for there to be no
+ * subscribers at all (the ordinary case for most paths on most steps) --
  * mirrors vs_tr_writer_broadcast_step_ready()'s "no readers, proceed"
  * tolerance. Returns 0 on success (even if an individual member's RPC
  * failed), -1 only on a local error. */
 int vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, const void *buf,
-                            uint64_t size);
+                            uint64_t elem_size, uint64_t write_start, uint64_t write_count);
 
 /* Reader side: block up to timeout_ms for a pushed data item (one may
  * already be queued), filling *physical_step, *out_path (newly malloc'd,
- * caller frees) and *out_buf, *out_size (newly malloc'd, caller frees).
- * timeout_ms == 0 polls without blocking. Returns 0 on success, -1 on
- * timeout or if vs_tr_stop() was called while waiting and no item remains
- * queued. */
+ * caller frees), *out_buf, *out_size (newly malloc'd, caller frees), and
+ * *out_elem_start, *out_elem_count -- the (element-granularity) subrange of
+ * the subscribed object this push covers (M8.5): the whole object's extent
+ * for a whole-object subscription, or the overlap with what the writer
+ * happened to write for a bounded one. timeout_ms == 0 polls without
+ * blocking. Returns 0 on success, -1 on timeout or if vs_tr_stop() was
+ * called while waiting and no item remains queued. */
 int vs_tr_reader_wait_data(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physical_step, char **out_path,
-                            void **out_buf, uint64_t *out_size);
+                            void **out_buf, uint64_t *out_size, uint64_t *out_elem_start,
+                            uint64_t *out_elem_count);
 
 #ifdef __cplusplus
 }

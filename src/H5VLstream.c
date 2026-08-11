@@ -369,6 +369,19 @@ static herr_t H5VL__stream_spill_step(H5VL_stream_t *file_obj);
 static herr_t H5VL__stream_drain_spill(H5VL_stream_t *file_obj, uint64_t min_acked_step);
 #endif
 static herr_t H5VL__stream_apply_queue_policy(H5VL_stream_t *file_obj);
+#ifdef H5_HAVE_PARALLEL
+/* M6.5: heterogeneous per-rank object sets -- see
+ * H5VL__stream_replay_step_parallel()'s comment for the full design. */
+static herr_t H5VL__stream_build_agg_manifest(H5VL_stream_file_state_t *fs, uint8_t **out_buf,
+                             size_t *out_len, uint8_t **out_payload_buf, size_t *out_payload_len);
+static herr_t H5VL__stream_merge_agg_manifests(H5VL_stream_file_state_t *fs, uint8_t **bufs, int *lens,
+                             uint8_t **payload_bufs, int *payload_lens, int nranks, int my_rank,
+                             uint8_t **out_merged_buf, size_t *out_merged_len, uint8_t **out_merged_payload,
+                             size_t *out_merged_payload_len, H5VL_stream_pending_entry_t **out_wiring,
+                             size_t *out_n_wiring);
+static herr_t H5VL__stream_replay_local_writes(H5VL_stream_t *file_obj, uint64_t physical_step);
+static herr_t H5VL__stream_replay_step_parallel(H5VL_stream_t *file_obj);
+#endif
 
 /* M3: reader helpers */
 static herr_t H5VL__stream_reader_build_index(H5VL_stream_file_state_t *fs);
@@ -614,13 +627,15 @@ typedef struct H5VL_stream_args_set_queue_policy_t {
     uint64_t                    reserve_slots;
 } H5VL_stream_args_set_queue_policy_t;
 
-/* M8 */
+/* M8/M8.5 */
 typedef struct H5VL_stream_args_get_subscribed_data_t {
     uint64_t  timeout_ms;
     uint64_t *physical_step; /* OUT */
     char    **path;          /* OUT, newly malloc'd */
     void    **buf;           /* OUT, newly malloc'd */
     size_t   *size;          /* OUT */
+    uint64_t *elem_start;    /* OUT */
+    uint64_t *elem_count;    /* OUT */
 } H5VL_stream_args_get_subscribed_data_t;
 
 /*-------------------------------------------------------------------------
@@ -2587,18 +2602,26 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                     }
 
 #ifdef VOL_STREAM_HAVE_MERCURY
-                    /* M8, first increment: push this entry's actual bytes to
-                     * any current subscriber of path (whole-object
-                     * granularity -- see tr_mercury.c's header comment).
-                     * vs_tr_writer_push_data() is itself a no-op when there
-                     * is no transport or no subscriber, so this costs
+                    /* M8/M8.5: push the subset of this entry's bytes that
+                     * overlaps each current subscriber's own requested
+                     * range (see tr_mercury.c's header comment) -- 1-D
+                     * element bounds of THIS write's own file-space
+                     * selection, matching H5Fsubscribe()'s own
+                     * H5Sget_select_bounds() use. vs_tr_writer_push_data()
+                     * is itself a no-op when there is no transport or no
+                     * subscriber overlapping this range, so this costs
                      * nothing on the ordinary M0-M7 path. Best-effort, same
                      * as vs_tr_writer_broadcast_step_ready(): a failed push
                      * must not fail the replay that already durably
                      * committed this data to the real file. */
-                    if (file_obj->file_state && file_obj->file_state->transport)
-                        vs_tr_writer_push_data(file_obj->file_state->transport, physical_step, path,
-                                                 payload_ptr, plen);
+                    if (file_obj->file_state && file_obj->file_state->transport) {
+                        hsize_t low[32], high[32];
+
+                        if (H5Sget_select_bounds(dspace, low, high) >= 0)
+                            vs_tr_writer_push_data(file_obj->file_state->transport, physical_step, path,
+                                                     payload_ptr, H5Tget_size(dtype), (uint64_t)low[0],
+                                                     (uint64_t)n_elem);
+                    }
 #endif
                     (void)plen;
                 }
@@ -2852,6 +2875,625 @@ H5VL__stream_replay_step(H5VL_stream_t *file_obj)
 
     return ret_value;
 } /* end H5VL__stream_replay_step() */
+
+#ifdef H5_HAVE_PARALLEL
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_build_agg_manifest
+ *
+ * Purpose:     M6.5. The subset of H5VL__stream_build_manifest()'s pass 1
+ *              that a heterogeneous parallel writer's ranks must exchange
+ *              before they can replay collectively: DsetCreate entries
+ *              (metadata only -- they never carry payload) and Attr entries
+ *              (WITH payload, since H5Acreate/H5Awrite are collective
+ *              metadata operations too, so every rank must replay the exact
+ *              same attribute value, not just agree it exists). DsetWrite
+ *              entries are deliberately excluded -- raw dataset I/O is
+ *              independent, needs no cross-rank agreement, and its payload
+ *              can be arbitrarily large, so it stays local and is replayed
+ *              by H5VL__stream_replay_local_writes() instead, after this
+ *              aggregated pass has ensured the target objects exist.
+ *
+ * Return:      Success:    0, with *out_buf/*out_payload_buf newly
+ *                          allocated (caller frees: flatcc_builder_free()
+ *                          for the former, free() for the latter)
+ *              Failure:    -1
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_build_agg_manifest(H5VL_stream_file_state_t *fs, uint8_t **out_buf, size_t *out_len,
+                                  uint8_t **out_payload_buf, size_t *out_payload_len)
+{
+    flatcc_builder_t B;
+    int               builder_ready = 0;
+    vs_Entry_ref_t   *entry_refs    = NULL;
+    size_t            n_refs        = 0;
+    uint8_t          *payload_buf   = NULL;
+    size_t            payload_cap   = 0;
+    size_t            payload_len   = 0;
+    uint8_t          *manifest_buf  = NULL;
+    size_t            manifest_len  = 0;
+    unsigned          maj, minor, rel;
+    size_t            i;
+    herr_t            ret_value = 0;
+
+    if (NULL == (entry_refs = (vs_Entry_ref_t *)malloc((fs->n_pending ? fs->n_pending : 1) * sizeof(vs_Entry_ref_t)))) {
+        ret_value = -1;
+        goto done;
+    }
+
+    flatcc_builder_init(&B);
+    builder_ready = 1;
+
+    for (i = 0; i < fs->n_pending; i++) {
+        H5VL_stream_pending_entry_t *pe = &fs->pending[i];
+        uint8_t                     *type_enc  = NULL;
+        uint8_t                     *space_enc = NULL;
+        uint8_t                     *dcpl_enc  = NULL;
+        size_t                       type_len  = 0;
+        size_t                       space_len = 0;
+        size_t                       dcpl_len  = 0;
+        uint64_t                     this_off  = (uint64_t)payload_len;
+        uint64_t                     this_len  = 0;
+
+        if (pe->kind != vs_Kind_DsetCreate && pe->kind != vs_Kind_Attr)
+            continue; /* DsetWrite -- stays local, see this function's comment */
+
+        if (H5VL__stream_encode_type(pe->type_id, &type_enc, &type_len) < 0 ||
+            H5VL__stream_encode_space(pe->space_id, &space_enc, &space_len) < 0 ||
+            (pe->dcpl_id >= 0 && H5VL__stream_encode_dcpl(pe->dcpl_id, &dcpl_enc, &dcpl_len) < 0)) {
+            free(type_enc);
+            free(space_enc);
+            free(dcpl_enc);
+            ret_value = -1;
+            goto done;
+        }
+
+        if (pe->kind == vs_Kind_Attr && pe->payload_len > 0) {
+            if (payload_len + pe->payload_len > payload_cap) {
+                size_t   new_cap = payload_cap ? payload_cap * 2 : 4096;
+                uint8_t *grown;
+
+                while (new_cap < payload_len + pe->payload_len)
+                    new_cap *= 2;
+                if (NULL == (grown = (uint8_t *)realloc(payload_buf, new_cap))) {
+                    free(type_enc);
+                    free(space_enc);
+                    free(dcpl_enc);
+                    ret_value = -1;
+                    goto done;
+                }
+                payload_buf = grown;
+                payload_cap = new_cap;
+            }
+            memcpy(payload_buf + payload_len, pe->payload, pe->payload_len);
+            payload_len += pe->payload_len;
+            this_len = (uint64_t)pe->payload_len;
+        }
+
+        vs_Entry_start(&B);
+        vs_Entry_kind_add(&B, (vs_Kind_enum_t)pe->kind);
+        vs_Entry_path_create_str(&B, pe->path);
+        vs_Entry_type_enc_create(&B, type_enc, type_len);
+        vs_Entry_space_enc_create(&B, space_enc, space_len);
+        if (dcpl_enc)
+            vs_Entry_dcpl_enc_create(&B, dcpl_enc, dcpl_len);
+        vs_Entry_form_add(&B, vs_Payload_Raw);
+        vs_Entry_payload_off_add(&B, this_off);
+        vs_Entry_payload_len_add(&B, this_len);
+        entry_refs[n_refs++] = vs_Entry_end(&B);
+
+        free(type_enc);
+        free(space_enc);
+        free(dcpl_enc);
+    }
+
+    H5get_libversion(&maj, &minor, &rel);
+
+    vs_Step_start_as_root(&B);
+    vs_Step_physical_step_add(&B, fs->physical_step);
+    vs_Step_wall_time_ns_add(&B, fs->wall_time_ns);
+    vs_Step_hdf5_version_add(&B, (uint32_t)(maj * 1000000u + minor * 1000u + rel));
+    if (n_refs > 0)
+        vs_Step_entries_create(&B, entry_refs, n_refs);
+    vs_Step_payload_bytes_add(&B, (uint64_t)payload_len);
+    vs_Step_end_as_root(&B);
+
+    if (NULL == (manifest_buf = (uint8_t *)flatcc_builder_finalize_buffer(&B, &manifest_len))) {
+        ret_value = -1;
+        goto done;
+    }
+
+    *out_buf          = manifest_buf;
+    *out_len          = manifest_len;
+    *out_payload_buf  = payload_buf;
+    *out_payload_len  = payload_len;
+    manifest_buf      = NULL;
+    payload_buf       = NULL;
+
+done:
+    if (manifest_buf)
+        flatcc_builder_free(manifest_buf);
+    if (builder_ready)
+        flatcc_builder_clear(&B);
+    free(entry_refs);
+    free(payload_buf);
+
+    return ret_value;
+} /* end H5VL__stream_build_agg_manifest() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_merge_agg_manifests
+ *
+ * Purpose:     M6.5. bufs[r]/lens[r] and payload_bufs[r]/payload_lens[r] are
+ *              every rank's own H5VL__stream_build_agg_manifest() output
+ *              (rank r's slot always at index r, an MPI_Allgatherv
+ *              guarantee this function's caller relies on). Every rank
+ *              calls this with identical input, so every rank's merge
+ *              produces an identical result -- no further communication
+ *              needed for the merge itself, only for gathering the raw
+ *              per-rank data beforehand.
+ *
+ *              Walks ranks in ascending order, entries within a rank in
+ *              original order, and deduplicates by (kind, path): the first
+ *              occurrence wins, later ones (whether a genuine duplicate
+ *              create from the ordinary "every rank creates the same
+ *              object" case, or a same-path Attr with a different value
+ *              from a different rank) are dropped. This is "first-seen-
+ *              wins" for both DsetCreate and Attr -- for DsetCreate,
+ *              harmless (a well-formed application creates the same shared
+ *              object identically from every rank that touches it); for
+ *              Attr, a real simplifying assumption for divergent per-rank
+ *              values, documented in project_m6_status.md.
+ *
+ * Return:      Success:    0, with *out_merged_buf/*out_merged_payload/
+ *                          *out_wiring newly allocated (caller frees:
+ *                          flatcc_builder_free() for the first, free() for
+ *                          the other two)
+ *              Failure:    -1
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_merge_agg_manifests(H5VL_stream_file_state_t *fs, uint8_t **bufs, int *lens,
+                                   uint8_t **payload_bufs, int *payload_lens, int nranks, int my_rank,
+                                   uint8_t **out_merged_buf, size_t *out_merged_len,
+                                   uint8_t **out_merged_payload, size_t *out_merged_payload_len,
+                                   H5VL_stream_pending_entry_t **out_wiring, size_t *out_n_wiring)
+{
+    typedef struct { int kind; char *path; } H5VL_stream_seen_key_t;
+
+    flatcc_builder_t                 B;
+    int                                builder_ready = 0;
+    vs_Entry_ref_t                   *entry_refs = NULL;
+    size_t                             cap_refs = 0, n_refs = 0;
+    uint8_t                          *merged_payload = NULL;
+    size_t                             merged_payload_cap = 0, merged_payload_len = 0;
+    H5VL_stream_pending_entry_t     *wiring = NULL;
+    size_t                             cap_wiring = 0, n_wiring = 0;
+    H5VL_stream_seen_key_t          *seen = NULL;
+    size_t                             n_seen = 0, cap_seen = 0;
+    uint8_t                          *merged_buf = NULL;
+    size_t                             merged_len = 0;
+    unsigned                           maj, minor, rel;
+    int                                 r;
+    herr_t                             ret_value = 0;
+
+    flatcc_builder_init(&B);
+    builder_ready = 1;
+
+    for (r = 0; r < nranks; r++) {
+        vs_Step_table_t step;
+        vs_Entry_vec_t  entries;
+        size_t          n_entries, i;
+        const uint8_t  *payload_buf_r = payload_bufs[r];
+
+        if (lens[r] <= 0)
+            continue;
+        step    = vs_Step_as_root(bufs[r]);
+        entries = step ? vs_Step_entries(step) : NULL;
+        n_entries = entries ? vs_Entry_vec_len(entries) : 0;
+
+        for (i = 0; i < n_entries; i++) {
+            vs_Entry_table_t        e     = vs_Entry_vec_at(entries, i);
+            vs_Kind_enum_t           kind  = vs_Entry_kind(e);
+            const char              *path  = vs_Entry_path(e);
+            flatbuffers_uint8_vec_t  type_enc  = vs_Entry_type_enc(e);
+            flatbuffers_uint8_vec_t  space_enc = vs_Entry_space_enc(e);
+            flatbuffers_uint8_vec_t  dcpl_enc  = vs_Entry_dcpl_enc(e);
+            uint64_t                 poff  = vs_Entry_payload_off(e);
+            uint64_t                 plen  = vs_Entry_payload_len(e);
+            uint64_t                 new_off;
+            size_t                   si;
+            int                      dup = 0;
+
+            for (si = 0; si < n_seen; si++)
+                if (seen[si].kind == (int)kind && strcmp(seen[si].path, path) == 0) {
+                    dup = 1;
+                    break;
+                }
+            if (dup)
+                continue;
+
+            if (n_seen == cap_seen) {
+                size_t                    new_cap = cap_seen ? cap_seen * 2 : 16;
+                H5VL_stream_seen_key_t *grown   = (H5VL_stream_seen_key_t *)realloc(seen, new_cap * sizeof(*seen));
+
+                if (!grown) {
+                    ret_value = -1;
+                    goto done;
+                }
+                seen     = grown;
+                cap_seen = new_cap;
+            }
+            seen[n_seen].kind = (int)kind;
+            if (NULL == (seen[n_seen].path = strdup(path))) {
+                ret_value = -1;
+                goto done;
+            }
+            n_seen++;
+
+            new_off = (uint64_t)merged_payload_len;
+            if (plen > 0) {
+                if (merged_payload_len + plen > merged_payload_cap) {
+                    size_t   new_cap = merged_payload_cap ? merged_payload_cap * 2 : 4096;
+                    uint8_t *grown;
+
+                    while (new_cap < merged_payload_len + plen)
+                        new_cap *= 2;
+                    if (NULL == (grown = (uint8_t *)realloc(merged_payload, new_cap))) {
+                        ret_value = -1;
+                        goto done;
+                    }
+                    merged_payload = grown;
+                    merged_payload_cap = new_cap;
+                }
+                memcpy(merged_payload + merged_payload_len, payload_buf_r + poff, plen);
+                merged_payload_len += plen;
+            }
+
+            vs_Entry_start(&B);
+            vs_Entry_kind_add(&B, kind);
+            vs_Entry_path_create_str(&B, path);
+            vs_Entry_type_enc_create(&B, type_enc, flatbuffers_uint8_vec_len(type_enc));
+            vs_Entry_space_enc_create(&B, space_enc, flatbuffers_uint8_vec_len(space_enc));
+            if (dcpl_enc && flatbuffers_uint8_vec_len(dcpl_enc) > 0)
+                vs_Entry_dcpl_enc_create(&B, dcpl_enc, flatbuffers_uint8_vec_len(dcpl_enc));
+            vs_Entry_form_add(&B, vs_Payload_Raw);
+            vs_Entry_payload_off_add(&B, new_off);
+            vs_Entry_payload_len_add(&B, plen);
+
+            if (n_refs == cap_refs) {
+                size_t          new_cap = cap_refs ? cap_refs * 2 : 16;
+                vs_Entry_ref_t *grown   = (vs_Entry_ref_t *)realloc(entry_refs, new_cap * sizeof(*entry_refs));
+
+                if (!grown) {
+                    ret_value = -1;
+                    goto done;
+                }
+                entry_refs = grown;
+                cap_refs   = new_cap;
+            }
+            entry_refs[n_refs] = vs_Entry_end(&B);
+
+            /* Wiring: only for entries this rank itself originated -- every
+             * other slot stays zeroed (NULL owner_wrapper), which
+             * H5VL__stream_replay_manifest() already treats as "close
+             * immediately", exactly correct since only the originating
+             * rank ever has an application-level placeholder handle open
+             * for it. See H5VL__stream_replay_manifest()'s pending_for_
+             * wiring comment. */
+            if (n_wiring == cap_wiring) {
+                size_t                          new_cap = cap_wiring ? cap_wiring * 2 : 16;
+                H5VL_stream_pending_entry_t *grown   =
+                    (H5VL_stream_pending_entry_t *)realloc(wiring, new_cap * sizeof(*wiring));
+
+                if (!grown) {
+                    ret_value = -1;
+                    goto done;
+                }
+                wiring     = grown;
+                cap_wiring = new_cap;
+            }
+            memset(&wiring[n_wiring], 0, sizeof(wiring[n_wiring]));
+            if (r == my_rank) {
+                size_t pj;
+
+                for (pj = 0; pj < fs->n_pending; pj++)
+                    if (fs->pending[pj].kind == (int)kind && strcmp(fs->pending[pj].path, path) == 0) {
+                        wiring[n_wiring].owner_wrapper = fs->pending[pj].owner_wrapper;
+                        break;
+                    }
+            }
+            n_wiring++;
+            n_refs++;
+        }
+    }
+
+    H5get_libversion(&maj, &minor, &rel);
+
+    vs_Step_start_as_root(&B);
+    vs_Step_physical_step_add(&B, fs->physical_step);
+    vs_Step_wall_time_ns_add(&B, fs->wall_time_ns);
+    vs_Step_hdf5_version_add(&B, (uint32_t)(maj * 1000000u + minor * 1000u + rel));
+    if (n_refs > 0)
+        vs_Step_entries_create(&B, entry_refs, n_refs);
+    vs_Step_payload_bytes_add(&B, (uint64_t)merged_payload_len);
+    vs_Step_end_as_root(&B);
+
+    if (NULL == (merged_buf = (uint8_t *)flatcc_builder_finalize_buffer(&B, &merged_len))) {
+        ret_value = -1;
+        goto done;
+    }
+
+    *out_merged_buf         = merged_buf;
+    *out_merged_len         = merged_len;
+    *out_merged_payload     = merged_payload;
+    *out_merged_payload_len = merged_payload_len;
+    *out_wiring             = wiring;
+    *out_n_wiring           = n_wiring;
+    merged_buf     = NULL;
+    merged_payload = NULL;
+    wiring         = NULL;
+
+done:
+    if (merged_buf)
+        flatcc_builder_free(merged_buf);
+    if (builder_ready)
+        flatcc_builder_clear(&B);
+    free(entry_refs);
+    free(merged_payload);
+    free(wiring);
+    {
+        size_t si;
+
+        for (si = 0; si < n_seen; si++)
+            free(seen[si].path);
+        free(seen);
+    }
+
+    return ret_value;
+} /* end H5VL__stream_merge_agg_manifests() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_replay_local_writes
+ *
+ * Purpose:     M6.5. The independent half of a heterogeneous parallel
+ *              writer's replay: this rank's own DsetWrite entries, applied
+ *              after H5VL__stream_merge_agg_manifests()'s collective pass
+ *              has ensured every target object exists (whether this rank
+ *              or another one originated its creation). Reopens each
+ *              target by path rather than reusing a live handle from the
+ *              collective pass -- simpler than threading object handles
+ *              across two separate replay calls, and DsetWrite entries
+ *              always have a matching DsetCreate earlier in the same step
+ *              (the capture side never lets one exist otherwise), so the
+ *              open always succeeds once the collective pass has run.
+ *
+ * Return:      Success:    0
+ *              Failure:    -1
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_replay_local_writes(H5VL_stream_t *file_obj, uint64_t physical_step)
+{
+    H5VL_stream_file_state_t *fs = file_obj->file_state;
+    char                       step_root[32];
+    size_t                     i;
+    herr_t                     ret_value = 0;
+
+    snprintf(step_root, sizeof(step_root), "/step/%llu", (unsigned long long)physical_step);
+
+    for (i = 0; i < fs->n_pending; i++) {
+        H5VL_stream_pending_entry_t *pe = &fs->pending[i];
+        char                          *full_path;
+        size_t                         full_len;
+        H5VL_loc_params_t              loc_params;
+        void                          *real;
+        hid_t                          mem_space = -1;
+        hssize_t                       n_elem;
+
+        if (pe->kind != vs_Kind_DsetWrite)
+            continue;
+
+        full_len = strlen(step_root) + strlen(pe->path) + 1;
+        if (NULL == (full_path = (char *)malloc(full_len))) {
+            ret_value = -1;
+            goto done;
+        }
+        snprintf(full_path, full_len, "%s%s", step_root, pe->path);
+
+        memset(&loc_params, 0, sizeof(loc_params));
+        loc_params.obj_type = H5I_FILE;
+        loc_params.type     = H5VL_OBJECT_BY_SELF;
+
+        real = H5VLdataset_open(file_obj->under_object, &loc_params, file_obj->under_vol_id, full_path,
+                                  H5P_DATASET_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL);
+        free(full_path);
+        if (!real) {
+            ret_value = -1;
+            goto done;
+        }
+
+        if ((n_elem = H5Sget_select_npoints(pe->space_id)) < 0) {
+            H5VLdataset_close(real, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+            ret_value = -1;
+            goto done;
+        }
+        {
+            hsize_t n_elem_h = (hsize_t)n_elem;
+
+            if ((mem_space = H5Screate_simple(1, &n_elem_h, NULL)) < 0) {
+                H5VLdataset_close(real, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+                ret_value = -1;
+                goto done;
+            }
+        }
+
+        {
+            const void *payload_ptr = pe->payload;
+            herr_t      w = H5VLdataset_write(1, &real, file_obj->under_vol_id, &pe->type_id, &mem_space,
+                                               &pe->space_id, H5P_DATASET_XFER_DEFAULT, &payload_ptr, NULL);
+
+            H5Sclose(mem_space);
+            H5VLdataset_close(real, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+            if (w < 0) {
+                ret_value = -1;
+                goto done;
+            }
+        }
+    }
+
+done:
+    return ret_value;
+} /* end H5VL__stream_replay_local_writes() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_replay_step_parallel
+ *
+ * Purpose:     M6.5's replacement for H5VL__stream_replay_step() when the
+ *              writer is parallel (fs->has_comm): supports heterogeneous
+ *              per-rank object sets -- rank 0 creating a dataset rank 1
+ *              never touches -- which M6's first increment explicitly could
+ *              not (every rank had to create the identical object set,
+ *              relying on ordinary parallel HDF5 collective-create
+ *              semantics with no connector-level help).
+ *
+ *              The mechanism: every rank encodes its own create-kind
+ *              entries (DsetCreate, Attr -- metadata only for the former,
+ *              full payload for the latter, see H5VL__stream_build_agg_
+ *              manifest()'s comment) and exchanges them with every other
+ *              rank via two MPI_Allgatherv calls (sizes gathered first via
+ *              MPI_Allgather, then the variable-length payloads). Every
+ *              rank then independently computes the identical deterministic
+ *              merge (H5VL__stream_merge_agg_manifests()) and replays that
+ *              SAME merged set collectively (H5VL__stream_replay_manifest()
+ *              -- the ordinary H5Dcreate2()/H5Acreate2() collective-
+ *              metadata calls this connector has always used, now just
+ *              covering the union of what every rank asked for rather than
+ *              only this rank's own subset). Finally, each rank
+ *              independently replays its own DsetWrite entries
+ *              (H5VL__stream_replay_local_writes()) now that every target
+ *              object exists.
+ *
+ *              This increment does not yet route through a Subfiling-style
+ *              I/O-concentrator topology -- every rank still does its own
+ *              raw-data I/O directly, which is correct (not a shortcut)
+ *              for any rank count, just not the aggregation-point
+ *              architecture dev-plan.md's M6 section names for scale. See
+ *              docs/dev-plan.md's M6.5 section.
+ *
+ * Return:      Success:    0
+ *              Failure:    -1
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_replay_step_parallel(H5VL_stream_t *file_obj)
+{
+    H5VL_stream_file_state_t    *fs = file_obj->file_state;
+    uint8_t                      *my_buf = NULL, *my_payload = NULL;
+    size_t                         my_len = 0, my_payload_len = 0;
+    int                            my_rank = fs->mpi_rank, nranks = fs->mpi_size;
+    int                           *lens = NULL, *payload_lens = NULL, *displs = NULL, *payload_displs = NULL;
+    uint8_t                       *all_bufs_flat = NULL, *all_payloads_flat = NULL;
+    uint8_t                      **bufs = NULL, **payload_bufs = NULL;
+    uint8_t                       *merged_buf = NULL, *merged_payload = NULL;
+    size_t                          merged_len = 0, merged_payload_len = 0;
+    H5VL_stream_pending_entry_t *wiring = NULL;
+    size_t                          n_wiring = 0;
+    int                            my_len_i, my_payload_len_i;
+    herr_t                         ret_value = 0;
+    int                            r;
+
+    if (H5VL__stream_build_agg_manifest(fs, &my_buf, &my_len, &my_payload, &my_payload_len) < 0)
+        return -1;
+    if (!my_payload) /* MPI_Allgatherv wants a valid pointer even for a 0-length send */
+        my_payload = (uint8_t *)malloc(1);
+
+    my_len_i         = (int)my_len;
+    my_payload_len_i = (int)my_payload_len;
+
+    if (NULL == (lens = (int *)malloc((size_t)nranks * sizeof(int))) ||
+        NULL == (payload_lens = (int *)malloc((size_t)nranks * sizeof(int))) ||
+        NULL == (displs = (int *)malloc((size_t)nranks * sizeof(int))) ||
+        NULL == (payload_displs = (int *)malloc((size_t)nranks * sizeof(int)))) {
+        ret_value = -1;
+        goto done;
+    }
+
+    if (MPI_SUCCESS != MPI_Allgather(&my_len_i, 1, MPI_INT, lens, 1, MPI_INT, fs->comm) ||
+        MPI_SUCCESS != MPI_Allgather(&my_payload_len_i, 1, MPI_INT, payload_lens, 1, MPI_INT, fs->comm)) {
+        ret_value = -1;
+        goto done;
+    }
+
+    {
+        int total = 0, ptotal = 0;
+
+        for (r = 0; r < nranks; r++) {
+            displs[r] = total;
+            total += lens[r];
+            payload_displs[r] = ptotal;
+            ptotal += payload_lens[r];
+        }
+        if (NULL == (all_bufs_flat = (uint8_t *)malloc(total > 0 ? (size_t)total : 1)) ||
+            NULL == (all_payloads_flat = (uint8_t *)malloc(ptotal > 0 ? (size_t)ptotal : 1))) {
+            ret_value = -1;
+            goto done;
+        }
+    }
+
+    if (MPI_SUCCESS !=
+            MPI_Allgatherv(my_buf, my_len_i, MPI_BYTE, all_bufs_flat, lens, displs, MPI_BYTE, fs->comm) ||
+        MPI_SUCCESS != MPI_Allgatherv(my_payload, my_payload_len_i, MPI_BYTE, all_payloads_flat, payload_lens,
+                                        payload_displs, MPI_BYTE, fs->comm)) {
+        ret_value = -1;
+        goto done;
+    }
+
+    if (NULL == (bufs = (uint8_t **)malloc((size_t)nranks * sizeof(uint8_t *))) ||
+        NULL == (payload_bufs = (uint8_t **)malloc((size_t)nranks * sizeof(uint8_t *)))) {
+        ret_value = -1;
+        goto done;
+    }
+    for (r = 0; r < nranks; r++) {
+        bufs[r]         = all_bufs_flat + displs[r];
+        payload_bufs[r] = all_payloads_flat + payload_displs[r];
+    }
+
+    if (H5VL__stream_merge_agg_manifests(fs, bufs, lens, payload_bufs, payload_lens, nranks, my_rank,
+                                           &merged_buf, &merged_len, &merged_payload, &merged_payload_len,
+                                           &wiring, &n_wiring) < 0) {
+        ret_value = -1;
+        goto done;
+    }
+
+    if (H5VL__stream_replay_manifest(file_obj, merged_buf, merged_len, merged_payload, wiring, n_wiring) < 0) {
+        ret_value = -1;
+        goto done;
+    }
+
+    if (H5VL__stream_replay_local_writes(file_obj, fs->physical_step) < 0) {
+        ret_value = -1;
+        goto done;
+    }
+
+done:
+    flatcc_builder_free(my_buf);
+    free(my_payload);
+    free(lens);
+    free(payload_lens);
+    free(displs);
+    free(payload_displs);
+    free(all_bufs_flat);
+    free(all_payloads_flat);
+    free(bufs);
+    free(payload_bufs);
+    flatcc_builder_free(merged_buf);
+    free(merged_payload);
+    free(wiring);
+
+    return ret_value;
+} /* end H5VL__stream_replay_step_parallel() */
+#endif /* H5_HAVE_PARALLEL */
 
 /*-------------------------------------------------------------------------
  * Function:    H5VL__stream_discard_step
@@ -5171,10 +5813,25 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
             MPI_Barrier(o->file_state->comm);
 #endif
 
+#ifdef H5_HAVE_PARALLEL
+        /* M6.5: a parallel writer supporting heterogeneous per-rank object
+         * sets needs cross-rank aggregation before it can replay
+         * collectively -- see H5VL__stream_replay_step_parallel()'s
+         * comment. M7's queue policy is not yet integrated with this path
+         * (out of M6.5's own scope, a real gap, not an oversight): a
+         * parallel writer with a policy set still gets this collective
+         * replay unconditionally, the same as if no policy were set at
+         * all. */
+        if (o->file_state->has_comm)
+            replay_ret = H5VL__stream_replay_step_parallel(o);
+        else
+            replay_ret = H5VL__stream_apply_queue_policy(o);
+#else
         /* M7: a no-op wrapper around H5VL__stream_replay_step() unless a
          * queue policy was set (H5Fset_stream_queue_policy()) -- see its
          * comment. */
         replay_ret = H5VL__stream_apply_queue_policy(o);
+#endif
 
         /* Discard the pending buffer either way: a failed replay may have
          * landed some entries and not others, and there is no partial-step
@@ -5262,9 +5919,13 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
 
         /* Validated regardless of transport: a subscription naming a path
          * that cannot be expressed should fail where the caller made the
-         * mistake. spaces[i]/plists[i] are validated but not yet acted on --
-         * M8's first increment routes at whole-object granularity only, see
-         * H5Fsubscribe()'s doc comment. */
+         * mistake. plists[i] is validated but not yet acted on -- per-
+         * subscriber precision (re-filtering) is M8.5 follow-up scope, see
+         * H5Fsubscribe()'s doc comment. spaces[i]'s selection bounds ARE
+         * acted on (M8.5): H5Sget_select_bounds()'s dimension-0 low/high
+         * become the 1-D element range this subscription routes on, the
+         * general-N-D-selection/H5Sselect_intersect_block case dev-plan.md's
+         * M8.5 text describes remains out of scope. */
         for (size_t i = 0; i < sargs->count; i++) {
             if (!sargs->paths[i] || sargs->paths[i][0] == '\0')
                 return -1;
@@ -5274,8 +5935,16 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
 
 #ifdef VOL_STREAM_HAVE_MERCURY
         if (o->file_state && o->file_state->transport) {
-            for (size_t i = 0; i < sargs->count; i++)
-                vs_tr_reader_subscribe(o->file_state->transport, sargs->paths[i]);
+            for (size_t i = 0; i < sargs->count; i++) {
+                hsize_t  low[32], high[32];
+                uint64_t sel_start = 0, sel_count = UINT64_MAX;
+
+                if (H5Sget_select_bounds(sargs->spaces[i], low, high) >= 0) {
+                    sel_start = (uint64_t)low[0];
+                    sel_count = (uint64_t)(high[0] - low[0] + 1);
+                }
+                vs_tr_reader_subscribe(o->file_state->transport, sargs->paths[i], sel_start, sel_count);
+            }
         }
 #endif
         return 0;
@@ -5355,14 +6024,16 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
         H5VL_stream_args_get_subscribed_data_t *sargs =
             (H5VL_stream_args_get_subscribed_data_t *)args->args;
 
-        if (!sargs || !sargs->physical_step || !sargs->path || !sargs->buf || !sargs->size || !o->file_state ||
-            !o->file_state->is_reader || !o->file_state->transport)
+        if (!sargs || !sargs->physical_step || !sargs->path || !sargs->buf || !sargs->size ||
+            !sargs->elem_start || !sargs->elem_count || !o->file_state || !o->file_state->is_reader ||
+            !o->file_state->transport)
             return -1;
 
         {
             uint64_t size64 = 0;
             int      r = vs_tr_reader_wait_data(o->file_state->transport, sargs->timeout_ms,
-                                                  sargs->physical_step, sargs->path, sargs->buf, &size64);
+                                                  sargs->physical_step, sargs->path, sargs->buf, &size64,
+                                                  sargs->elem_start, sargs->elem_count);
 
             *sargs->size = (size_t)size64;
             return (herr_t)r;
@@ -6900,11 +7571,11 @@ H5Fset_stream_queue_policy(hid_t file_id, H5VL_stream_queue_policy_t policy, uin
 
 herr_t
 H5Fget_subscribed_data(hid_t file_id, uint64_t timeout_ms, uint64_t *physical_step, char **path, void **buf,
-                         size_t *size)
+                         size_t *size, uint64_t *elem_start, uint64_t *elem_count)
 {
     H5VL_stream_args_get_subscribed_data_t op_args;
 
-    if (!physical_step || !path || !buf || !size)
+    if (!physical_step || !path || !buf || !size || !elem_start || !elem_count)
         return -1;
 
     op_args.timeout_ms    = timeout_ms;
@@ -6912,6 +7583,8 @@ H5Fget_subscribed_data(hid_t file_id, uint64_t timeout_ms, uint64_t *physical_st
     op_args.path            = path;
     op_args.buf             = buf;
     op_args.size            = size;
+    op_args.elem_start     = elem_start;
+    op_args.elem_count     = elem_count;
 
     return H5VL__stream_file_op(file_id, H5VL_stream_op_get_subscribed_data, &op_args);
 } /* end H5Fget_subscribed_data() */

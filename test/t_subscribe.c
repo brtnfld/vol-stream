@@ -5,27 +5,35 @@
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
 /*
- * M8 exit gate, first increment: the writer marshals only what is
- * subscribed. Full milestone text calls for two subscribers at different
- * precisions and chunk-level measurement; this increment proves the core
- * mechanism at whole-object granularity instead (see tr_mercury.c's header
- * comment for the scope note) -- one subscriber, one step writing two
- * datasets of very different size, and a direct check that only the
- * subscribed one's bytes ever cross the wire.
+ * M8 exit gate, first increment, plus M8.5's subvolume routing on top: the
+ * writer marshals only what is subscribed, down to the requested subrange,
+ * not just the requested object. Full milestone text also calls for
+ * per-subscriber precision (re-filtering) and chunk-storage-granularity
+ * (H5Sselect_intersect_block against the FilteredChunks payload form) --
+ * neither is built; this proves 1-D element-range intersection instead,
+ * which already satisfies the exit gate's core numeric claim ("wire bytes
+ * scale with subscribed volume") without either. See tr_mercury.c's header
+ * comment for the full scope note.
  *
  * Two OS processes, na+sm, same shape as test/t_queue_policy.c.
  *
- *   1. The reader opens, subscribes to "/sub" only, and waits.
+ *   1. The reader opens, subscribes to "/sub" bounded to
+ *      [SUB_RANGE_START, SUB_RANGE_START+SUB_RANGE_COUNT) -- a strict
+ *      subrange of the NSUB-element object, not the whole thing -- and
+ *      waits.
  *   2. The writer commits one step creating and writing BOTH "/sub" (small,
- *      NSUB ints) and "/unsub" (much larger, NUNSUB doubles) -- "/unsub" is
- *      deliberately the bigger of the two, so a bug that pushed everything
- *      regardless of subscription would be obvious rather than accidentally
- *      passing.
+ *      NSUB ints, written as one whole-object H5Dwrite -- the connector's
+ *      own push logic is what narrows this down to the subscribed
+ *      subrange, no special-casing on the write side) and "/unsub" (much
+ *      larger, NUNSUB doubles) -- "/unsub" is deliberately the bigger of
+ *      the two, so a bug that pushed everything regardless of subscription
+ *      would be obvious rather than accidentally passing.
  *   3. The reader retrieves exactly one pushed item via
- *      H5Fget_subscribed_data(), checks it is "/sub" with the right size and
- *      content, then -- after the writer signals it is completely done --
- *      confirms nothing else ever arrives (proving "/unsub" was never
- *      pushed, not just "not yet").
+ *      H5Fget_subscribed_data(), checks it covers exactly the requested
+ *      subrange (not the whole object) with the right content, then --
+ *      after the writer signals it is completely done -- confirms nothing
+ *      else ever arrives (proving "/unsub" was never pushed, not just "not
+ *      yet").
  *
  * Only compiled/run when VOL_STREAM_HAVE_MERCURY is on; see
  * test/CMakeLists.txt.
@@ -43,6 +51,11 @@
 #define NSUB   4    /* ints in /sub -- NSUB * sizeof(int) bytes on the wire */
 #define NUNSUB 2000 /* doubles in /unsub -- never subscribed, never pushed */
 #define FNAME  "t_subscribe.h5"
+
+/* M8.5: the reader subscribes to this strict subrange of /sub, not the
+ * whole NSUB-element object -- proves subvolume intersection routing. */
+#define SUB_RANGE_START 1
+#define SUB_RANGE_COUNT 2
 
 #define READY_SENTINEL       "t_subscribe.reader_ready"
 #define WRITES_DONE_SENTINEL "t_subscribe.writes_done"
@@ -83,6 +96,7 @@ run_reader(void)
     char    *path        = NULL;
     void    *buf         = NULL;
     size_t   size        = 0;
+    uint64_t elem_start = 0, elem_count = 0;
     hid_t    sub_space;
     int      sub_dims_i  = NSUB;
     hsize_t  sub_dims    = (hsize_t)sub_dims_i;
@@ -115,9 +129,23 @@ run_reader(void)
         return 1;
     }
 
+    /* M8.5: subscribe to a strict SUBRANGE of /sub -- elements [SUB_RANGE_START,
+     * SUB_RANGE_START+SUB_RANGE_COUNT), not the whole NSUB-element object --
+     * so this test proves subvolume intersection routing, not just whole-
+     * object routing (already covered by the fact that a whole-object
+     * subscription is exactly sel_start=0/sel_count=extent, the same
+     * mechanism with the bound relaxed to cover everything). */
     if ((sub_space = H5Screate_simple(1, &sub_dims, NULL)) < 0) {
         printf("reader: FAIL create subscription dataspace\n");
         return 1;
+    }
+    {
+        hsize_t h_start = SUB_RANGE_START, h_count = SUB_RANGE_COUNT;
+
+        if (H5Sselect_hyperslab(sub_space, H5S_SELECT_SET, &h_start, NULL, &h_count, NULL) < 0) {
+            printf("reader: FAIL select subscription range\n");
+            return 1;
+        }
     }
     {
         const char *paths[1]  = {"/sub"};
@@ -132,32 +160,48 @@ run_reader(void)
 
     touch_sentinel(READY_SENTINEL);
 
-    if (H5Fget_subscribed_data(fid, 10000, &phys, &path, &buf, &size) < 0) {
+    if (H5Fget_subscribed_data(fid, 10000, &phys, &path, &buf, &size, &elem_start, &elem_count) < 0) {
         printf("  FAIL  never received pushed data for /sub\n");
         rc = 1;
     }
     else {
         int ok = 1;
 
+        /* M8.5: exactly the requested [SUB_RANGE_START, SUB_RANGE_START+
+         * SUB_RANGE_COUNT) subrange -- not the whole NSUB-element object --
+         * is what proves subvolume intersection routing rather than just
+         * whole-object routing. */
+        if (elem_start != SUB_RANGE_START || elem_count != SUB_RANGE_COUNT) {
+            printf("  FAIL  pushed range is [%llu, %llu), expected [%d, %d)\n",
+                   (unsigned long long)elem_start, (unsigned long long)(elem_start + elem_count),
+                   SUB_RANGE_START, SUB_RANGE_START + SUB_RANGE_COUNT);
+            ok = 0;
+        }
+
         if (!path || strcmp(path, "/sub") != 0) {
             printf("  FAIL  pushed path is '%s', expected '/sub'\n", path ? path : "(null)");
             ok = 0;
         }
-        if (size != NSUB * sizeof(int)) {
-            printf("  FAIL  pushed size is %zu, expected %zu\n", size, NSUB * sizeof(int));
+        if (size != SUB_RANGE_COUNT * sizeof(int)) {
+            printf("  FAIL  pushed size is %zu, expected %zu\n", size, SUB_RANGE_COUNT * sizeof(int));
             ok = 0;
         }
         else {
             const int *vals = (const int *)buf;
 
-            for (i = 0; i < NSUB; i++)
-                if (vals[i] != i * 10) {
-                    printf("  FAIL  pushed /sub[%d] = %d, expected %d\n", i, vals[i], i * 10);
+            for (i = 0; i < SUB_RANGE_COUNT; i++) {
+                int expected = (SUB_RANGE_START + i) * 10;
+
+                if (vals[i] != expected) {
+                    printf("  FAIL  pushed /sub[%d] = %d, expected %d\n", SUB_RANGE_START + i, vals[i],
+                           expected);
                     ok = 0;
                 }
+            }
         }
         if (ok)
-            printf("  ok    received exactly /sub's %zu bytes, content correct\n", size);
+            printf("  ok    received exactly the subscribed subrange (%zu of %zu bytes), content correct\n",
+                   size, NSUB * sizeof(int));
         free(path);
         free(buf);
     }
@@ -175,8 +219,9 @@ run_reader(void)
         char    *path2  = NULL;
         void    *buf2   = NULL;
         size_t   size2  = 0;
+        uint64_t es2 = 0, ec2 = 0;
 
-        if (H5Fget_subscribed_data(fid, 500, &phys2, &path2, &buf2, &size2) == 0) {
+        if (H5Fget_subscribed_data(fid, 500, &phys2, &path2, &buf2, &size2, &es2, &ec2) == 0) {
             printf("  FAIL  received unexpected extra data for '%s' (%zu bytes) -- /unsub leaked\n",
                    path2 ? path2 : "(null)", size2);
             free(path2);
