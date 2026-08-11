@@ -11,20 +11,30 @@ add_test(NAME deferred COMMAND t_deferred)
 
 # M4 exit gate: the two-process Mercury round trip. M5 exit gate: SSG
 # rendezvous, late joiners, and a departing reader that does not stall the
-# writer. Both need the transport, so both are only built/run when
+# writer. M7 exit gate: Block/Discard/Spill under a deliberately slow
+# reader. M8 exit gate (first increment): the writer marshals only what is
+# subscribed. All four need the transport, so all are only built/run when
 # VOL_STREAM_HAVE_MERCURY is on (see ../CMakeLists.txt's
 # VOL_STREAM_ENABLE_MERCURY option).
 if(VOL_STREAM_HAVE_MERCURY)
-  foreach(t t_transport t_rendezvous)
+  foreach(t t_transport t_rendezvous t_queue_policy t_subscribe)
     add_executable(${t} ${t}.c)
     target_link_libraries(${t} PRIVATE vol_stream)
   endforeach()
   add_test(NAME transport COMMAND t_transport)
   add_test(NAME rendezvous COMMAND t_rendezvous)
-  set_tests_properties(transport rendezvous PROPERTIES
+  add_test(NAME queue_policy COMMAND t_queue_policy)
+  add_test(NAME subscribe COMMAND t_subscribe)
+  set_tests_properties(transport rendezvous queue_policy subscribe PROPERTIES
     ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
     TIMEOUT 60
   )
+  # t_queue_policy.c gates its Spill scenario on this at compile time -- the
+  # library's own VOL_STREAM_HAVE_BAKE compile definition is PRIVATE to the
+  # vol_stream target, so a consumer target needs its own copy to see it.
+  if(VOL_STREAM_HAVE_BAKE)
+    target_compile_definitions(t_queue_policy PRIVATE VOL_STREAM_HAVE_BAKE)
+  endif()
 endif()
 
 # M6 exit gate (first increment): collective step boundaries and a

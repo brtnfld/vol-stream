@@ -38,16 +38,99 @@ MERCURY_GEN_PROC(vs_step_ready_in_t, ((uint64_t)(physical_step))((uint64_t)(wall
 MERCURY_GEN_PROC(vs_step_ready_out_t, ((int32_t)(status)))
 MERCURY_GEN_PROC(vs_get_current_step_in_t, ((int32_t)(unused)))
 MERCURY_GEN_PROC(vs_get_current_step_out_t, ((int32_t)(status))((uint64_t)(physical_step))((uint64_t)(wall_time_ns)))
+/* M7: reader -> writer. member_id identifies the sender explicitly rather
+ * than relying on the RPC's source address, since that address is not the
+ * SSG member_id (see vs_tr_reader_get_current_step()'s comment on why rank
+ * cannot be assumed either) and the writer's lag table is keyed by
+ * member_id to stay valid across SSG's own address bookkeeping. */
+MERCURY_GEN_PROC(vs_reader_ack_in_t, ((uint64_t)(member_id))((uint64_t)(physical_step)))
+MERCURY_GEN_PROC(vs_reader_ack_out_t, ((int32_t)(status)))
+
+/* M8: a length-prefixed raw byte blob -- no builtin Mercury type covers this
+ * (hg_string_t is NUL-terminated text; everything else in mercury_proc.h is
+ * a fixed scalar), so this is a hand-written proc rather than something
+ * MERCURY_GEN_PROC can generate. HG_FREE frees buf on both sides: the
+ * sender's own copy after the RPC completes, and the receiver's decoded
+ * copy once the caller is done with it (margo_free_input()/
+ * margo_free_output() trigger this, same as any other field). */
+typedef struct vs_blob_t {
+    uint64_t size;
+    void    *buf;
+} vs_blob_t;
+
+static hg_return_t
+hg_proc_vs_blob_t(hg_proc_t proc, void *data)
+{
+    vs_blob_t  *b = (vs_blob_t *)data;
+    hg_return_t ret;
+
+    switch (hg_proc_get_op(proc)) {
+        case HG_ENCODE:
+        case HG_DECODE:
+            if (HG_SUCCESS != (ret = hg_proc_hg_uint64_t(proc, &b->size)))
+                return ret;
+            if (hg_proc_get_op(proc) == HG_DECODE) {
+                b->buf = (b->size > 0) ? malloc(b->size) : NULL;
+                if (b->size > 0 && !b->buf)
+                    return HG_NOMEM_ERROR;
+            }
+            if (b->size > 0)
+                return hg_proc_bytes(proc, b->buf, b->size);
+            return HG_SUCCESS;
+        case HG_FREE:
+            free(b->buf);
+            b->buf = NULL;
+            return HG_SUCCESS;
+        default:
+            return HG_SUCCESS;
+    }
+}
+
+/* M8: reader -> writer, "send me path's data" (whole-object granularity,
+ * see this file's header comment). */
+MERCURY_GEN_PROC(vs_subscribe_in_t, ((uint64_t)(member_id))((hg_string_t)(path)))
+MERCURY_GEN_PROC(vs_subscribe_out_t, ((int32_t)(status)))
+/* M8: writer -> reader, one entry's actual bytes. */
+MERCURY_GEN_PROC(vs_data_push_in_t, ((uint64_t)(physical_step))((hg_string_t)(path))((vs_blob_t)(payload)))
+MERCURY_GEN_PROC(vs_data_push_out_t, ((int32_t)(status)))
 
 typedef struct vs_tr_pending_t {
     uint64_t physical_step;
     uint64_t wall_time_ns;
 } vs_tr_pending_t;
 
+/* M7: writer-side lag tracking, one entry per reader that has ever acked.
+ * Absence from this table (never acked, or departed and pruned) means "not
+ * tracked" -- see vs_tr_writer_min_acked_step(). */
+typedef struct vs_tr_lag_entry_t {
+    ssg_member_id_t member_id;
+    uint64_t         acked_step;
+} vs_tr_lag_entry_t;
+
+/* M8, writer side: one (subscriber, path) pair. A reader with several
+ * subscriptions appears once per path, not once per reader -- simplest thing
+ * that works for whole-object granularity, and small enough not to need a
+ * smarter index. */
+typedef struct vs_tr_sub_entry_t {
+    ssg_member_id_t member_id;
+    char            *path;
+} vs_tr_sub_entry_t;
+
+/* M8, reader side: one pushed data item queued for vs_tr_reader_wait_data(). */
+typedef struct vs_tr_data_item_t {
+    uint64_t physical_step;
+    char    *path;
+    void    *buf;
+    uint64_t size;
+} vs_tr_data_item_t;
+
 struct vs_tr_t {
     margo_instance_id mid;
     hg_id_t            step_ready_rpc_id;
     hg_id_t            get_current_step_rpc_id;
+    hg_id_t            reader_ack_rpc_id;
+    hg_id_t            subscribe_rpc_id;
+    hg_id_t            data_push_rpc_id;
 
     /* M5: SSG group this process created (writer) or joined (reader).
      * SSG_GROUP_ID_INVALID until vs_tr_writer_start_group()/
@@ -74,6 +157,43 @@ struct vs_tr_t {
     size_t           n_pending;
     size_t           cap_pending;
     int              stopped;
+
+    /* M7, reader side: the group member that answered a get_current_step
+     * query, cached the first time vs_tr_reader_get_current_step() finds it
+     * so vs_tr_reader_ack_step() does not need to re-probe every member on
+     * every step. There is exactly one writer per group in this
+     * connector's model, and it does not change mid-session. */
+    ssg_member_id_t writer_member_id;
+    int              has_writer_member_id;
+
+    /* M7, writer side: per-reader lag table (see vs_tr_lag_entry_t). Grown
+     * lazily on a reader's first ack; entries for members no longer in the
+     * group are ignored (not pruned) by vs_tr_writer_min_acked_step() --
+     * simpler than hooking SSG's membership callback, and just as correct
+     * since the table is small and re-checked against live membership on
+     * every query. */
+    pthread_mutex_t     lag_lock;
+    vs_tr_lag_entry_t *lag_table;
+    size_t              n_lag;
+    size_t              cap_lag;
+
+    /* M8, writer side: subscription table (see vs_tr_sub_entry_t). Same
+     * "grown lazily, entries for departed members simply ignored rather than
+     * pruned" approach as lag_table above. */
+    pthread_mutex_t     sub_lock;
+    vs_tr_sub_entry_t *sub_table;
+    size_t              n_sub;
+    size_t              cap_sub;
+
+    /* M8, reader side: queue of pushed data items not yet consumed by
+     * vs_tr_reader_wait_data() -- same shape as the pending/pending_lock/
+     * pending_cond step_ready queue above, kept separate since the two are
+     * drained independently and carry different payloads. */
+    pthread_mutex_t     data_lock;
+    pthread_cond_t      data_cond;
+    vs_tr_data_item_t *data_queue;
+    size_t              n_data;
+    size_t              cap_data;
 };
 
 /*-------------------------------------------------------------------------
@@ -102,6 +222,37 @@ vs_push_pending(vs_tr_t *tr, uint64_t physical_step, uint64_t wall_time_ns)
     pthread_cond_broadcast(&tr->pending_cond);
     pthread_mutex_unlock(&tr->pending_lock);
 } /* end vs_push_pending() */
+
+/* M8: takes ownership of path/buf on success (frees them itself if the queue
+ * cannot grow); the caller's own copies must not be used afterward. */
+static void
+vs_push_data_item(vs_tr_t *tr, uint64_t physical_step, char *path, void *buf, uint64_t size)
+{
+    pthread_mutex_lock(&tr->data_lock);
+
+    if (tr->n_data == tr->cap_data) {
+        size_t              new_cap = tr->cap_data ? tr->cap_data * 2 : 8;
+        vs_tr_data_item_t *grown   = (vs_tr_data_item_t *)realloc(tr->data_queue, new_cap * sizeof(*tr->data_queue));
+
+        if (grown) {
+            tr->data_queue = grown;
+            tr->cap_data    = new_cap;
+        }
+    }
+    if (tr->n_data < tr->cap_data) {
+        tr->data_queue[tr->n_data].physical_step = physical_step;
+        tr->data_queue[tr->n_data].path          = path;
+        tr->data_queue[tr->n_data].buf           = buf;
+        tr->data_queue[tr->n_data].size          = size;
+        tr->n_data++;
+    }
+    else {
+        free(path);
+        free(buf);
+    }
+    pthread_cond_broadcast(&tr->data_cond);
+    pthread_mutex_unlock(&tr->data_lock);
+} /* end vs_push_data_item() */
 
 static char *
 vs_tr_self_address(vs_tr_t *tr)
@@ -200,6 +351,157 @@ vs_get_current_step_ult(hg_handle_t handle)
 }
 DEFINE_MARGO_RPC_HANDLER(vs_get_current_step_ult)
 
+/* M7: writer-side handler for vs_reader_ack_in_t. Runs on a Margo/Argobots
+ * RPC-handler thread, not the application's own -- touches only lag_table
+ * under lag_lock, never HDF5 (v1 is not H5VL_CAP_FLAG_THREADSAFE; see
+ * dev-plan.md's "Threading" section), matching the same discipline
+ * vs_step_ready_ult/vs_get_current_step_ult already follow. */
+static void
+vs_reader_ack_ult(hg_handle_t handle)
+{
+    margo_instance_id  mid = margo_hg_handle_get_instance(handle);
+    hg_id_t              id = margo_get_info(handle)->id;
+    vs_tr_t             *tr = (vs_tr_t *)margo_registered_data(mid, id);
+    vs_reader_ack_in_t   in;
+    vs_reader_ack_out_t  out;
+
+    out.status = -1;
+
+    if (tr && HG_SUCCESS == margo_get_input(handle, &in)) {
+        size_t i;
+
+        pthread_mutex_lock(&tr->lag_lock);
+
+        for (i = 0; i < tr->n_lag; i++)
+            if (tr->lag_table[i].member_id == (ssg_member_id_t)in.member_id) {
+                if (in.physical_step > tr->lag_table[i].acked_step)
+                    tr->lag_table[i].acked_step = in.physical_step;
+                break;
+            }
+        if (i == tr->n_lag) {
+            if (tr->n_lag == tr->cap_lag) {
+                size_t               new_cap = tr->cap_lag ? tr->cap_lag * 2 : 8;
+                vs_tr_lag_entry_t *grown   = (vs_tr_lag_entry_t *)realloc(tr->lag_table,
+                                                                            new_cap * sizeof(*tr->lag_table));
+
+                if (grown) {
+                    tr->lag_table = grown;
+                    tr->cap_lag   = new_cap;
+                }
+            }
+            if (tr->n_lag < tr->cap_lag) {
+                tr->lag_table[tr->n_lag].member_id  = (ssg_member_id_t)in.member_id;
+                tr->lag_table[tr->n_lag].acked_step = in.physical_step;
+                tr->n_lag++;
+            }
+        }
+
+        pthread_mutex_unlock(&tr->lag_lock);
+
+        out.status = 0;
+        margo_free_input(handle, &in);
+    }
+
+    margo_respond(handle, &out);
+    margo_destroy(handle);
+}
+DEFINE_MARGO_RPC_HANDLER(vs_reader_ack_ult)
+
+/* M8: writer-side handler for vs_subscribe_in_t. Same thread discipline as
+ * vs_reader_ack_ult -- touches only sub_table under sub_lock. Duplicate
+ * subscriptions from the same member for the same path are harmless (a
+ * later push would just be sent to that member twice), but are still
+ * de-duplicated here to keep vs_tr_writer_push_data()'s fan-out honest. */
+static void
+vs_subscribe_ult(hg_handle_t handle)
+{
+    margo_instance_id    mid = margo_hg_handle_get_instance(handle);
+    hg_id_t                id = margo_get_info(handle)->id;
+    vs_tr_t               *tr = (vs_tr_t *)margo_registered_data(mid, id);
+    vs_subscribe_in_t    in;
+    vs_subscribe_out_t   out;
+
+    out.status = -1;
+
+    if (tr && HG_SUCCESS == margo_get_input(handle, &in) && in.path) {
+        size_t i;
+        int    found = 0;
+
+        pthread_mutex_lock(&tr->sub_lock);
+
+        for (i = 0; i < tr->n_sub; i++)
+            if (tr->sub_table[i].member_id == (ssg_member_id_t)in.member_id &&
+                strcmp(tr->sub_table[i].path, in.path) == 0) {
+                found = 1;
+                break;
+            }
+
+        if (!found) {
+            if (tr->n_sub == tr->cap_sub) {
+                size_t               new_cap = tr->cap_sub ? tr->cap_sub * 2 : 8;
+                vs_tr_sub_entry_t *grown   = (vs_tr_sub_entry_t *)realloc(tr->sub_table,
+                                                                            new_cap * sizeof(*tr->sub_table));
+
+                if (grown) {
+                    tr->sub_table = grown;
+                    tr->cap_sub   = new_cap;
+                }
+            }
+            if (tr->n_sub < tr->cap_sub) {
+                char *path_copy = strdup(in.path);
+
+                if (path_copy) {
+                    tr->sub_table[tr->n_sub].member_id = (ssg_member_id_t)in.member_id;
+                    tr->sub_table[tr->n_sub].path      = path_copy;
+                    tr->n_sub++;
+                }
+            }
+        }
+
+        pthread_mutex_unlock(&tr->sub_lock);
+
+        out.status = 0;
+        margo_free_input(handle, &in);
+    }
+
+    margo_respond(handle, &out);
+    margo_destroy(handle);
+}
+DEFINE_MARGO_RPC_HANDLER(vs_subscribe_ult)
+
+/* M8: reader-side handler for vs_data_push_in_t -- just queues the item;
+ * see vs_push_data_item(). Ownership of the decoded path/payload buffers
+ * moves into the queue (or is freed by vs_push_data_item() itself if the
+ * queue could not grow), so this handler must not touch in.path/in.payload
+ * again after handing them off, and must not margo_free_input() them --
+ * that would free memory the queue now owns. */
+static void
+vs_data_push_ult(hg_handle_t handle)
+{
+    margo_instance_id     mid = margo_hg_handle_get_instance(handle);
+    hg_id_t                 id = margo_get_info(handle)->id;
+    vs_tr_t                *tr = (vs_tr_t *)margo_registered_data(mid, id);
+    vs_data_push_in_t     in;
+    vs_data_push_out_t    out;
+
+    out.status = -1;
+
+    if (tr && HG_SUCCESS == margo_get_input(handle, &in)) {
+        char *path_copy = in.path ? strdup(in.path) : NULL;
+
+        if (path_copy) {
+            vs_push_data_item(tr, in.physical_step, path_copy, in.payload.buf, in.payload.size);
+            in.payload.buf = NULL; /* ownership moved -- do not let margo_free_input() free it too */
+            out.status      = 0;
+        }
+        margo_free_input(handle, &in);
+    }
+
+    margo_respond(handle, &out);
+    margo_destroy(handle);
+}
+DEFINE_MARGO_RPC_HANDLER(vs_data_push_ult)
+
 /*-------------------------------------------------------------------------
  * Public API
  *-------------------------------------------------------------------------
@@ -231,6 +533,10 @@ vs_tr_start(const char *na_str)
     pthread_mutex_init(&tr->last_step_lock, NULL);
     pthread_mutex_init(&tr->pending_lock, NULL);
     pthread_cond_init(&tr->pending_cond, NULL);
+    pthread_mutex_init(&tr->lag_lock, NULL);
+    pthread_mutex_init(&tr->sub_lock, NULL);
+    pthread_mutex_init(&tr->data_lock, NULL);
+    pthread_cond_init(&tr->data_cond, NULL);
 
     tr->step_ready_rpc_id =
         MARGO_REGISTER(tr->mid, "vol-stream:step_ready", vs_step_ready_in_t, vs_step_ready_out_t,
@@ -238,9 +544,21 @@ vs_tr_start(const char *na_str)
     tr->get_current_step_rpc_id =
         MARGO_REGISTER(tr->mid, "vol-stream:get_current_step", vs_get_current_step_in_t,
                         vs_get_current_step_out_t, vs_get_current_step_ult);
+    tr->reader_ack_rpc_id =
+        MARGO_REGISTER(tr->mid, "vol-stream:reader_ack", vs_reader_ack_in_t, vs_reader_ack_out_t,
+                        vs_reader_ack_ult);
+    tr->subscribe_rpc_id =
+        MARGO_REGISTER(tr->mid, "vol-stream:subscribe", vs_subscribe_in_t, vs_subscribe_out_t,
+                        vs_subscribe_ult);
+    tr->data_push_rpc_id =
+        MARGO_REGISTER(tr->mid, "vol-stream:data_push", vs_data_push_in_t, vs_data_push_out_t,
+                        vs_data_push_ult);
 
     margo_register_data(tr->mid, tr->step_ready_rpc_id, tr, NULL);
     margo_register_data(tr->mid, tr->get_current_step_rpc_id, tr, NULL);
+    margo_register_data(tr->mid, tr->reader_ack_rpc_id, tr, NULL);
+    margo_register_data(tr->mid, tr->subscribe_rpc_id, tr, NULL);
+    margo_register_data(tr->mid, tr->data_push_rpc_id, tr, NULL);
 
     return tr;
 }
@@ -256,6 +574,10 @@ vs_tr_stop(vs_tr_t *tr)
     pthread_cond_broadcast(&tr->pending_cond);
     pthread_mutex_unlock(&tr->pending_lock);
 
+    pthread_mutex_lock(&tr->data_lock);
+    pthread_cond_broadcast(&tr->data_cond);
+    pthread_mutex_unlock(&tr->data_lock);
+
     if (tr->group_id != SSG_GROUP_ID_INVALID) {
         if (tr->is_writer)
             ssg_group_destroy(tr->group_id);
@@ -270,7 +592,24 @@ vs_tr_stop(vs_tr_t *tr)
     pthread_mutex_destroy(&tr->last_step_lock);
     pthread_mutex_destroy(&tr->pending_lock);
     pthread_cond_destroy(&tr->pending_cond);
+    pthread_mutex_destroy(&tr->lag_lock);
+    pthread_mutex_destroy(&tr->sub_lock);
+    pthread_mutex_destroy(&tr->data_lock);
+    pthread_cond_destroy(&tr->data_cond);
     free(tr->pending);
+    free(tr->lag_table);
+    {
+        size_t i;
+
+        for (i = 0; i < tr->n_sub; i++)
+            free(tr->sub_table[i].path);
+        free(tr->sub_table);
+        for (i = 0; i < tr->n_data; i++) {
+            free(tr->data_queue[i].path);
+            free(tr->data_queue[i].buf);
+        }
+        free(tr->data_queue);
+    }
     free(tr);
 }
 
@@ -412,6 +751,11 @@ vs_tr_reader_get_current_step(vs_tr_t *tr, uint64_t *physical_step, uint64_t *wa
                             *physical_step = out.physical_step;
                         if (wall_time_ns)
                             *wall_time_ns = out.wall_time_ns;
+                        /* M7: this member just proved it is the writer (only
+                         * the writer ever answers status == 0) -- cache it so
+                         * vs_tr_reader_ack_step() can target it directly. */
+                        tr->writer_member_id     = member_id;
+                        tr->has_writer_member_id = 1;
                         ret = 0;
                     }
                     margo_free_output(handle, &out);
@@ -519,6 +863,319 @@ vs_tr_reader_wait_step_ready(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physica
         ret = 0;
     }
     pthread_mutex_unlock(&tr->pending_lock);
+
+    return ret;
+}
+
+margo_instance_id
+vs_tr_get_mid(vs_tr_t *tr)
+{
+    return tr ? tr->mid : MARGO_INSTANCE_NULL;
+}
+
+int
+vs_tr_reader_ack_step(vs_tr_t *tr, uint64_t physical_step)
+{
+    ssg_member_id_t    self_id;
+    vs_reader_ack_in_t in;
+    int                 ret = -1;
+
+    if (!tr || tr->group_id == SSG_GROUP_ID_INVALID)
+        return -1;
+    if (SSG_SUCCESS != ssg_get_self_id(tr->mid, &self_id))
+        return -1;
+
+    in.member_id     = (uint64_t)self_id;
+    in.physical_step = physical_step;
+
+    /* Common case: the writer was already identified by an earlier
+     * get_current_step call (always true after vs_tr_reader_join_group()) --
+     * target it directly instead of probing every member on every ack. */
+    if (tr->has_writer_member_id) {
+        hg_addr_t  addr;
+        hg_handle_t handle;
+
+        if (SSG_SUCCESS == ssg_get_group_member_addr(tr->group_id, tr->writer_member_id, &addr)) {
+            if (HG_SUCCESS == margo_create(tr->mid, addr, tr->reader_ack_rpc_id, &handle)) {
+                if (HG_SUCCESS == margo_forward_timed(handle, &in, 1000.0)) {
+                    vs_reader_ack_out_t out;
+
+                    if (HG_SUCCESS == margo_get_output(handle, &out)) {
+                        if (out.status == 0)
+                            ret = 0;
+                        margo_free_output(handle, &out);
+                    }
+                }
+                margo_destroy(handle);
+            }
+            margo_addr_free(tr->mid, addr);
+        }
+    }
+
+    /* Fallback: the writer has not been identified yet (e.g. the very first
+     * ack, racing a join whose seed query has not resolved). Same
+     * probe-every-member approach vs_tr_reader_get_current_step() uses. */
+    if (ret != 0) {
+        int group_size, i;
+
+        if (SSG_SUCCESS != ssg_get_group_size(tr->group_id, &group_size))
+            return ret;
+
+        for (i = 0; i < group_size && ret != 0; i++) {
+            ssg_member_id_t member_id;
+            hg_addr_t         addr;
+            hg_handle_t        handle;
+
+            if (SSG_SUCCESS != ssg_get_group_member_id_from_rank(tr->group_id, i, &member_id))
+                continue;
+            if (member_id == self_id)
+                continue;
+            if (SSG_SUCCESS != ssg_get_group_member_addr(tr->group_id, member_id, &addr))
+                continue;
+
+            if (HG_SUCCESS == margo_create(tr->mid, addr, tr->reader_ack_rpc_id, &handle)) {
+                if (HG_SUCCESS == margo_forward_timed(handle, &in, 1000.0)) {
+                    vs_reader_ack_out_t out;
+
+                    if (HG_SUCCESS == margo_get_output(handle, &out)) {
+                        if (out.status == 0) {
+                            tr->writer_member_id     = member_id;
+                            tr->has_writer_member_id = 1;
+                            ret                       = 0;
+                        }
+                        margo_free_output(handle, &out);
+                    }
+                }
+                margo_destroy(handle);
+            }
+            margo_addr_free(tr->mid, addr);
+        }
+    }
+
+    return ret;
+}
+
+int
+vs_tr_writer_min_acked_step(vs_tr_t *tr, uint64_t *min_acked_step)
+{
+    int    group_size = 0;
+    size_t i;
+    int    found = 0;
+    uint64_t min = 0;
+
+    if (!tr)
+        return 0;
+
+    /* No group at all -- nothing to be behind. */
+    if (tr->group_id != SSG_GROUP_ID_INVALID)
+        ssg_get_group_size(tr->group_id, &group_size);
+
+    pthread_mutex_lock(&tr->lag_lock);
+    for (i = 0; i < tr->n_lag; i++) {
+        int      rank;
+        int      still_member = (SSG_SUCCESS == ssg_get_group_member_rank(tr->group_id, tr->lag_table[i].member_id, &rank));
+
+        if (!still_member)
+            continue; /* departed -- not pruned, just skipped (see struct comment) */
+
+        if (!found || tr->lag_table[i].acked_step < min)
+            min = tr->lag_table[i].acked_step;
+        found = 1;
+    }
+    pthread_mutex_unlock(&tr->lag_lock);
+
+    (void)group_size;
+
+    if (found && min_acked_step)
+        *min_acked_step = min;
+
+    return found;
+}
+
+int
+vs_tr_reader_subscribe(vs_tr_t *tr, const char *path)
+{
+    ssg_member_id_t     self_id;
+    vs_subscribe_in_t in;
+    int                  ret = -1;
+
+    if (!tr || !path || tr->group_id == SSG_GROUP_ID_INVALID)
+        return -1;
+    if (SSG_SUCCESS != ssg_get_self_id(tr->mid, &self_id))
+        return -1;
+
+    in.member_id = (uint64_t)self_id;
+    in.path       = (hg_string_t)path;
+
+    /* Same target-the-cached-writer-then-fall-back-to-probing approach as
+     * vs_tr_reader_ack_step() -- see that function's comment. */
+    if (tr->has_writer_member_id) {
+        hg_addr_t  addr;
+        hg_handle_t handle;
+
+        if (SSG_SUCCESS == ssg_get_group_member_addr(tr->group_id, tr->writer_member_id, &addr)) {
+            if (HG_SUCCESS == margo_create(tr->mid, addr, tr->subscribe_rpc_id, &handle)) {
+                if (HG_SUCCESS == margo_forward_timed(handle, &in, 1000.0)) {
+                    vs_subscribe_out_t out;
+
+                    if (HG_SUCCESS == margo_get_output(handle, &out)) {
+                        if (out.status == 0)
+                            ret = 0;
+                        margo_free_output(handle, &out);
+                    }
+                }
+                margo_destroy(handle);
+            }
+            margo_addr_free(tr->mid, addr);
+        }
+    }
+
+    if (ret != 0) {
+        int group_size, i;
+
+        if (SSG_SUCCESS != ssg_get_group_size(tr->group_id, &group_size))
+            return ret;
+
+        for (i = 0; i < group_size && ret != 0; i++) {
+            ssg_member_id_t member_id;
+            hg_addr_t         addr;
+            hg_handle_t        handle;
+
+            if (SSG_SUCCESS != ssg_get_group_member_id_from_rank(tr->group_id, i, &member_id))
+                continue;
+            if (member_id == self_id)
+                continue;
+            if (SSG_SUCCESS != ssg_get_group_member_addr(tr->group_id, member_id, &addr))
+                continue;
+
+            if (HG_SUCCESS == margo_create(tr->mid, addr, tr->subscribe_rpc_id, &handle)) {
+                if (HG_SUCCESS == margo_forward_timed(handle, &in, 1000.0)) {
+                    vs_subscribe_out_t out;
+
+                    if (HG_SUCCESS == margo_get_output(handle, &out)) {
+                        if (out.status == 0) {
+                            tr->writer_member_id     = member_id;
+                            tr->has_writer_member_id = 1;
+                            ret                       = 0;
+                        }
+                        margo_free_output(handle, &out);
+                    }
+                }
+                margo_destroy(handle);
+            }
+            margo_addr_free(tr->mid, addr);
+        }
+    }
+
+    return ret;
+}
+
+int
+vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, const void *buf, uint64_t size)
+{
+    ssg_member_id_t   self_id;
+    int                 group_size, i;
+    vs_data_push_in_t in;
+
+    if (!tr || !path)
+        return -1;
+    if (tr->group_id == SSG_GROUP_ID_INVALID)
+        return 0; /* no group -- no subscribers possible, same "proceed" tolerance as broadcast */
+    if (SSG_SUCCESS != ssg_get_self_id(tr->mid, &self_id))
+        return 0;
+    if (SSG_SUCCESS != ssg_get_group_size(tr->group_id, &group_size))
+        return 0;
+
+    in.physical_step   = physical_step;
+    in.path              = (hg_string_t)path;
+    in.payload.size     = size;
+    in.payload.buf      = (void *)(uintptr_t)buf; /* HG_ENCODE only reads this -- see hg_proc_vs_blob_t() */
+
+    for (i = 0; i < group_size; i++) {
+        ssg_member_id_t member_id;
+        hg_addr_t         addr;
+        hg_handle_t        handle;
+        size_t             j;
+        int                subscribed = 0;
+
+        if (SSG_SUCCESS != ssg_get_group_member_id_from_rank(tr->group_id, i, &member_id))
+            continue;
+        if (member_id == self_id)
+            continue;
+
+        pthread_mutex_lock(&tr->sub_lock);
+        for (j = 0; j < tr->n_sub; j++)
+            if (tr->sub_table[j].member_id == member_id && strcmp(tr->sub_table[j].path, path) == 0) {
+                subscribed = 1;
+                break;
+            }
+        pthread_mutex_unlock(&tr->sub_lock);
+
+        if (!subscribed)
+            continue;
+
+        if (SSG_SUCCESS != ssg_get_group_member_addr(tr->group_id, member_id, &addr))
+            continue;
+
+        /* Same bounded, best-effort forward as vs_tr_writer_broadcast_step_ready() --
+         * a stalled or gone subscriber must not stall the writer. */
+        if (HG_SUCCESS == margo_create(tr->mid, addr, tr->data_push_rpc_id, &handle)) {
+            if (HG_SUCCESS == margo_forward_timed(handle, &in, 1000.0)) {
+                vs_data_push_out_t out;
+
+                if (HG_SUCCESS == margo_get_output(handle, &out))
+                    margo_free_output(handle, &out);
+            }
+            margo_destroy(handle);
+        }
+        margo_addr_free(tr->mid, addr);
+    }
+
+    return 0;
+}
+
+int
+vs_tr_reader_wait_data(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physical_step, char **out_path,
+                         void **out_buf, uint64_t *out_size)
+{
+    struct timespec deadline;
+    int             ret = -1;
+
+    if (!tr)
+        return -1;
+
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += (time_t)(timeout_ms / 1000);
+    deadline.tv_nsec += (long)((timeout_ms % 1000) * 1000000L);
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    pthread_mutex_lock(&tr->data_lock);
+    while (tr->n_data == 0 && !tr->stopped) {
+        if (ETIMEDOUT == pthread_cond_timedwait(&tr->data_cond, &tr->data_lock, &deadline))
+            break;
+    }
+
+    if (tr->n_data > 0) {
+        if (physical_step)
+            *physical_step = tr->data_queue[0].physical_step;
+        if (out_path)
+            *out_path = tr->data_queue[0].path;
+        else
+            free(tr->data_queue[0].path);
+        if (out_buf)
+            *out_buf = tr->data_queue[0].buf;
+        else
+            free(tr->data_queue[0].buf);
+        if (out_size)
+            *out_size = tr->data_queue[0].size;
+        memmove(&tr->data_queue[0], &tr->data_queue[1], (tr->n_data - 1) * sizeof(*tr->data_queue));
+        tr->n_data--;
+        ret = 0;
+    }
+    pthread_mutex_unlock(&tr->data_lock);
 
     return ret;
 }

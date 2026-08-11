@@ -69,7 +69,19 @@ echo "  global size: $GLOBAL_SIZE elements ($PER_RANK per writer rank)"
 echo
 
 echo "== write ($WRITER_RANKS ranks) =="
-HDF5_PLUGIN_PATH="$PLUGIN_DIR" "$MPIRUN" -n "$WRITER_RANKS" "$BIN" write t_parallel.h5 "$GLOBAL_SIZE"
+# -host localhost:N declares N slots on localhost explicitly, regardless of
+# how many cores this machine actually has -- needed on CI runners with
+# fewer cores than requested ranks, where the default slot count (usually
+# derived from nproc) is too small. Confirmed necessary in CI: Open MPI
+# refuses outright ("There are not enough slots available") without either
+# this or --oversubscribe; MPICH's hydra, worse, does not error but silently
+# launches WRITER_RANKS independent single-rank jobs instead of one
+# coordinated job (each rank sees MPI_COMM_WORLD size 1) -- a correctness
+# bug, not just a warning, so this is not optional the way it might look.
+# -host is honored by both implementations, so one flag covers both legs of
+# the CI matrix without branching on which is in use.
+HDF5_PLUGIN_PATH="$PLUGIN_DIR" "$MPIRUN" -host "localhost:$WRITER_RANKS" -n "$WRITER_RANKS" "$BIN" write \
+    t_parallel.h5 "$GLOBAL_SIZE"
 write_rc=$?
 if [[ $write_rc -ne 0 ]]; then
     echo
@@ -79,8 +91,8 @@ fi
 
 echo
 echo "== read ($READER_RANKS ranks, decomposition independent of the writers) =="
-HDF5_PLUGIN_PATH="$PLUGIN_DIR" "$MPIRUN" -n "$READER_RANKS" "$BIN" read t_parallel.h5 "$GLOBAL_SIZE" \
-    "$WRITER_RANKS"
+HDF5_PLUGIN_PATH="$PLUGIN_DIR" "$MPIRUN" -host "localhost:$READER_RANKS" -n "$READER_RANKS" "$BIN" read \
+    t_parallel.h5 "$GLOBAL_SIZE" "$WRITER_RANKS"
 read_rc=$?
 if [[ $read_rc -ne 0 ]]; then
     echo

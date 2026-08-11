@@ -69,6 +69,14 @@
 #ifdef VOL_STREAM_HAVE_MERCURY
 #include "tr_mercury.h"
 #include <unistd.h> /* usleep() -- bounded retry waiting for a writer's address sidecar file */
+
+/* M7: BAKE-backed Spill queue policy. Needs VOL_STREAM_HAVE_MERCURY (BAKE's
+ * provider rides the same margo instance tr_mercury.c already starts) --
+ * see CMakeLists.txt's VOL_STREAM_ENABLE_BAKE. Without it, Spill behaves
+ * like Discard (see H5VL__stream_apply_queue_policy()'s comment). */
+#ifdef VOL_STREAM_HAVE_BAKE
+#include "tr_bake.h"
+#endif
 #endif
 
 /* Pin the VOL class struct version.
@@ -171,6 +179,21 @@ typedef struct H5VL_stream_step_completion_t {
     H5VL_stream_step_notify_t  *notify_list;
 } H5VL_stream_step_completion_t;
 
+#ifdef VOL_STREAM_HAVE_BAKE
+/* M7: one step currently sitting in BAKE rather than fully replayed into the
+ * shared file -- see H5VL__stream_spill_step()/H5VL__stream_drain_spill().
+ * desc is the string tr_bake.c's vs_bake_spill_write() returned; owned by
+ * this entry, freed when the entry is drained or the file closes. size is
+ * what vs_bake_spill_write() was given -- vs_bake_spill_read() needs it
+ * back verbatim, since the file backend's bake_get_size() is not usable
+ * (confirmed against BAKE 0.6.4: returns BAKE_ERR_OP_UNSUPPORTED). */
+typedef struct H5VL_stream_spill_entry_t {
+    uint64_t physical_step;
+    char    *desc;
+    uint64_t size;
+} H5VL_stream_spill_entry_t;
+#endif
+
 /* Step state and the pending-entry buffer for one open file. Refcounted: the
  * file's own wrapper and every dataset/attribute/group/datatype wrapper
  * opened under it borrow this pointer, so it outlives the file wrapper if a
@@ -197,6 +220,23 @@ struct H5VL_stream_file_state_t {
     H5VL_stream_step_completion_t *current_completion;
 #ifdef VOL_STREAM_HAVE_MERCURY
     vs_tr_t *transport;
+#endif
+
+    /* M7: writer-side queue policy, opt-in via H5Fset_stream_queue_policy()
+     * (queue_policy_set stays 0 otherwise, so H5Fend_step() takes the exact
+     * M0-M6 code path -- see H5VL__stream_apply_queue_policy()). spill_bake/
+     * pending_spill are lazily created on this file's first Spill-policy
+     * eviction; NULL/empty otherwise, even with the policy set, if it never
+     * actually triggers. */
+    int                          queue_policy_set;
+    H5VL_stream_queue_policy_t   queue_policy;
+    uint64_t                     reserve_slots;
+#ifdef VOL_STREAM_HAVE_BAKE
+    vs_bake_t                   *spill_bake;
+    char                         *spill_dir;
+    H5VL_stream_spill_entry_t   *pending_spill; /* growable array, oldest first */
+    size_t                        n_pending_spill;
+    size_t                        cap_pending_spill;
 #endif
 
     /* M6: set when this file was opened with H5Pset_fapl_mpio(), i.e. a
@@ -315,7 +355,20 @@ static H5VL_stream_t *H5VL__stream_new_child_obj(void *under_obj, hid_t under_vo
 static size_t H5VL__stream_pending_append(H5VL_stream_file_state_t *fs,
                              const H5VL_stream_pending_entry_t *entry);
 static hid_t  H5VL__stream_resolve_space(hid_t space_id, hid_t fallback_space_id);
+static herr_t H5VL__stream_build_manifest(H5VL_stream_file_state_t *fs, uint8_t **out_manifest_buf,
+                             size_t *out_manifest_len, uint8_t **out_payload_buf, size_t *out_payload_len);
+static herr_t H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_buf,
+                             size_t manifest_len, const uint8_t *payload_buf,
+                             H5VL_stream_pending_entry_t *pending_for_wiring, size_t n_pending_for_wiring);
 static herr_t H5VL__stream_replay_step(H5VL_stream_t *file_obj);
+/* M7: queue policy -- see H5VL__stream_apply_queue_policy()'s comment for
+ * what each does and why they are safe to call instead of a full replay. */
+static herr_t H5VL__stream_discard_step(H5VL_stream_t *file_obj);
+#ifdef VOL_STREAM_HAVE_BAKE
+static herr_t H5VL__stream_spill_step(H5VL_stream_t *file_obj);
+static herr_t H5VL__stream_drain_spill(H5VL_stream_t *file_obj, uint64_t min_acked_step);
+#endif
+static herr_t H5VL__stream_apply_queue_policy(H5VL_stream_t *file_obj);
 
 /* M3: reader helpers */
 static herr_t H5VL__stream_reader_build_index(H5VL_stream_file_state_t *fs);
@@ -517,6 +570,8 @@ static int H5VL_stream_op_subscribe          = -1;
 static int H5VL_stream_op_begin_logical_step = -1;
 static int H5VL_stream_op_get_logical_steps  = -1;
 static int H5VL_stream_op_wait_step_ready    = -1;
+static int H5VL_stream_op_set_queue_policy   = -1;
+static int H5VL_stream_op_get_subscribed_data = -1;
 
 /* Argument structs for the step operations. */
 typedef struct H5VL_stream_args_begin_step_t {
@@ -552,6 +607,21 @@ typedef struct H5VL_stream_args_wait_step_ready_t {
     uint64_t *physical_step; /* OUT */
     uint64_t *wall_time_ns;  /* OUT; NULL if not wanted */
 } H5VL_stream_args_wait_step_ready_t;
+
+/* M7 */
+typedef struct H5VL_stream_args_set_queue_policy_t {
+    H5VL_stream_queue_policy_t policy;
+    uint64_t                    reserve_slots;
+} H5VL_stream_args_set_queue_policy_t;
+
+/* M8 */
+typedef struct H5VL_stream_args_get_subscribed_data_t {
+    uint64_t  timeout_ms;
+    uint64_t *physical_step; /* OUT */
+    char    **path;          /* OUT, newly malloc'd */
+    void    **buf;           /* OUT, newly malloc'd */
+    size_t   *size;          /* OUT */
+} H5VL_stream_args_get_subscribed_data_t;
 
 /*-------------------------------------------------------------------------
  * Default connector info.
@@ -898,6 +968,27 @@ H5VL__stream_file_state_decref(H5VL_stream_file_state_t *fs)
     if (fs->current_completion)
         H5VL__stream_step_completion_decref(fs->current_completion);
 
+#ifdef VOL_STREAM_HAVE_BAKE
+    /* M7: any step still sitting in BAKE at file_close() is simply
+     * abandoned, same "no partial-step state worth preserving" reasoning as
+     * an unclosed step's pending buffer above -- vs_bake_stop() releases the
+     * target itself without needing each region drained first.
+     *
+     * Must run BEFORE vs_tr_stop() below: the BAKE provider and its abt-io
+     * instance are registered on fs->transport's own margo instance, so
+     * tearing that instance down (vs_tr_stop() -> margo_finalize()) first
+     * destroys the Argobots execution streams BAKE/abt-io still have
+     * resources on -- observed directly as an ABT_finalize() assertion
+     * failure ("p_xstream_head == NULL") when this was ordered the other
+     * way around. */
+    for (i = 0; i < fs->n_pending_spill; i++)
+        free(fs->pending_spill[i].desc);
+    free(fs->pending_spill);
+    if (fs->spill_bake)
+        vs_bake_stop(fs->spill_bake);
+    free(fs->spill_dir);
+#endif
+
 #ifdef VOL_STREAM_HAVE_MERCURY
     if (fs->transport)
         vs_tr_stop(fs->transport);
@@ -1044,6 +1135,27 @@ H5VL__stream_transport_na(void)
 {
     return getenv("VOL_STREAM_NA");
 } /* end H5VL__stream_transport_na() */
+
+#ifdef VOL_STREAM_HAVE_BAKE
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_spill_dir
+ *
+ * Purpose:     M7: where a writer's BAKE-backed Spill target file lives.
+ *              VOL_STREAM_SPILL_DIR opts in explicitly, same convention as
+ *              VOL_STREAM_NA above; falls back to /tmp (node-local on any
+ *              normal HPC node, the whole point of Spill) rather than
+ *              failing, since the connector cannot know a better default
+ *              and the fallback still satisfies "node-local".
+ *-------------------------------------------------------------------------
+ */
+static const char *
+H5VL__stream_spill_dir(void)
+{
+    const char *dir = getenv("VOL_STREAM_SPILL_DIR");
+
+    return dir ? dir : "/tmp";
+} /* end H5VL__stream_spill_dir() */
+#endif
 
 /*-------------------------------------------------------------------------
  * Function:    H5VL__stream_ssg_group_path
@@ -2085,71 +2197,39 @@ H5VL__stream_reader_open_attr(H5VL_stream_t *o, const char *name, hid_t aapl_id,
 } /* end H5VL__stream_reader_open_attr() */
 
 /*-------------------------------------------------------------------------
- * Function:    H5VL__stream_replay_step
+ * Function:    H5VL__stream_build_manifest
  *
- * Purpose:     The M2 core. Encodes file_obj->file_state's pending entries
- *              into a flatcc Step manifest, then decodes that manifest back
- *              and replays it -- creating real objects group-based under
- *              /step/<physical_step>/ from the *decoded* ids, never the live
- *              ones captured at create/write time. That decode round trip is
- *              the point: it is what proves the manifest -- not just the
- *              connector's own bookkeeping -- faithfully reproduces HDF5's
- *              data model (types, selections, chunking/filters).
+ * Purpose:     M7: split out of what was the first half of
+ *              H5VL__stream_replay_step() (still below, now a thin
+ *              build-then-replay wrapper) so M7's Spill policy can build a
+ *              step's manifest+payload bytes without paying for the second
+ *              half -- the real H5Dcreate2()/H5Awrite() etc. calls that
+ *              would touch the (possibly congested) shared file, which is
+ *              exactly the cost Spill exists to defer. Encodes fs's pending
+ *              entries into a flatcc Step manifest exactly as before; see
+ *              H5VL__stream_replay_manifest()'s comment for the decode half.
  *
- *              Entries replay in original capture order. A DsetWrite or Attr
- *              entry always has a DsetCreate entry earlier in the same pass:
- *              a placeholder (the only source of either) can only be created
- *              by dataset_create()/attr_create() while IN_STEP. Replay finds
- *              it by scanning already-replayed entries for a matching path
- *              rather than needing a separate index.
- *
- *              M6: this function is unchanged for a parallel (has_comm)
- *              writer -- it is simply called once per rank, each replaying
- *              its own pending[] against the same collectively-opened
- *              underlying file. That is sufficient, not a shortcut,
- *              *given* this milestone's scope decision: every rank
- *              creates the same set of objects (the ordinary parallel-HDF5
- *              pattern of all ranks calling H5Dcreate2()/H5Acreate2() etc.
- *              with matching arguments), varying only in which hyperslab
- *              each rank's own DsetWrite entries cover. Under that
- *              assumption, N ranks independently replaying identical
- *              create-entries against a shared file *is* the correct,
- *              standard parallel-HDF5 collective-create pattern -- HDF5
- *              itself coordinates it into one shared object, not this
- *              connector. Each rank's writes are independent (no DXPL
- *              collective I/O requested), which is safe because writer
- *              ranks' hyperslabs do not overlap. Heterogeneous per-rank
- *              object sets -- rank 0 creating a dataset rank 1 never
- *              touches -- are out of scope for this increment; that needs
- *              real cross-rank manifest aggregation (H5Sselect_project_
- *              intersection, per dev-plan.md's M6 section) and is where
- *              the Subfiling-style I/O-concentrator topology belongs.
- *              See H5VL_stream_file_optional()'s begin_step/end_step
- *              handling for the collective barriers around this call.
- *
- * Return:      Success:    0
- *              Failure:    -1 (the caller discards the pending buffer either
- *                          way -- a partial replay is not salvaged)
+ * Return:      Success:    0, with *out_manifest_buf/*out_payload_buf newly
+ *                          allocated (caller frees: flatcc_builder_free() for
+ *                          the former, free() for the latter)
+ *              Failure:    -1, *out_manifest_buf/*out_payload_buf untouched
  *-------------------------------------------------------------------------
  */
 static herr_t
-H5VL__stream_replay_step(H5VL_stream_t *file_obj)
+H5VL__stream_build_manifest(H5VL_stream_file_state_t *fs, uint8_t **out_manifest_buf,
+                              size_t *out_manifest_len, uint8_t **out_payload_buf, size_t *out_payload_len)
 {
-    H5VL_stream_file_state_t *fs = file_obj->file_state;
-    flatcc_builder_t           B;
-    int                        builder_ready = 0;
-    vs_Entry_ref_t            *entry_refs    = NULL;
-    uint8_t                   *payload_buf   = NULL;
-    size_t                     payload_cap   = 0;
-    size_t                     payload_len   = 0;
-    void                     **replay_under  = NULL;
-    uint8_t                   *needs_close   = NULL;
-    uint8_t                   *manifest_buf  = NULL;
-    size_t                     manifest_len  = 0;
-    char                      *step_root     = NULL;
-    unsigned                   maj, minor, rel;
-    size_t                     i;
-    herr_t                     ret_value = 0;
+    flatcc_builder_t B;
+    int               builder_ready = 0;
+    vs_Entry_ref_t   *entry_refs    = NULL;
+    uint8_t          *payload_buf   = NULL;
+    size_t            payload_cap   = 0;
+    size_t            payload_len   = 0;
+    uint8_t          *manifest_buf  = NULL;
+    size_t            manifest_len  = 0;
+    unsigned          maj, minor, rel;
+    size_t            i;
+    herr_t            ret_value = 0;
 
     if (NULL ==
         (entry_refs = (vs_Entry_ref_t *)malloc((fs->n_pending ? fs->n_pending : 1) * sizeof(vs_Entry_ref_t)))) {
@@ -2240,23 +2320,124 @@ H5VL__stream_replay_step(H5VL_stream_t *file_obj)
         goto done;
     }
 
-    if (NULL == (step_root = (char *)malloc(32))) { /* "/step/" + up to 20 digits + '\0' */
-        ret_value = -1;
-        goto done;
-    }
-    snprintf(step_root, 32, "/step/%llu", (unsigned long long)fs->physical_step);
+    *out_manifest_buf = manifest_buf;
+    *out_manifest_len = manifest_len;
+    *out_payload_buf  = payload_buf;
+    *out_payload_len  = payload_len;
+    manifest_buf      = NULL; /* ownership moved to the caller */
+    payload_buf       = NULL;
 
-    /* Pass 2: decode the manifest just built and replay it entry by entry,
-     * using only the decoded ids -- see the function comment above. */
+done:
+    if (manifest_buf)
+        flatcc_builder_free(manifest_buf);
+    if (builder_ready)
+        flatcc_builder_clear(&B);
+    free(entry_refs);
+    free(payload_buf);
+
+    return ret_value;
+} /* end H5VL__stream_build_manifest() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_replay_manifest
+ *
+ * Purpose:     The M2 core (M7: the second half of what was
+ *              H5VL__stream_replay_step(), now reusable). Decodes
+ *              manifest_buf and replays it -- creating real objects
+ *              group-based under /step/<physical_step>/ (physical_step read
+ *              from the *decoded* manifest, not passed in, so this always
+ *              targets exactly the step the manifest itself claims) from
+ *              the decoded ids, never any live ones. That decode round trip
+ *              is the point: it is what proves the manifest -- not just the
+ *              connector's own bookkeeping -- faithfully reproduces HDF5's
+ *              data model (types, selections, chunking/filters).
+ *
+ *              Entries replay in original capture order. A DsetWrite or Attr
+ *              entry always has a DsetCreate entry earlier in the same pass:
+ *              a placeholder (the only source of either) can only be created
+ *              by dataset_create()/attr_create() while IN_STEP. Replay finds
+ *              it by scanning already-replayed entries for a matching path
+ *              rather than needing a separate index.
+ *
+ *              pending_for_wiring/n_pending_for_wiring wire a DsetCreate/Attr
+ *              entry's replayed object into the application's still-open
+ *              placeholder handle (see H5VL_stream_dataset_close()), index-
+ *              for-index with the manifest's own entries -- only valid when
+ *              this manifest was JUST built from that exact pending buffer
+ *              (the normal, same-step case: pass fs->pending/fs->n_pending).
+ *              Pass NULL/0 when replaying a manifest recovered from
+ *              elsewhere (M7's spill drain, H5VL__stream_drain_spill()) --
+ *              every replayed object is then closed immediately instead,
+ *              which M7's H5VL__stream_apply_queue_policy() guarantees is
+ *              correct by never spilling or discarding a step that has an
+ *              open placeholder in the first place (see its comment).
+ *
+ *              M6: this function is unchanged for a parallel (has_comm)
+ *              writer -- it is simply called once per rank, each replaying
+ *              its own pending[] against the same collectively-opened
+ *              underlying file. That is sufficient, not a shortcut,
+ *              *given* this milestone's scope decision: every rank
+ *              creates the same set of objects (the ordinary parallel-HDF5
+ *              pattern of all ranks calling H5Dcreate2()/H5Acreate2() etc.
+ *              with matching arguments), varying only in which hyperslab
+ *              each rank's own DsetWrite entries cover. Under that
+ *              assumption, N ranks independently replaying identical
+ *              create-entries against a shared file *is* the correct,
+ *              standard parallel-HDF5 collective-create pattern -- HDF5
+ *              itself coordinates it into one shared object, not this
+ *              connector. Each rank's writes are independent (no DXPL
+ *              collective I/O requested), which is safe because writer
+ *              ranks' hyperslabs do not overlap. Heterogeneous per-rank
+ *              object sets -- rank 0 creating a dataset rank 1 never
+ *              touches -- are out of scope for this increment; that needs
+ *              real cross-rank manifest aggregation (H5Sselect_project_
+ *              intersection, per dev-plan.md's M6 section) and is where
+ *              the Subfiling-style I/O-concentrator topology belongs.
+ *              See H5VL_stream_file_optional()'s begin_step/end_step
+ *              handling for the collective barriers around this call.
+ *
+ * Return:      Success:    0
+ *              Failure:    -1 (the caller discards the pending buffer either
+ *                          way -- a partial replay is not salvaged)
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_buf, size_t manifest_len,
+                               const uint8_t *payload_buf, H5VL_stream_pending_entry_t *pending_for_wiring,
+                               size_t n_pending_for_wiring)
+{
+    void       **replay_under = NULL;
+    uint8_t     *needs_close  = NULL;
+    char        *step_root    = NULL;
+    size_t       payload_len  = 0;
+    uint64_t     physical_step = 0;
+    size_t       i;
+    herr_t       ret_value = 0;
+
+    /* Pass 2: decode the manifest and replay it entry by entry, using only
+     * the decoded ids -- see the function comment above. */
     {
         vs_Step_table_t step      = vs_Step_as_root(manifest_buf);
         vs_Entry_vec_t  entries   = step ? vs_Step_entries(step) : NULL;
         size_t          n_entries = entries ? vs_Entry_vec_len(entries) : 0;
 
-        if (!step || n_entries != fs->n_pending) {
+        if (!step || (pending_for_wiring && n_entries != n_pending_for_wiring)) {
             ret_value = -1;
             goto done;
         }
+
+        /* Schema-recorded, not recomputed from entries: build_manifest()
+         * writes it once as the authoritative total (dev-plan.md's Step
+         * manifest section), and this is exactly the value the persistence
+         * block below needs for the .payload dataspace. */
+        payload_len   = (size_t)vs_Step_payload_bytes(step);
+        physical_step = vs_Step_physical_step(step);
+
+        if (NULL == (step_root = (char *)malloc(32))) { /* "/step/" + up to 20 digits + '\0' */
+            ret_value = -1;
+            goto done;
+        }
+        snprintf(step_root, 32, "/step/%llu", (unsigned long long)physical_step);
 
         if (n_entries > 0) {
             if (NULL == (replay_under = (void **)calloc(n_entries, sizeof(void *))) ||
@@ -2355,9 +2536,9 @@ H5VL__stream_replay_step(H5VL_stream_t *file_obj)
 
                 replay_under[i] = real;
 
-                if (fs->pending[i].owner_wrapper) {
-                    fs->pending[i].owner_wrapper->under_object = real;
-                    fs->pending[i].owner_wrapper->obj_state    = H5VL_STREAM_OBJ_LIVE;
+                if (pending_for_wiring && pending_for_wiring[i].owner_wrapper) {
+                    pending_for_wiring[i].owner_wrapper->under_object = real;
+                    pending_for_wiring[i].owner_wrapper->obj_state    = H5VL_STREAM_OBJ_LIVE;
                 }
                 else
                     needs_close[i] = 1;
@@ -2398,13 +2579,28 @@ H5VL__stream_replay_step(H5VL_stream_t *file_obj)
                     herr_t      w = H5VLdataset_write(1, &real, file_obj->under_vol_id, &dtype, &mem_space,
                                                       &dspace, H5P_DATASET_XFER_DEFAULT, &payload_ptr, NULL);
                     H5Sclose(mem_space);
-                    (void)plen;
                     if (w < 0) {
                         H5Tclose(dtype);
                         H5Sclose(dspace);
                         ret_value = -1;
                         goto done;
                     }
+
+#ifdef VOL_STREAM_HAVE_MERCURY
+                    /* M8, first increment: push this entry's actual bytes to
+                     * any current subscriber of path (whole-object
+                     * granularity -- see tr_mercury.c's header comment).
+                     * vs_tr_writer_push_data() is itself a no-op when there
+                     * is no transport or no subscriber, so this costs
+                     * nothing on the ordinary M0-M7 path. Best-effort, same
+                     * as vs_tr_writer_broadcast_step_ready(): a failed push
+                     * must not fail the replay that already durably
+                     * committed this data to the real file. */
+                    if (file_obj->file_state && file_obj->file_state->transport)
+                        vs_tr_writer_push_data(file_obj->file_state->transport, physical_step, path,
+                                                 payload_ptr, plen);
+#endif
+                    (void)plen;
                 }
             }
             else if (kind == vs_Kind_Attr) {
@@ -2517,9 +2713,9 @@ H5VL__stream_replay_step(H5VL_stream_t *file_obj)
                     }
                 }
 
-                if (fs->pending[i].owner_wrapper) {
-                    fs->pending[i].owner_wrapper->under_object = attr;
-                    fs->pending[i].owner_wrapper->obj_state    = H5VL_STREAM_OBJ_LIVE;
+                if (pending_for_wiring && pending_for_wiring[i].owner_wrapper) {
+                    pending_for_wiring[i].owner_wrapper->under_object = attr;
+                    pending_for_wiring[i].owner_wrapper->obj_state    = H5VL_STREAM_OBJ_LIVE;
                 }
                 else
                     H5VLattr_close(attr, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
@@ -2610,18 +2806,379 @@ H5VL__stream_replay_step(H5VL_stream_t *file_obj)
     }
 
 done:
-    if (manifest_buf)
-        flatcc_builder_free(manifest_buf);
-    if (builder_ready)
-        flatcc_builder_clear(&B);
-    free(entry_refs);
-    free(payload_buf);
     free(replay_under);
     free(needs_close);
     free(step_root);
 
     return ret_value;
+} /* end H5VL__stream_replay_manifest() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_replay_step
+ *
+ * Purpose:     M0-M6 behavior, unchanged: build this step's manifest and
+ *              replay it immediately. What M7 adds lives in
+ *              H5VL__stream_apply_queue_policy(), which calls this only
+ *              when there is no reason to Block/Discard/Spill instead --
+ *              see its comment. Kept as a separate, trivial function (not
+ *              inlined into the caller) so every existing call site and
+ *              this function's own long-standing doc comment on the
+ *              M2-M6 replay design keep meaning exactly what they did
+ *              before M7.
+ *
+ * Return:      Success:    0
+ *              Failure:    -1 (the caller discards the pending buffer either
+ *                          way -- a partial replay is not salvaged)
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_replay_step(H5VL_stream_t *file_obj)
+{
+    H5VL_stream_file_state_t *fs = file_obj->file_state;
+    uint8_t                   *manifest_buf = NULL;
+    size_t                     manifest_len = 0;
+    uint8_t                   *payload_buf  = NULL;
+    size_t                     payload_len  = 0;
+    herr_t                     ret_value;
+
+    if (H5VL__stream_build_manifest(fs, &manifest_buf, &manifest_len, &payload_buf, &payload_len) < 0)
+        return -1;
+
+    ret_value = H5VL__stream_replay_manifest(file_obj, manifest_buf, manifest_len, payload_buf, fs->pending,
+                                               fs->n_pending);
+
+    flatcc_builder_free(manifest_buf);
+    free(payload_buf);
+
+    return ret_value;
 } /* end H5VL__stream_replay_step() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_discard_step
+ *
+ * Purpose:     M7's Discard (and, as a building block, Spill) queue policy:
+ *              materialize an empty /step/<physical_step>/ placeholder --
+ *              satisfying the reader index's hard contiguity requirement
+ *              (H5VL__stream_reader_build_index(): "physical steps are
+ *              always 0..n-1, contiguous", a gap makes a reader refuse the
+ *              whole file as foreign) -- without replaying any of this
+ *              step's real entries into it. A reader landing on this step
+ *              via sequential H5Fbegin_step() finds the group exists but
+ *              nothing new: H5VL__stream_path_index_resolve()'s "largest
+ *              physical step <= current with an entry" already falls back
+ *              to the last real value with no code change needed here.
+ *
+ * Return:      Success:    0
+ *              Failure:    -1
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_discard_step(H5VL_stream_t *file_obj)
+{
+    H5VL_stream_file_state_t *fs = file_obj->file_state;
+    char                       step_root[32];
+    void                      *step_group;
+
+    snprintf(step_root, sizeof(step_root), "/step/%llu", (unsigned long long)fs->physical_step);
+
+    if (NULL ==
+        (step_group = H5VL__stream_replay_ensure_group(file_obj->under_object, file_obj->under_vol_id, step_root)))
+        return -1;
+    H5VLgroup_close(step_group, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+
+    return 0;
+} /* end H5VL__stream_discard_step() */
+
+#ifdef VOL_STREAM_HAVE_BAKE
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_spill_step
+ *
+ * Purpose:     M7's Spill queue policy. Creates the same empty placeholder
+ *              H5VL__stream_discard_step() does (contiguity), then builds
+ *              this step's manifest+payload (H5VL__stream_build_manifest(),
+ *              the cheap half of ordinary replay -- no H5Dcreate2()/
+ *              H5Awrite() etc. against the shared file) and writes both,
+ *              with a tiny length-prefixed header so they can be split
+ *              apart again, as ONE region to node-local storage via
+ *              tr_bake.c. One region because the BAKE file backend does not
+ *              support writes to a non-zero region offset (confirmed
+ *              against BAKE 0.6.4 directly): two separate regions would
+ *              need two round trips for no benefit here anyway. The
+ *              resulting descriptor is queued in fs->pending_spill for
+ *              H5VL__stream_drain_spill() to complete later.
+ *
+ * Return:      Success:    0
+ *              Failure:    -1 (fs->pending_spill unchanged; the caller,
+ *                          H5VL__stream_apply_queue_policy(), falls back to
+ *                          Block rather than silently lose the step)
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_spill_step(H5VL_stream_t *file_obj)
+{
+    H5VL_stream_file_state_t *fs           = file_obj->file_state;
+    uint8_t                   *manifest_buf = NULL;
+    uint8_t                   *payload_buf  = NULL;
+    size_t                     manifest_len = 0;
+    size_t                     payload_len  = 0;
+    uint8_t                   *combined     = NULL;
+    size_t                     combined_len;
+    char                      *desc         = NULL;
+    herr_t                     ret_value = 0;
+
+    if (H5VL__stream_discard_step(file_obj) < 0)
+        return -1;
+
+    /* Lazily started on this file's first Spill eviction -- most steps of
+     * most files never trigger Spill even with the policy set, so most
+     * files never pay for a BAKE provider/target at all. */
+    if (!fs->spill_bake && fs->transport)
+        fs->spill_bake = vs_bake_start(vs_tr_get_mid(fs->transport), H5VL__stream_spill_dir());
+    if (!fs->spill_bake)
+        return -1;
+
+    if (H5VL__stream_build_manifest(fs, &manifest_buf, &manifest_len, &payload_buf, &payload_len) < 0)
+        return -1;
+
+    /* [0..8): manifest_len, [8..16): payload_len, then manifest bytes, then
+     * payload bytes -- an internal-only layout, never read back by anything
+     * but H5VL__stream_drain_spill() on this same process. */
+    combined_len = 16 + manifest_len + payload_len;
+    if (NULL == (combined = (uint8_t *)malloc(combined_len))) {
+        ret_value = -1;
+        goto done;
+    }
+    {
+        uint64_t mlen = (uint64_t)manifest_len, plen = (uint64_t)payload_len;
+
+        memcpy(combined, &mlen, 8);
+        memcpy(combined + 8, &plen, 8);
+        memcpy(combined + 16, manifest_buf, manifest_len);
+        memcpy(combined + 16 + manifest_len, payload_buf, payload_len);
+    }
+
+    if (!fs->spill_bake || vs_bake_spill_write(fs->spill_bake, combined, (uint64_t)combined_len, &desc) < 0) {
+        ret_value = -1;
+        goto done;
+    }
+
+    if (fs->n_pending_spill == fs->cap_pending_spill) {
+        size_t                       new_cap = fs->cap_pending_spill ? fs->cap_pending_spill * 2 : 8;
+        H5VL_stream_spill_entry_t *grown = (H5VL_stream_spill_entry_t *)realloc(
+            fs->pending_spill, new_cap * sizeof(*fs->pending_spill));
+
+        if (!grown) {
+            ret_value = -1;
+            goto done;
+        }
+        fs->pending_spill   = grown;
+        fs->cap_pending_spill = new_cap;
+    }
+    fs->pending_spill[fs->n_pending_spill].physical_step = fs->physical_step;
+    fs->pending_spill[fs->n_pending_spill].desc          = desc;
+    fs->pending_spill[fs->n_pending_spill].size          = (uint64_t)combined_len;
+    fs->n_pending_spill++;
+    desc = NULL; /* ownership moved into pending_spill */
+
+done:
+    flatcc_builder_free(manifest_buf);
+    free(payload_buf);
+    free(combined);
+    free(desc);
+
+    return ret_value;
+} /* end H5VL__stream_spill_step() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_drain_spill
+ *
+ * Purpose:     Complete the real replay -- H5Dcreate2()/H5Awrite() etc.,
+ *              same as an un-spilled step would have gotten synchronously
+ *              -- for every queued spill entry whose physical_step is now
+ *              <= min_acked_step + reserve_slots, oldest first. Entries are
+ *              always appended to fs->pending_spill in increasing
+ *              physical_step order (each spill happens at the
+ *              then-current, forward-only step counter), so the array is
+ *              already sorted and the first entry still outside the window
+ *              means every later one is too -- safe to stop there rather
+ *              than scanning the rest.
+ *
+ *              pending_for_wiring is NULL for every drained entry (see
+ *              H5VL__stream_replay_manifest()'s comment): safe because
+ *              H5VL__stream_apply_queue_policy() never spills a step with
+ *              an open placeholder in the first place.
+ *
+ * Return:      0 whether or not anything was drained; -1 only if a read or
+ *              replay actually failed (the failing entry, and everything
+ *              after it, stays queued for a later call to retry).
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_drain_spill(H5VL_stream_t *file_obj, uint64_t min_acked_step)
+{
+    H5VL_stream_file_state_t *fs = file_obj->file_state;
+    size_t                     drained = 0;
+    herr_t                     ret_value = 0;
+
+    while (drained < fs->n_pending_spill) {
+        H5VL_stream_spill_entry_t *e = &fs->pending_spill[drained];
+        void                        *buf = NULL;
+
+        if (e->physical_step > min_acked_step + fs->reserve_slots)
+            break; /* still outside the window -- so is everything after it */
+
+        if (vs_bake_spill_read(fs->spill_bake, e->desc, e->size, &buf) < 0) {
+            ret_value = -1;
+            break;
+        }
+
+        {
+            uint64_t mlen, plen;
+
+            if (e->size < 16) { /* corrupt/truncated -- cannot happen from our own writer, but do not trust blindly */
+                free(buf);
+                ret_value = -1;
+                break;
+            }
+            memcpy(&mlen, buf, 8);
+            memcpy(&plen, (const uint8_t *)buf + 8, 8);
+
+            if (e->size != 16 + mlen + plen ||
+                H5VL__stream_replay_manifest(file_obj, (const uint8_t *)buf + 16, (size_t)mlen,
+                                               (const uint8_t *)buf + 16 + mlen, NULL, 0) < 0) {
+                free(buf);
+                ret_value = -1;
+                break;
+            }
+        }
+        free(buf);
+
+        vs_bake_spill_remove(fs->spill_bake, e->desc); /* best-effort -- not fatal to leave it */
+        free(e->desc);
+        drained++;
+    }
+
+    if (drained > 0) {
+        memmove(fs->pending_spill, fs->pending_spill + drained,
+                (fs->n_pending_spill - drained) * sizeof(*fs->pending_spill));
+        fs->n_pending_spill -= drained;
+    }
+
+    return ret_value;
+} /* end H5VL__stream_drain_spill() */
+#endif /* VOL_STREAM_HAVE_BAKE */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_apply_queue_policy
+ *
+ * Purpose:     M7. Called from end_step() instead of calling
+ *              H5VL__stream_replay_step() directly. With no policy set
+ *              (fs->queue_policy_set == 0, the default) or no transport to
+ *              check reader progress against, this reduces to exactly
+ *              H5VL__stream_replay_step() -- M0-M6 behavior, unchanged.
+ *
+ *              Otherwise: first, best-effort drain whatever earlier spilled
+ *              steps the currently-tracked reader has now caught up to
+ *              (independent of what this step itself needs, so a spilled
+ *              backlog clears as soon as it can rather than only when the
+ *              *next* step also happens to be under pressure). Then decide
+ *              this step's own fate: if the furthest-behind tracked reader
+ *              (vs_tr_writer_min_acked_step() -- readers that only ever
+ *              jump via H5Fbegin_logical_step() are never tracked, so a
+ *              monitoring/latest-only reader never counts here) is more
+ *              than reserve_slots steps behind the one about to commit,
+ *              apply the configured policy; otherwise, same as no pressure
+ *              at all, do the ordinary full replay.
+ *
+ *              A step with any placeholder object still open (an
+ *              application holding a handle from dataset_create()/
+ *              attr_create() across end_step(), see
+ *              H5VL__stream_replay_manifest()'s pending_for_wiring comment)
+ *              is never spilled or discarded, regardless of pressure or
+ *              policy -- deferring that resolution past end_step() is a
+ *              real generalization this increment does not attempt, so
+ *              such a step always gets the full immediate replay.
+ *
+ * Return:      Success:    0
+ *              Failure:    -1
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_apply_queue_policy(H5VL_stream_t *file_obj)
+{
+    H5VL_stream_file_state_t *fs = file_obj->file_state;
+
+#ifdef VOL_STREAM_HAVE_MERCURY
+    if (fs->queue_policy_set && fs->transport) {
+        uint64_t min_acked = 0;
+        int       have_lag;
+
+#ifdef VOL_STREAM_HAVE_BAKE
+        if (fs->n_pending_spill > 0) {
+            uint64_t drain_to;
+
+            if (!vs_tr_writer_min_acked_step(fs->transport, &drain_to))
+                drain_to = fs->physical_step; /* nothing tracked -- no pressure, drain everything */
+            H5VL__stream_drain_spill(file_obj, drain_to);
+        }
+#endif
+
+        have_lag = vs_tr_writer_min_acked_step(fs->transport, &min_acked);
+
+        if (have_lag && fs->physical_step > min_acked + fs->reserve_slots) {
+            size_t i;
+            int    has_open_placeholder = 0;
+
+            for (i = 0; i < fs->n_pending; i++)
+                if (fs->pending[i].owner_wrapper) {
+                    has_open_placeholder = 1;
+                    break;
+                }
+
+            if (!has_open_placeholder) {
+                if (fs->queue_policy == H5VL_STREAM_QUEUE_DISCARD)
+                    return H5VL__stream_discard_step(file_obj);
+
+#ifdef VOL_STREAM_HAVE_BAKE
+                if (fs->queue_policy == H5VL_STREAM_QUEUE_SPILL) {
+                    /* H5VL__stream_spill_step() lazily starts fs->spill_bake
+                     * on its own on the very first call -- do not pre-check
+                     * it here, or that first start never happens at all. */
+                    if (H5VL__stream_spill_step(file_obj) == 0)
+                        return 0;
+                    /* Either BAKE never came up or the spill write itself
+                     * failed -- fall through to Block rather than silently
+                     * lose the step. */
+                }
+#else
+                if (fs->queue_policy == H5VL_STREAM_QUEUE_SPILL)
+                    return H5VL__stream_discard_step(file_obj); /* connector built without BAKE */
+#endif
+                /* Block: wait for the tracked reader to catch up. Bounded
+                 * (~60s) so a genuine failure, not just slowness, cannot
+                 * hang the writer forever -- Margo's progress engine runs
+                 * independently of this thread, so the ack table keeps
+                 * updating while it sleeps. */
+                {
+                    int iter;
+
+                    for (iter = 0; iter < 600; iter++) {
+                        uint64_t cur_min;
+
+                        if (!vs_tr_writer_min_acked_step(fs->transport, &cur_min))
+                            break; /* reader departed -- nothing left to wait for */
+                        if (fs->physical_step <= cur_min + fs->reserve_slots)
+                            break;
+                        usleep(100000); /* 100ms */
+                    }
+                }
+            }
+        }
+    }
+#endif /* VOL_STREAM_HAVE_MERCURY */
+
+    return H5VL__stream_replay_step(file_obj);
+} /* end H5VL__stream_apply_queue_policy() */
 
 /*-------------------------------------------------------------------------
  * Function:    H5VL_stream_init
@@ -2666,6 +3223,12 @@ H5VL_stream_init(hid_t vipl_id)
         return -1;
     if (H5VLregister_opt_operation(H5VL_SUBCLS_FILE, H5VL_STREAM_OP_WAIT_STEP_READY,
                                     &H5VL_stream_op_wait_step_ready) < 0)
+        return -1;
+    if (H5VLregister_opt_operation(H5VL_SUBCLS_FILE, H5VL_STREAM_OP_SET_QUEUE_POLICY,
+                                    &H5VL_stream_op_set_queue_policy) < 0)
+        return -1;
+    if (H5VLregister_opt_operation(H5VL_SUBCLS_FILE, H5VL_STREAM_OP_GET_SUBSCRIBED_DATA,
+                                    &H5VL_stream_op_get_subscribed_data) < 0)
         return -1;
 
     return 0;
@@ -4538,8 +5101,22 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
          * n_logical/logical_ids/wall_time_ns are write-only and ignored here;
          * the call is reused unmodified for both roles, per dev-plan.md's
          * "borrow by default" rule -- see H5Fbegin_step()'s doc comment. */
-        if (o->file_state->is_reader)
-            return H5VL__stream_reader_advance(o->file_state, 0, 0);
+        if (o->file_state->is_reader) {
+            herr_t adv_ret = H5VL__stream_reader_advance(o->file_state, 0, 0);
+
+#ifdef VOL_STREAM_HAVE_MERCURY
+            /* M7: report progress to the writer -- only for this sequential
+             * advance, never for H5Fbegin_logical_step()'s jump (see that
+             * handler below), which is exactly what keeps a reader using
+             * only the jump path exempt from the writer's queue-policy
+             * pressure (vs_tr_writer_min_acked_step()'s comment). Best-
+             * effort: a failed ack just means the writer's view of this
+             * reader goes stale until the next one, not a read failure. */
+            if (adv_ret == 0 && o->file_state->transport)
+                vs_tr_reader_ack_step(o->file_state->transport, o->file_state->current_step);
+#endif
+            return adv_ret;
+        }
 
 #ifdef H5_HAVE_PARALLEL
         /* M6: a writer's step boundaries are collective (opt_query() already
@@ -4594,7 +5171,10 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
             MPI_Barrier(o->file_state->comm);
 #endif
 
-        replay_ret = H5VL__stream_replay_step(o);
+        /* M7: a no-op wrapper around H5VL__stream_replay_step() unless a
+         * queue policy was set (H5Fset_stream_queue_policy()) -- see its
+         * comment. */
+        replay_ret = H5VL__stream_apply_queue_policy(o);
 
         /* Discard the pending buffer either way: a failed replay may have
          * landed some entries and not others, and there is no partial-step
@@ -4680,14 +5260,24 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
         if (!sargs)
             return -1;
 
-        /* Validate now, act in M8: a subscription naming a path that cannot be
-         * expressed should fail where the caller made the mistake. */
+        /* Validated regardless of transport: a subscription naming a path
+         * that cannot be expressed should fail where the caller made the
+         * mistake. spaces[i]/plists[i] are validated but not yet acted on --
+         * M8's first increment routes at whole-object granularity only, see
+         * H5Fsubscribe()'s doc comment. */
         for (size_t i = 0; i < sargs->count; i++) {
             if (!sargs->paths[i] || sargs->paths[i][0] == '\0')
                 return -1;
             if (H5Sget_simple_extent_ndims(sargs->spaces[i]) < 0)
                 return -1;
         }
+
+#ifdef VOL_STREAM_HAVE_MERCURY
+        if (o->file_state && o->file_state->transport) {
+            for (size_t i = 0; i < sargs->count; i++)
+                vs_tr_reader_subscribe(o->file_state->transport, sargs->paths[i]);
+        }
+#endif
         return 0;
     }
     else if (args->op_type == H5VL_stream_op_begin_logical_step) {
@@ -4745,6 +5335,38 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
 
         return (herr_t)vs_tr_reader_wait_step_ready(o->file_state->transport, sargs->timeout_ms,
                                                      sargs->physical_step, sargs->wall_time_ns);
+#else
+        return -1;
+#endif
+    }
+    else if (args->op_type == H5VL_stream_op_set_queue_policy) {
+        H5VL_stream_args_set_queue_policy_t *sargs = (H5VL_stream_args_set_queue_policy_t *)args->args;
+
+        if (!sargs || !o->file_state || o->file_state->is_reader)
+            return -1;
+
+        o->file_state->queue_policy_set = 1;
+        o->file_state->queue_policy      = sargs->policy;
+        o->file_state->reserve_slots     = sargs->reserve_slots;
+        return 0;
+    }
+    else if (args->op_type == H5VL_stream_op_get_subscribed_data) {
+#ifdef VOL_STREAM_HAVE_MERCURY
+        H5VL_stream_args_get_subscribed_data_t *sargs =
+            (H5VL_stream_args_get_subscribed_data_t *)args->args;
+
+        if (!sargs || !sargs->physical_step || !sargs->path || !sargs->buf || !sargs->size || !o->file_state ||
+            !o->file_state->is_reader || !o->file_state->transport)
+            return -1;
+
+        {
+            uint64_t size64 = 0;
+            int      r = vs_tr_reader_wait_data(o->file_state->transport, sargs->timeout_ms,
+                                                  sargs->physical_step, sargs->path, sargs->buf, &size64);
+
+            *sargs->size = (size_t)size64;
+            return (herr_t)r;
+        }
 #else
         return -1;
 #endif
@@ -5627,6 +6249,14 @@ H5VL_stream_introspect_opt_query(void *obj, H5VL_subclass_t cls, int opt_type, u
         *flags = H5VL_OPT_QUERY_SUPPORTED | H5VL_OPT_QUERY_QUERY_METADATA;
         return 0;
     }
+    else if (cls == H5VL_SUBCLS_FILE && opt_type == H5VL_stream_op_set_queue_policy) {
+        *flags = H5VL_OPT_QUERY_SUPPORTED | H5VL_OPT_QUERY_MODIFY_METADATA;
+        return 0;
+    }
+    else if (cls == H5VL_SUBCLS_FILE && opt_type == H5VL_stream_op_get_subscribed_data) {
+        *flags = H5VL_OPT_QUERY_SUPPORTED | H5VL_OPT_QUERY_QUERY_METADATA;
+        return 0;
+    }
 
     ret_value = H5VLintrospect_opt_query(o->under_object, o->under_vol_id, cls, opt_type, flags);
 
@@ -6256,3 +6886,32 @@ H5Fwait_step_ready(hid_t file_id, uint64_t timeout_ms, uint64_t *physical_step, 
 
     return H5VL__stream_file_op(file_id, H5VL_stream_op_wait_step_ready, &op_args);
 } /* end H5Fwait_step_ready() */
+
+herr_t
+H5Fset_stream_queue_policy(hid_t file_id, H5VL_stream_queue_policy_t policy, uint64_t reserve_slots)
+{
+    H5VL_stream_args_set_queue_policy_t op_args;
+
+    op_args.policy        = policy;
+    op_args.reserve_slots = reserve_slots;
+
+    return H5VL__stream_file_op(file_id, H5VL_stream_op_set_queue_policy, &op_args);
+} /* end H5Fset_stream_queue_policy() */
+
+herr_t
+H5Fget_subscribed_data(hid_t file_id, uint64_t timeout_ms, uint64_t *physical_step, char **path, void **buf,
+                         size_t *size)
+{
+    H5VL_stream_args_get_subscribed_data_t op_args;
+
+    if (!physical_step || !path || !buf || !size)
+        return -1;
+
+    op_args.timeout_ms    = timeout_ms;
+    op_args.physical_step = physical_step;
+    op_args.path            = path;
+    op_args.buf             = buf;
+    op_args.size            = size;
+
+    return H5VL__stream_file_op(file_id, H5VL_stream_op_get_subscribed_data, &op_args);
+} /* end H5Fget_subscribed_data() */

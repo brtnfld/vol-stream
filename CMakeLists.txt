@@ -191,6 +191,64 @@ else()
   message(STATUS "Mercury transport: disabled (set VOL_STREAM_ENABLE_MERCURY=ON to require it)")
 endif()
 
+# ---------------------------------------------------------------------------
+# M7's Spill queue policy: BAKE (a Mochi provider for node-local
+# byte-addressable regions) embedded on the same margo instance
+# tr_mercury.c already drives -- src/tr_bake.c. Separate from the Mercury
+# block above (its own AUTO/ON/OFF, its own pkg-config --static closure)
+# rather than folded into it: BAKE's build hard-requires libpmemobj (PMDK),
+# a real, heavier dependency than anything Mercury/Margo/Argobots/SSG need,
+# so Block and Discard must stay fully usable on a system that has the
+# transport but not BAKE. See docs/dev-plan.md's M7 section.
+# ---------------------------------------------------------------------------
+set(VOL_STREAM_ENABLE_BAKE "AUTO" CACHE STRING
+  "Build the BAKE-backed Spill queue policy (M7): ON, OFF, or AUTO (default; enable if found and Mercury is enabled)")
+set_property(CACHE VOL_STREAM_ENABLE_BAKE PROPERTY STRINGS AUTO ON OFF)
+
+set(VOL_STREAM_HAVE_BAKE FALSE)
+if(VOL_STREAM_HAVE_MERCURY AND NOT VOL_STREAM_ENABLE_BAKE STREQUAL "OFF")
+  if(PkgConfig_FOUND)
+    pkg_check_modules(VOL_STREAM_BAKE_CLIENT QUIET bake-client)
+    pkg_check_modules(VOL_STREAM_BAKE_SERVER QUIET bake-server)
+    pkg_check_modules(VOL_STREAM_ABTIO QUIET abt-io)
+  endif()
+
+  if(VOL_STREAM_BAKE_CLIENT_FOUND AND VOL_STREAM_BAKE_SERVER_FOUND AND VOL_STREAM_ABTIO_FOUND)
+    set(VOL_STREAM_HAVE_BAKE TRUE)
+
+    # Same transitive-closure reasoning as the Mercury/Margo/Argobots/SSG
+    # block above, kept as a separate pkg-config --static call so BAKE stays
+    # optional independent of that stack.
+    execute_process(
+      COMMAND ${PKG_CONFIG_EXECUTABLE} --static --libs bake-client bake-server abt-io
+      OUTPUT_VARIABLE VOL_STREAM_BAKE_STATIC_LIBS
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      RESULT_VARIABLE VOL_STREAM_BAKE_PKGCONFIG_RC)
+    execute_process(
+      COMMAND ${PKG_CONFIG_EXECUTABLE} --static --cflags bake-client bake-server abt-io
+      OUTPUT_VARIABLE VOL_STREAM_BAKE_STATIC_CFLAGS
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+    if(NOT VOL_STREAM_BAKE_PKGCONFIG_RC EQUAL 0)
+      message(FATAL_ERROR "pkg-config --static failed for bake-client/bake-server/abt-io")
+    endif()
+
+    separate_arguments(VOL_STREAM_BAKE_STATIC_LIBS UNIX_COMMAND "${VOL_STREAM_BAKE_STATIC_LIBS}")
+    separate_arguments(VOL_STREAM_BAKE_STATIC_CFLAGS UNIX_COMMAND "${VOL_STREAM_BAKE_STATIC_CFLAGS}")
+  elseif(VOL_STREAM_ENABLE_BAKE STREQUAL "ON")
+    message(FATAL_ERROR
+      "VOL_STREAM_ENABLE_BAKE=ON but bake-client/bake-server/abt-io were not all found via pkg-config")
+  endif()
+endif()
+
+if(VOL_STREAM_HAVE_BAKE)
+  message(STATUS "BAKE spill:        enabled (bake-client ${VOL_STREAM_BAKE_CLIENT_VERSION}, "
+                  "abt-io ${VOL_STREAM_ABTIO_VERSION})")
+else()
+  message(STATUS "BAKE spill:        disabled (Spill policy falls back to Discard; "
+                  "set VOL_STREAM_ENABLE_BAKE=ON to require it)")
+endif()
+
 set(VOL_STREAM_FBS ${CMAKE_CURRENT_SOURCE_DIR}/src/vol_stream.fbs)
 set(VOL_STREAM_FBS_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
 set(VOL_STREAM_FBS_GEN_HDR ${VOL_STREAM_FBS_GEN_DIR}/vol_stream_builder.h)
@@ -207,6 +265,9 @@ add_custom_target(vol_stream_fbs_gen DEPENDS ${VOL_STREAM_FBS_GEN_HDR})
 set(VOL_STREAM_SOURCES src/H5VLstream.c)
 if(VOL_STREAM_HAVE_MERCURY)
   list(APPEND VOL_STREAM_SOURCES src/tr_mercury.c)
+endif()
+if(VOL_STREAM_HAVE_BAKE)
+  list(APPEND VOL_STREAM_SOURCES src/tr_bake.c)
 endif()
 
 add_library(vol_stream SHARED ${VOL_STREAM_SOURCES})
@@ -244,6 +305,12 @@ if(VOL_STREAM_HAVE_MERCURY)
   # above where these are computed.
   target_compile_options(vol_stream PUBLIC ${VOL_STREAM_TRANSPORT_STATIC_CFLAGS})
   target_link_libraries(vol_stream PUBLIC ${VOL_STREAM_TRANSPORT_STATIC_LIBS} Threads::Threads)
+endif()
+
+if(VOL_STREAM_HAVE_BAKE)
+  target_compile_definitions(vol_stream PRIVATE VOL_STREAM_HAVE_BAKE)
+  target_compile_options(vol_stream PUBLIC ${VOL_STREAM_BAKE_STATIC_CFLAGS})
+  target_link_libraries(vol_stream PUBLIC ${VOL_STREAM_BAKE_STATIC_LIBS})
 endif()
 
 if(VOL_STREAM_ENABLE_LOGGING)
@@ -332,10 +399,11 @@ install(TARGETS vol_stream LIBRARY DESTINATION lib)
 install(FILES src/H5VLstream.h DESTINATION include)
 
 message(STATUS "")
-message(STATUS "vol-stream ${VOL_STREAM_VERSION}  (M6 - parallel writer and real MxN, first increment)")
+message(STATUS "vol-stream ${VOL_STREAM_VERSION}  (M7 - queue policy and BAKE spill)")
 message(STATUS "  HDF5:            ${HDF5_VERSION}")
 message(STATUS "  flatcc:          ${VOL_STREAM_FLATCC_EXE}")
 message(STATUS "  mercury:         ${VOL_STREAM_HAVE_MERCURY}")
+message(STATUS "  bake:            ${VOL_STREAM_HAVE_BAKE}")
 message(STATUS "  logging:         ${VOL_STREAM_ENABLE_LOGGING}")
 message(STATUS "  tests:           ${VOL_STREAM_BUILD_TESTS}")
 message(STATUS "  h5sign:          ${H5SIGN_EXECUTABLE}")

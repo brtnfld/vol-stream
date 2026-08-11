@@ -328,6 +328,30 @@ Subfiling VFD's I/O concentrators.
 **Exit gate.** Byte-exact data with coprime rank counts — 7 writers to 3 readers,
 64 to 5. Replay invariant holds in parallel.
 
+M6's first increment meets this gate on the uniform-topology case only — every
+rank creates the same objects, varying just which hyperslab each rank covers,
+which is already legal under parallel HDF5's own collective-create rule and
+needs no manifest aggregation across ranks. [M6.5](#m65--heterogeneous-mn-and-concentrator-topology--m)
+carries the general case forward.
+
+### M6.5 — Heterogeneous M×N and concentrator topology · M
+
+The two things M6 named but didn't need for its first increment: ranks that
+create *different* objects (rank 0 writes a dataset rank 1 never touches) and
+the Subfiling-style I/O-concentrator aggregation topology. Heterogeneous
+object sets break the "every rank calls the same creates" shortcut, so pending
+entries must be exchanged across ranks — `MPI_Allgatherv` of a per-rank flatcc
+mini-manifest (metadata only; payload bytes stay local), merged deterministically
+(create-kind entries deduped by `(kind, path)`; `DsetWrite` never deduped;
+`Attr` first-seen-wins). Reader-side requests spanning a concentrator's
+aggregated region are resolved with `H5Sselect_project_intersection`, the
+public API M6 traced but left unused.
+
+**Exit gate.** Coprime rank counts (7→3, 64→5) with a heterogeneous per-rank
+object set — not every rank creating the same objects — still byte-exact and
+replay-invariant, routed through at least one concentrator that aggregates
+more than one writer rank.
+
 ### M7 — Queue policy and BAKE spill · M
 
 `Block`, `Discard` and `Spill`, plus reserve slots and latest-step-only for
@@ -348,6 +372,27 @@ back-channel.
 **Exit gate.** Two subscribers on one stream at different precisions from a
 single `end_step`. Measured wire bytes scale with subscribed volume, not total
 step volume — the number that proves the thesis.
+
+M8's first increment proves the core mechanism — a subscribe RPC and a real
+data-push RPC (Mercury's first carrying payload bytes, not just control-plane
+scalars) — at whole-object granularity: an unsubscribed sibling object in the
+same step is never sent. [M8.5](#m85--chunk-level-subscription-routing--m)
+carries the exit gate's literal chunk-level/multi-precision numbers forward.
+
+### M8.5 — Chunk-level subscription routing · M
+
+The two things M8 named but its first increment didn't need: routing a
+subscription's *(path, `H5Sencode2` selection)* at chunk granularity via
+`H5Sselect_intersect_block` against the `FilteredChunks` payload form (M2), and
+per-subscriber precision — reusing a subscription's `H5Pencode2` filter
+pipeline to re-filter one dataset's bytes differently per subscriber, per
+dev-plan.md decision #3. Both need a subscription to carry (and the writer to
+actually consult) the dataspace selection and property list M8's first
+increment already accepts and validates but never acts on.
+
+**Exit gate.** Two subscribers on one stream at different precisions from a
+single `end_step`, wire bytes measured (not just asserted less-than) to scale
+with subscribed volume — dev-plan.md's M8 exit gate, in full.
 
 ### M9 — Tools, bindings, and the long tail · M
 

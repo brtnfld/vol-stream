@@ -88,7 +88,39 @@
  *              topology dev-plan.md's M6 section calls for are not
  *              implemented yet -- both need real cross-rank manifest
  *              aggregation (H5Sselect_project_intersection), which this
- *              increment's uniform-topology assumption avoids needing.
+ *              increment's uniform-topology assumption avoids needing. See
+ *              docs/dev-plan.md's M6.5 for that generalization's own scope.
+ *
+ *              M7 status: queue policy for a lagging reader
+ *              (H5Fset_stream_queue_policy(), src/tr_mercury.c's reader-ack
+ *              RPC, src/tr_bake.c's embedded BAKE provider). Opt-in and a
+ *              no-op unless set -- with no policy, H5Fend_step() behaves
+ *              exactly as through M6. Block waits for the reader; Discard
+ *              drops the step's data entirely (the physical step still
+ *              exists, so later steps stay reachable, but carries nothing);
+ *              Spill writes the step's manifest+payload bytes to node-local
+ *              storage instead of replaying them into the (possibly
+ *              congested) shared file immediately, and a later
+ *              H5Fend_step() drains the spill queue -- completes the real
+ *              replay -- once the reader is back within the window. Spill
+ *              needs VOL_STREAM_ENABLE_BAKE (falls back to Discard's
+ *              behavior if the connector was built without it). See
+ *              H5VL_stream_queue_policy_t's doc comment for the exact
+ *              per-policy contract.
+ *
+ *              M8 status (first increment -- see src/tr_mercury.c's header
+ *              comment for the full scope note): H5Fsubscribe() now does
+ *              something -- it sends the writer a real RPC per subscribed
+ *              path, and the writer pushes that path's actual payload bytes
+ *              (Mercury's first RPC ever to carry more than small fixed
+ *              scalars) to every subscriber at replay time. Retrieved via
+ *              the new H5Fget_subscribed_data(). Routing is whole-object
+ *              only this increment: an unsubscribed sibling object in the
+ *              same step is never sent, which is the core thesis, but the
+ *              dataspace subvolume/precision H5Fsubscribe() already accepts
+ *              is validated, not yet acted on -- that needs chunk-level
+ *              intersection (H5Sselect_intersect_block) and per-subscriber
+ *              re-filtering, both flagged as follow-up scope.
  */
 
 #ifndef H5VLstream_H
@@ -160,6 +192,8 @@ H5VL_STREAM_API extern hid_t H5VL_STREAM_g;
 #define H5VL_STREAM_OP_BEGIN_LOGICAL_STEP "vol-stream:begin_logical_step"
 #define H5VL_STREAM_OP_GET_LOGICAL_STEPS  "vol-stream:get_logical_steps"
 #define H5VL_STREAM_OP_WAIT_STEP_READY    "vol-stream:wait_step_ready"
+#define H5VL_STREAM_OP_SET_QUEUE_POLICY   "vol-stream:set_queue_policy"
+#define H5VL_STREAM_OP_GET_SUBSCRIBED_DATA "vol-stream:get_subscribed_data"
 
 /** Status of the current step */
 typedef enum H5F_step_status_t {
@@ -170,6 +204,40 @@ typedef enum H5F_step_status_t {
     H5F_STEP_READING     = 4  /**< M3: reader positioned at a step; begin_step
                                 *   advances it                             */
 } H5F_step_status_t;
+
+/**
+ * \brief M7: writer-only. How H5Fend_step() behaves when the furthest-behind
+ *        tracked reader (see H5Fset_stream_queue_policy()) is more than
+ *        \c reserve_slots steps behind the one about to commit.
+ *
+ * A reader is "tracked" once it has sent at least one ack, which happens
+ * automatically after a sequential H5Fbegin_step() advance -- a reader that
+ * only ever jumps via H5Fbegin_logical_step() (a monitoring/latest-only
+ * reader) never acks and is therefore never counted as behind, regardless of
+ * policy. With no policy set (the default), or with no tracked reader ever
+ * behind the window, H5Fend_step() behaves exactly as it did through M6:
+ * unconditional, synchronous, durable replay.
+ */
+typedef enum H5VL_stream_queue_policy_t {
+    H5VL_STREAM_QUEUE_BLOCK   = 0, /**< Wait for the reader to catch up. Nothing
+                                      *   is ever lost; the replay invariant holds
+                                      *   for every step, same as with no policy
+                                      *   set -- the only change is when
+                                      *   H5Fend_step() returns.               */
+    H5VL_STREAM_QUEUE_DISCARD = 1, /**< Do not wait. The step's data is dropped
+                                      *   entirely -- the physical step still
+                                      *   exists (so later steps stay reachable)
+                                      *   but carries nothing.                 */
+    H5VL_STREAM_QUEUE_SPILL   = 2  /**< Do not wait, and do not drop: write the
+                                      *   step's bytes to node-local storage
+                                      *   (BAKE) instead of replaying them into
+                                      *   the (possibly congested) shared file
+                                      *   now. A later H5Fend_step() drains it --
+                                      *   completes the real replay -- once the
+                                      *   tracked reader is back within the
+                                      *   window. Falls back to Discard if this
+                                      *   connector was built without BAKE.     */
+} H5VL_stream_queue_policy_t;
 
 /**
  * \brief Open a step on \p file_id.
@@ -266,18 +334,50 @@ H5VL_STREAM_API herr_t H5Fget_logical_steps(hid_t file_id, size_t *n_logical, ui
  * filter pipeline -- which is how per-subscriber precision is expressed
  * without a new codec.  The writer marshals only what is subscribed.
  *
- * \param file_id  File opened through the vol-stream connector for reading
+ * \param file_id  File opened through the vol-stream connector for reading,
+ *                 with the transport enabled (see VOL_STREAM_NA in
+ *                 dev-plan.md's M4 section) -- a subscription cannot reach
+ *                 the writer without it
  * \param count    Number of entries
  * \param paths    Object paths
  * \param spaces   Dataspace IDs carrying the wanted selection
  * \param plists   DCPL IDs requesting a filter pipeline, or NULL
  * \return \herr_t
  *
- * \note M0/M1 accept and record subscriptions without acting on them; the
- *       protocol lands in M8.
+ * \note M8, first increment: routes at whole-object granularity only --
+ *       \p spaces and \p plists are validated (a selection that cannot be
+ *       expressed still fails here, where the caller made the mistake) but
+ *       not yet acted on. A subscribed path's *entire* payload is pushed for
+ *       every step that writes it; the dataspace subvolume and per-subscriber
+ *       precision (property-list re-filtering) dev-plan.md's M8 section
+ *       describes are follow-up scope. Call H5Fget_subscribed_data() after
+ *       H5Fwait_step_ready() to retrieve what was pushed.
  */
 H5VL_STREAM_API herr_t H5Fsubscribe(hid_t file_id, size_t count, const char *const *paths, const hid_t *spaces,
                     const hid_t *plists);
+
+/**
+ * \brief M8, first increment: reader only. Block until the writer pushes
+ *        data for a subscribed path, or \p timeout_ms elapses.
+ *
+ * Only paths named in a prior H5Fsubscribe() call on this file ever produce
+ * an item here. Several items may be queued (one per subscribed path per
+ * step that writes it); each call drains exactly one, oldest first.
+ *
+ * \param file_id       File opened through the vol-stream connector for
+ *                      reading, with the transport enabled
+ * \param timeout_ms    Milliseconds to wait, or 0 to poll without blocking
+ * \param physical_step OUT: the step this data belongs to
+ * \param path          OUT: the subscribed object path, newly malloc()'d --
+ *                      caller frees with free()
+ * \param buf           OUT: the pushed bytes, newly malloc()'d -- caller
+ *                      frees with free()
+ * \param size          OUT: length of \p buf in bytes
+ * \return \herr_t, -1 on timeout or if the transport is unavailable for this
+ *         file
+ */
+H5VL_STREAM_API herr_t H5Fget_subscribed_data(hid_t file_id, uint64_t timeout_ms, uint64_t *physical_step,
+                                                char **path, void **buf, size_t *size);
 
 /**
  * \brief M4/M5: reader only. Block until the writer's transport announces a
@@ -308,6 +408,31 @@ H5VL_STREAM_API herr_t H5Fsubscribe(hid_t file_id, size_t count, const char *con
  */
 H5VL_STREAM_API herr_t H5Fwait_step_ready(hid_t file_id, uint64_t timeout_ms, uint64_t *physical_step,
                     uint64_t *wall_time_ns);
+
+/**
+ * \brief M7: writer only. Set the policy H5Fend_step() applies when a
+ *        tracked reader (see H5VL_stream_queue_policy_t) falls more than
+ *        \p reserve_slots steps behind the one about to commit.
+ *
+ * Takes effect starting with the next H5Fend_step() call; steps already
+ * committed are unaffected. Not collective by itself in a parallel writer,
+ * but every rank should set the same policy before the first H5Fend_step()
+ * that could be affected, the same convention as other stream-wide settings.
+ *
+ * \param file_id       File opened through the vol-stream connector for
+ *                      writing, with the transport enabled (see
+ *                      VOL_STREAM_NA in dev-plan.md's M4 section) -- a
+ *                      policy cannot do anything without the reader-ack
+ *                      transport H5Fwait_step_ready() also needs
+ * \param policy        Block, Discard, or Spill
+ * \param reserve_slots How many steps a tracked reader may lag before
+ *                      \p policy applies. 0 applies it the moment any
+ *                      tracked reader is not caught up to the step just
+ *                      about to commit.
+ * \return \herr_t, -1 if \p file_id is not a writer
+ */
+H5VL_STREAM_API herr_t H5Fset_stream_queue_policy(hid_t file_id, H5VL_stream_queue_policy_t policy,
+                                                    uint64_t reserve_slots);
 
 /**
  * \brief Register the vol-stream connector and return its ID.
