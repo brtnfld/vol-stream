@@ -27,6 +27,22 @@ if(VOL_STREAM_HAVE_MERCURY)
   )
 endif()
 
+# M6 exit gate (first increment): collective step boundaries and a
+# parallel writer/reader over MPI, coprime rank counts. Needs MPI (the
+# same MPI_C_FOUND ../CMakeLists.txt already links vol_stream against when
+# present) and mpiexec/mpirun.
+if(MPI_C_FOUND AND MPIEXEC_EXECUTABLE)
+  add_executable(t_parallel t_parallel.c)
+  target_link_libraries(t_parallel PRIVATE vol_stream)
+  add_test(NAME parallel
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/run_parallel_test.sh
+            --mpirun     ${MPIEXEC_EXECUTABLE}
+            --bin        $<TARGET_FILE:t_parallel>
+            --plugin-dir $<TARGET_FILE_DIR:vol_stream>
+  )
+  set_tests_properties(parallel PROPERTIES TIMEOUT 120)
+endif()
+
 # VOL_STREAM_H5DIFF points t_replay (the M2 replay-invariant gate) at an
 # h5diff binary when it is not on PATH -- e.g. an uninstalled HDF5 build
 # tree, which is the normal setup when developing against the library

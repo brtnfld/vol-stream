@@ -17,6 +17,13 @@ jobs:
   # Only develop is tracked -- older releases are not a support target, so the
   # matrix's job is catching drift against HEAD (H5VL_VERSION is 3 today and
   # will move again), not cross-version compatibility.
+  #
+  # This job already builds HDF5 with -DHDF5_ENABLE_PARALLEL=ON and installs
+  # MPI (both legs of the matrix), so it is also where M6's collective-step /
+  # parallel-writer test (ctest target "parallel") runs -- no separate job
+  # needed, and it gets exercised against both mpich and openmpi for free,
+  # matching this matrix's own rationale below about MPI implementations
+  # differing in practice.
   # ---------------------------------------------------------------------------
   build:
     name: hdf5 ${{ matrix.hdf5 }} / ${{ matrix.mpi }}

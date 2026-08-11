@@ -332,7 +332,7 @@ install(TARGETS vol_stream LIBRARY DESTINATION lib)
 install(FILES src/H5VLstream.h DESTINATION include)
 
 message(STATUS "")
-message(STATUS "vol-stream ${VOL_STREAM_VERSION}  (M5 - SSG rendezvous and late joiners)")
+message(STATUS "vol-stream ${VOL_STREAM_VERSION}  (M6 - parallel writer and real MxN, first increment)")
 message(STATUS "  HDF5:            ${HDF5_VERSION}")
 message(STATUS "  flatcc:          ${VOL_STREAM_FLATCC_EXE}")
 message(STATUS "  mercury:         ${VOL_STREAM_HAVE_MERCURY}")

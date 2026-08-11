@@ -37,6 +37,15 @@
 /* Public HDF5 file */
 #include "hdf5.h"
 
+/* M6: collective step boundaries for a file opened with the MPI-IO VFD.
+ * H5_HAVE_PARALLEL is a fact about the HDF5 this connector is built
+ * against (set in the public H5pubconf.h, pulled in by hdf5.h above), not
+ * a vol-stream build option -- a serial HDF5 build simply never defines it,
+ * and every M6 code path below compiles to nothing in that case. */
+#ifdef H5_HAVE_PARALLEL
+#include "H5FDmpio.h"
+#endif
+
 /* This connector's header */
 #include "H5VLnative.h"
 #include "H5PLextern.h"
@@ -190,6 +199,24 @@ struct H5VL_stream_file_state_t {
     vs_tr_t *transport;
 #endif
 
+    /* M6: set when this file was opened with H5Pset_fapl_mpio(), i.e. a
+     * parallel writer/reader over the given communicator. comm is this
+     * connector's own duplicate (H5Pget_fapl_mpio() itself already hands
+     * back a fresh duplicate -- see H5VL__stream_transport_na()-adjacent
+     * comment in file_create()/file_open()), freed in
+     * H5VL__stream_file_state_decref(). has_comm is checked instead of
+     * comparing against MPI_COMM_NULL so this struct needs no MPI type at
+     * all in a serial build (see H5_HAVE_PARALLEL note at the top of this
+     * file). begin_step()/end_step() collective-barrier around the step
+     * boundary; the replay itself needs no other change -- see
+     * H5VL__stream_replay_step()'s M6 comment for why. */
+#ifdef H5_HAVE_PARALLEL
+    MPI_Comm comm;
+    int      has_comm;
+    int      mpi_rank;
+    int      mpi_size;
+#endif
+
     /* M3: reader state. under_object/under_vol_id (on H5VL_stream_t) belong
      * to whatever object a given wrapper wraps; file_under_object/
      * file_under_vol_id are always the FILE's own, so a wrapper several
@@ -311,6 +338,9 @@ static const char *H5VL__stream_transport_na(void);
 static char *H5VL__stream_vsaddr_path(const char *filename);
 static void H5VL__stream_transport_start_writer(H5VL_stream_file_state_t *fs, const char *name);
 static void H5VL__stream_transport_start_reader(H5VL_stream_file_state_t *fs, const char *name);
+#endif
+#ifdef H5_HAVE_PARALLEL
+static void H5VL__stream_detect_mpi_comm(H5VL_stream_file_state_t *fs, hid_t fapl_id);
 #endif
 
 /* "Management" callbacks */
@@ -873,6 +903,11 @@ H5VL__stream_file_state_decref(H5VL_stream_file_state_t *fs)
         vs_tr_stop(fs->transport);
 #endif
 
+#ifdef H5_HAVE_PARALLEL
+    if (fs->has_comm)
+        MPI_Comm_free(&fs->comm);
+#endif
+
     free(fs);
 } /* end H5VL__stream_file_state_decref() */
 
@@ -1119,6 +1154,58 @@ H5VL__stream_transport_start_reader(H5VL_stream_file_state_t *fs, const char *na
     free(group_file);
 } /* end H5VL__stream_transport_start_reader() */
 #endif /* VOL_STREAM_HAVE_MERCURY */
+
+#ifdef H5_HAVE_PARALLEL
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_detect_mpi_comm
+ *
+ * Purpose:     If fapl_id carries the MPI-IO VFD (H5Pset_fapl_mpio() was
+ *              called on it, or an ancestor FAPL it was copied from), pull
+ *              out the communicator and record it on fs, making this file's
+ *              step boundaries collective -- see H5VL_stream_file_optional()'s
+ *              begin_step/end_step handling. Not an error for the fapl to
+ *              carry no MPI-IO VFD at all: that is the ordinary serial case,
+ *              and fs->has_comm simply stays 0 (its calloc() default),
+ *              matching M0-M5 behavior exactly.
+ *-------------------------------------------------------------------------
+ */
+static void
+H5VL__stream_detect_mpi_comm(H5VL_stream_file_state_t *fs, hid_t fapl_id)
+{
+    MPI_Comm    comm;
+    MPI_Info    info;
+    H5E_auto2_t old_func;
+    void       *old_data;
+    hid_t       err_id;
+    herr_t      r;
+
+    /* H5Pget_fapl_mpio() errors on a fapl that does not use the MPI-IO
+     * VFD -- the ordinary case -- so probe quietly rather than assume,
+     * same idiom as H5VL__stream_reader_build_index()'s missing-/step
+     * probe. */
+    H5Eget_auto2(H5E_DEFAULT, &old_func, &old_data);
+    H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
+    err_id = H5Eget_current_stack();
+    r = H5Pget_fapl_mpio(fapl_id, &comm, &info);
+    H5Eset_current_stack(err_id);
+    H5Eset_auto2(H5E_DEFAULT, old_func, old_data);
+
+    if (r < 0)
+        return;
+
+    /* H5Pget_fapl_mpio() already hands back a fresh duplicate of the
+     * stored communicator (its own doc comment says so) -- ours to keep
+     * and free in H5VL__stream_file_state_decref(), no extra
+     * MPI_Comm_dup() needed. */
+    if (info != MPI_INFO_NULL)
+        MPI_Info_free(&info);
+
+    fs->comm     = comm;
+    fs->has_comm = 1;
+    MPI_Comm_rank(fs->comm, &fs->mpi_rank);
+    MPI_Comm_size(fs->comm, &fs->mpi_size);
+} /* end H5VL__stream_detect_mpi_comm() */
+#endif /* H5_HAVE_PARALLEL */
 
 /*-------------------------------------------------------------------------
  * Function:    H5VL__stream_child_path
@@ -2015,6 +2102,30 @@ H5VL__stream_reader_open_attr(H5VL_stream_t *o, const char *name, hid_t aapl_id,
  *              by dataset_create()/attr_create() while IN_STEP. Replay finds
  *              it by scanning already-replayed entries for a matching path
  *              rather than needing a separate index.
+ *
+ *              M6: this function is unchanged for a parallel (has_comm)
+ *              writer -- it is simply called once per rank, each replaying
+ *              its own pending[] against the same collectively-opened
+ *              underlying file. That is sufficient, not a shortcut,
+ *              *given* this milestone's scope decision: every rank
+ *              creates the same set of objects (the ordinary parallel-HDF5
+ *              pattern of all ranks calling H5Dcreate2()/H5Acreate2() etc.
+ *              with matching arguments), varying only in which hyperslab
+ *              each rank's own DsetWrite entries cover. Under that
+ *              assumption, N ranks independently replaying identical
+ *              create-entries against a shared file *is* the correct,
+ *              standard parallel-HDF5 collective-create pattern -- HDF5
+ *              itself coordinates it into one shared object, not this
+ *              connector. Each rank's writes are independent (no DXPL
+ *              collective I/O requested), which is safe because writer
+ *              ranks' hyperslabs do not overlap. Heterogeneous per-rank
+ *              object sets -- rank 0 creating a dataset rank 1 never
+ *              touches -- are out of scope for this increment; that needs
+ *              real cross-rank manifest aggregation (H5Sselect_project_
+ *              intersection, per dev-plan.md's M6 section) and is where
+ *              the Subfiling-style I/O-concentrator topology belongs.
+ *              See H5VL_stream_file_optional()'s begin_step/end_step
+ *              handling for the collective barriers around this call.
  *
  * Return:      Success:    0
  *              Failure:    -1 (the caller discards the pending buffer either
@@ -4140,6 +4251,9 @@ H5VL_stream_file_create(const char *name, unsigned flags, hid_t fcpl_id, hid_t f
             file->path                             = strdup("");
             file->file_state->file_under_object   = under;
             file->file_state->file_under_vol_id   = info->under_vol_id;
+#ifdef H5_HAVE_PARALLEL
+            H5VL__stream_detect_mpi_comm(file->file_state, fapl_id);
+#endif
 #ifdef VOL_STREAM_HAVE_MERCURY
             H5VL__stream_transport_start_writer(file->file_state, name);
 #endif
@@ -4212,6 +4326,9 @@ H5VL_stream_file_open(const char *name, unsigned flags, hid_t fapl_id, hid_t dxp
             file->file_state->file_under_object = under;
             file->file_state->file_under_vol_id = info->under_vol_id;
             file->file_state->is_reader         = ((flags & H5F_ACC_RDWR) == 0) ? 1 : 0;
+#ifdef H5_HAVE_PARALLEL
+            H5VL__stream_detect_mpi_comm(file->file_state, fapl_id);
+#endif
 #ifdef VOL_STREAM_HAVE_MERCURY
             if (file->file_state->is_reader)
                 H5VL__stream_transport_start_reader(file->file_state, name);
@@ -4424,6 +4541,16 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
         if (o->file_state->is_reader)
             return H5VL__stream_reader_advance(o->file_state, 0, 0);
 
+#ifdef H5_HAVE_PARALLEL
+        /* M6: a writer's step boundaries are collective (opt_query() already
+         * declares this via H5VL_OPT_QUERY_COLLECTIVE) -- synchronize here so
+         * no rank starts capturing entries for this step before every rank
+         * has finished whatever it was doing after the previous one (a
+         * matching barrier sits at the end of end_step() too). */
+        if (o->file_state->has_comm)
+            MPI_Barrier(o->file_state->comm);
+#endif
+
         /* Nested steps are not a thing: a step is the unit of atomicity, so an
          * unclosed one is a bug in the caller rather than something to
          * silently absorb. */
@@ -4456,6 +4583,16 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
             return -1;
 
         o->file_state->step_state = H5F_STEP_COMMITTING;
+
+#ifdef H5_HAVE_PARALLEL
+        /* M6: every rank has finished capturing its own pending entries for
+         * this step by the time it calls end_step() -- but replay below
+         * makes real, collective HDF5 calls (H5Dcreate2() and friends;
+         * see H5VL__stream_replay_step()'s M6 comment) that every rank in
+         * the communicator must reach together, so synchronize first. */
+        if (o->file_state->has_comm)
+            MPI_Barrier(o->file_state->comm);
+#endif
 
         replay_ret = H5VL__stream_replay_step(o);
 
@@ -4515,6 +4652,15 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
 #else
         (void)committed_step;
         (void)committed_wall_time_ns;
+#endif
+
+#ifdef H5_HAVE_PARALLEL
+        /* Matches the barrier at the top of begin_step(): keeps a rank that
+         * finishes end_step() from racing ahead into a collective call
+         * (another begin_step(), or H5Fclose()) while a slower rank is
+         * still inside replay above. */
+        if (o->file_state->has_comm)
+            MPI_Barrier(o->file_state->comm);
 #endif
 
         return 0;

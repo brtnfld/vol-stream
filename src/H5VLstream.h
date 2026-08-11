@@ -71,6 +71,24 @@
  *              H5Fwait_step_ready() drains, so the first call after joining
  *              returns the current step immediately rather than blocking
  *              for a write the reader already missed.
+ *
+ *              M6 status (first increment -- see src/H5VLstream.c's
+ *              H5VL__stream_replay_step() for the full scope note): a file
+ *              opened with H5Pset_fapl_mpio() makes H5Fbegin_step()/
+ *              H5Fend_step() collective over that communicator. Every
+ *              writer rank creates the same set of objects (the ordinary
+ *              parallel-HDF5 pattern -- all ranks call H5Dcreate2() etc.
+ *              with matching arguments) and independently writes its own
+ *              non-overlapping hyperslab; HDF5's own collective-metadata
+ *              handling does the rest, so no connector-level cross-rank
+ *              manifest aggregation is needed for this case. Verified
+ *              byte-exact with the M6 exit gate's own coprime rank counts
+ *              (7 writers/3 readers, 64/5). Heterogeneous per-rank object
+ *              sets and the Subfiling-style I/O-concentrator aggregation
+ *              topology dev-plan.md's M6 section calls for are not
+ *              implemented yet -- both need real cross-rank manifest
+ *              aggregation (H5Sselect_project_intersection), which this
+ *              increment's uniform-topology assumption avoids needing.
  */
 
 #ifndef H5VLstream_H
