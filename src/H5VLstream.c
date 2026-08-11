@@ -152,6 +152,20 @@ typedef struct H5VL_stream_path_steps_t {
     size_t    cap_steps;
 } H5VL_stream_path_steps_t;
 
+/* M6.5/dictionary caching: the last type_enc (H5Tencode() bytes) sent for a
+ * given DsetWrite path, on both the writer side (H5VL__stream_build_
+ * manifest(), to decide whether this step's type_enc can be omitted) and
+ * the replay side (H5VL__stream_replay_manifest(), to resolve an omitted
+ * one back into real bytes). Two independent arrays -- one per role -- both
+ * using this same element type; see H5VL__stream_type_cache_lookup()'s
+ * comment for why no schema change was needed to carry the "omitted"
+ * sentinel. */
+typedef struct H5VL_stream_type_cache_entry_t {
+    char    *path;
+    uint8_t *type_enc;
+    size_t   type_enc_len;
+} H5VL_stream_type_cache_entry_t;
+
 /* One H5VL_stream_request_notify() registration still waiting on a step's
  * completion cell to resolve -- a singly linked list since there is no
  * bound on how many deferred requests from the same step get a callback
@@ -282,6 +296,20 @@ struct H5VL_stream_file_state_t {
     H5VL_stream_path_steps_t *path_index;
     size_t                     n_path_index;
     size_t                     cap_path_index;
+
+    /* Dictionary caching for DsetWrite's type_enc, see H5VL__stream_type_
+     * cache_entry_t's comment. write_type_cache is consulted/updated by
+     * H5VL__stream_build_manifest() (the writer role); replay_type_cache by
+     * H5VL__stream_replay_manifest() (immediately after, same process, same
+     * step -- see that function's own comment on why "reader" here does not
+     * mean a separate process). Both are empty/unused unless a DsetWrite
+     * ever runs, so this has no cost for files that never write. */
+    H5VL_stream_type_cache_entry_t *write_type_cache;
+    size_t                           n_write_type_cache;
+    size_t                           cap_write_type_cache;
+    H5VL_stream_type_cache_entry_t *replay_type_cache;
+    size_t                           n_replay_type_cache;
+    size_t                           cap_replay_type_cache;
 };
 
 /* Whether a wrapped object is a real, opened/created underlying object, a
@@ -356,6 +384,11 @@ static size_t H5VL__stream_pending_append(H5VL_stream_file_state_t *fs,
                              const H5VL_stream_pending_entry_t *entry);
 static hid_t  H5VL__stream_resolve_space(hid_t space_id, hid_t fallback_space_id);
 static htri_t H5VL__stream_type_unsafe_to_capture(hid_t type_id);
+static const uint8_t *H5VL__stream_type_cache_lookup(H5VL_stream_type_cache_entry_t *arr, size_t n,
+                             const char *path, size_t *out_len);
+static herr_t H5VL__stream_type_cache_upsert(H5VL_stream_type_cache_entry_t **arr, size_t *n, size_t *cap,
+                             const char *path, const uint8_t *type_enc, size_t type_enc_len);
+static void   H5VL__stream_type_cache_clear(H5VL_stream_type_cache_entry_t *arr, size_t n);
 static herr_t H5VL__stream_build_manifest(H5VL_stream_file_state_t *fs, uint8_t **out_manifest_buf,
                              size_t *out_manifest_len, uint8_t **out_payload_buf, size_t *out_payload_len);
 static herr_t H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_buf,
@@ -985,6 +1018,9 @@ H5VL__stream_file_state_decref(H5VL_stream_file_state_t *fs)
         free(fs->path_index[i].steps);
     }
     free(fs->path_index);
+
+    H5VL__stream_type_cache_clear(fs->write_type_cache, fs->n_write_type_cache);
+    H5VL__stream_type_cache_clear(fs->replay_type_cache, fs->n_replay_type_cache);
 
     /* M4: an unclosed step at file_close() leaves current_completion set --
      * same "no partial-step state worth preserving" reasoning as an unclosed
@@ -1639,6 +1675,104 @@ H5VL__stream_encode_dcpl(hid_t dcpl_id, uint8_t **buf, size_t *len)
     *len = nalloc;
     return 0;
 } /* end H5VL__stream_encode_dcpl() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_type_cache_lookup / H5VL__stream_type_cache_upsert
+ *
+ * Purpose:     dev-plan.md's residual risks: a DsetWrite entry's type_enc
+ *              was unconditionally re-H5Tencode()'d and re-persisted to
+ *              /step/<n>/.manifest on every single write, even though a
+ *              dataset's type never changes after creation -- real,
+ *              unbounded metadata bloat at high step cadence. These two
+ *              helpers back a small per-path cache (one array on the
+ *              writer side, a mirror on the replay side, both hung off
+ *              file_state) that lets H5VL__stream_build_manifest() omit a
+ *              DsetWrite entry's type_enc entirely when it is byte-identical
+ *              to the last one sent for that path, and lets
+ *              H5VL__stream_replay_manifest() resolve that omission back
+ *              into real bytes. No schema change was needed: an omitted
+ *              flatbuffers vector field decodes as NULL with
+ *              flatbuffers_uint8_vec_len() == 0 (verified against flatcc's
+ *              own __flatbuffers_vec_len() macro), a sentinel no valid
+ *              H5Tencode() output can ever produce, so this is unambiguous
+ *              and fully backward compatible with a manifest that predates
+ *              caching (every entry there has real bytes, so the cache
+ *              simply never triggers for it).
+ *
+ * Return:      lookup:  the cached entry's type_enc/len (may be a 0-length
+ *                        result if truly not found -- callers distinguish
+ *                        via the returned pointer being NULL)
+ *              upsert:  0 on success, -1 on failure (out of memory)
+ *-------------------------------------------------------------------------
+ */
+static const uint8_t *
+H5VL__stream_type_cache_lookup(H5VL_stream_type_cache_entry_t *arr, size_t n, const char *path, size_t *out_len)
+{
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        if (0 == strcmp(arr[i].path, path)) {
+            *out_len = arr[i].type_enc_len;
+            return arr[i].type_enc;
+        }
+    }
+    return NULL;
+} /* end H5VL__stream_type_cache_lookup() */
+
+static herr_t
+H5VL__stream_type_cache_upsert(H5VL_stream_type_cache_entry_t **arr, size_t *n, size_t *cap, const char *path,
+                                const uint8_t *type_enc, size_t type_enc_len)
+{
+    size_t i;
+    uint8_t *copy;
+
+    if (NULL == (copy = (uint8_t *)malloc(type_enc_len ? type_enc_len : 1)))
+        return -1;
+    if (type_enc_len > 0)
+        memcpy(copy, type_enc, type_enc_len);
+
+    for (i = 0; i < *n; i++) {
+        if (0 == strcmp((*arr)[i].path, path)) {
+            free((*arr)[i].type_enc);
+            (*arr)[i].type_enc     = copy;
+            (*arr)[i].type_enc_len = type_enc_len;
+            return 0;
+        }
+    }
+
+    if (*n == *cap) {
+        size_t                            new_cap = *cap ? *cap * 2 : 8;
+        H5VL_stream_type_cache_entry_t *grown;
+
+        if (NULL == (grown = (H5VL_stream_type_cache_entry_t *)realloc(*arr, new_cap * sizeof(**arr)))) {
+            free(copy);
+            return -1;
+        }
+        *arr = grown;
+        *cap = new_cap;
+    }
+
+    if (NULL == ((*arr)[*n].path = strdup(path))) {
+        free(copy);
+        return -1;
+    }
+    (*arr)[*n].type_enc     = copy;
+    (*arr)[*n].type_enc_len = type_enc_len;
+    (*n)++;
+    return 0;
+} /* end H5VL__stream_type_cache_upsert() */
+
+static void
+H5VL__stream_type_cache_clear(H5VL_stream_type_cache_entry_t *arr, size_t n)
+{
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        free(arr[i].path);
+        free(arr[i].type_enc);
+    }
+    free(arr);
+} /* end H5VL__stream_type_cache_clear() */
 
 /*-------------------------------------------------------------------------
  * Function:    H5VL__stream_replay_ensure_group
@@ -2368,6 +2502,36 @@ H5VL__stream_build_manifest(H5VL_stream_file_state_t *fs, uint8_t **out_manifest
             goto done;
         }
 
+        /* dev-plan.md's residual risks: a DsetWrite's type never changes
+         * across steps for a given path, so once this exact type_enc has
+         * already been sent for pe->path, omit it here (see
+         * H5VL__stream_type_cache_lookup()'s comment for the wire-format
+         * reasoning) instead of re-persisting the same bytes to
+         * /step/<n>/.manifest every step. DsetCreate/Attr entries are
+         * unaffected -- they only ever happen once per object, so there is
+         * nothing to cache for them. */
+        if (pe->kind == vs_Kind_DsetWrite) {
+            size_t          cached_len = 0;
+            const uint8_t *cached     = H5VL__stream_type_cache_lookup(fs->write_type_cache,
+                                                                        fs->n_write_type_cache, pe->path,
+                                                                        &cached_len);
+
+            if (cached && cached_len == type_len && (type_len == 0 || 0 == memcmp(cached, type_enc, type_len))) {
+                free(type_enc);
+                type_enc = NULL;
+                type_len = 0;
+            }
+            else if (H5VL__stream_type_cache_upsert(&fs->write_type_cache, &fs->n_write_type_cache,
+                                                      &fs->cap_write_type_cache, pe->path, type_enc,
+                                                      type_len) < 0) {
+                free(type_enc);
+                free(space_enc);
+                free(dcpl_enc);
+                ret_value = -1;
+                goto done;
+            }
+        }
+
         if (pe->payload_len > 0) {
             if (payload_len + pe->payload_len > payload_cap) {
                 size_t   new_cap = payload_cap ? payload_cap * 2 : 4096;
@@ -2392,7 +2556,8 @@ H5VL__stream_build_manifest(H5VL_stream_file_state_t *fs, uint8_t **out_manifest
         vs_Entry_start(&B);
         vs_Entry_kind_add(&B, (vs_Kind_enum_t)pe->kind);
         vs_Entry_path_create_str(&B, pe->path);
-        vs_Entry_type_enc_create(&B, type_enc, type_len);
+        if (type_enc) /* NULL/0 here means: identical to the cache, omitted -- see above */
+            vs_Entry_type_enc_create(&B, type_enc, type_len);
         vs_Entry_space_enc_create(&B, space_enc, space_len);
         if (dcpl_enc)
             vs_Entry_dcpl_enc_create(&B, dcpl_enc, dcpl_len);
@@ -2548,13 +2713,14 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                                const uint8_t *payload_buf, H5VL_stream_pending_entry_t *pending_for_wiring,
                                size_t n_pending_for_wiring)
 {
-    void       **replay_under = NULL;
-    uint8_t     *needs_close  = NULL;
-    char        *step_root    = NULL;
-    size_t       payload_len  = 0;
-    uint64_t     physical_step = 0;
-    size_t       i;
-    herr_t       ret_value = 0;
+    H5VL_stream_file_state_t *fs           = file_obj->file_state;
+    void                     **replay_under = NULL;
+    uint8_t                  *needs_close  = NULL;
+    char                      *step_root    = NULL;
+    size_t                     payload_len  = 0;
+    uint64_t                   physical_step = 0;
+    size_t                     i;
+    herr_t                     ret_value = 0;
 
     /* Pass 2: decode the manifest and replay it entry by entry, using only
      * the decoded ids -- see the function comment above. */
@@ -2629,11 +2795,40 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
             uint64_t                 poff  = vs_Entry_payload_off(e);
             uint64_t                 plen  = vs_Entry_payload_len(e);
             hid_t                    dtype = -1, dspace = -1, ddcpl = -1;
+            const uint8_t           *type_enc_ptr = type_enc;
+            size_t                   type_enc_actual_len = flatbuffers_uint8_vec_len(type_enc);
 
-            if ((dtype = H5Tdecode2(type_enc, flatbuffers_uint8_vec_len(type_enc))) < 0 ||
+            /* H5VL__stream_type_cache_lookup()'s comment: a DsetWrite entry
+             * with an empty type_enc means the writer omitted it because it
+             * was identical to the last one sent for this path -- resolve
+             * it from this process's own mirror of that same cache instead
+             * (this always runs in the same process, immediately after
+             * H5VL__stream_build_manifest() built the buffer being decoded
+             * here -- see this function's own comment on why "reader" does
+             * not mean a separate process for this call). */
+            if (kind == vs_Kind_DsetWrite && type_enc_actual_len == 0) {
+                type_enc_ptr = H5VL__stream_type_cache_lookup(fs->replay_type_cache, fs->n_replay_type_cache,
+                                                                path, &type_enc_actual_len);
+                if (!type_enc_ptr) {
+                    ret_value = -1;
+                    goto done;
+                }
+            }
+
+            if ((dtype = H5Tdecode2(type_enc_ptr, type_enc_actual_len)) < 0 ||
                 (dspace = H5Sdecode(space_enc)) < 0) {
                 if (dtype >= 0)
                     H5Tclose(dtype);
+                ret_value = -1;
+                goto done;
+            }
+
+            if (kind == vs_Kind_DsetWrite && flatbuffers_uint8_vec_len(type_enc) > 0 &&
+                H5VL__stream_type_cache_upsert(&fs->replay_type_cache, &fs->n_replay_type_cache,
+                                                 &fs->cap_replay_type_cache, path, type_enc,
+                                                 flatbuffers_uint8_vec_len(type_enc)) < 0) {
+                H5Tclose(dtype);
+                H5Sclose(dspace);
                 ret_value = -1;
                 goto done;
             }

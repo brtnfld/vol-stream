@@ -484,16 +484,32 @@ session; the CI matrix's own "HDF5 version" axis builds the *connector*
 against different HDF5 series one at a time, it does not yet write with one and
 read with another in the same test.
 
-**Manifest metadata is fully re-encoded every step, with no dictionary.**
+**Manifest metadata was fully re-encoded every step, with no dictionary.**
 `H5VL__stream_build_manifest()` calls `H5Tencode`/`H5Sencode2` (and
 `H5Pencode2` for create-kind entries) on *every* pending entry on *every*
-step, including `DsetWrite` — a dataset whose type and selection never change
-across steps still pays full type/space blob re-encoding and re-transmission
-each time. At high step cadence or with many small per-step datasets, this is
-real, unbounded metadata overhead with no mitigation today. A path forward:
-send `type_enc`/`dcpl_enc` once per `(path, value)` and reference it by a
-small ID afterward, falling back to a full re-send only when the value
-actually changes.
+step. `dcpl_enc` was never actually part of this cost for `DsetWrite` (its
+`dcpl_id` is always `H5I_INVALID_HID` — only `DsetCreate`/`Attr` carry one,
+and those happen once per object, not once per step); `type_enc` was the
+real, live cost, since a `DsetWrite` re-sent it in full every step even
+though a dataset's type never changes after creation. `space_enc` is left
+alone — a write's selection legitimately varies step to step and is not
+part of this fix.
+
+**Update:** `type_enc` is now cached per path, on both the writer side
+(`H5VL__stream_type_cache_lookup`/`_upsert`, omitting the field when it is
+byte-identical to the last one sent for that path) and the replay side
+(a mirror cache, resolving an omitted field back to real bytes — both sides
+run in the same process, so no cross-process synchronization is needed).
+No schema change: an omitted flatbuffers vector field decodes as a 0-length
+result via `flatbuffers_uint8_vec_len()`, a sentinel no valid `H5Tencode()`
+output can produce, so this is unambiguous and fully backward compatible.
+Verified in `test/t_manifest_cache.c` by comparing the *persisted*
+`/step/<n>/.manifest` dataset's on-disk size across three steps writing the
+same path: step 0 (create + first write, nothing to omit) is measurably
+larger than steps 1–2 (repeat writes, `type_enc` omitted), and steps 1–2
+land at the identical, stable size — a black-box proof the omission is
+real, not just a code-reading claim, plus a correctness check that the
+cached path never changes what actually lands in the file.
 
 **Existing tools on a live stream.** See the constraint section above.
 
