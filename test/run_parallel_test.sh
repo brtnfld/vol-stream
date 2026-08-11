@@ -34,8 +34,8 @@ set -uo pipefail
 MPIRUN=""
 BIN=""
 PLUGIN_DIR=""
-WRITER_RANKS=2
-READER_RANKS=1
+WRITER_RANKS=3
+READER_RANKS=2
 PER_RANK=4
 OUTDIR="./parallel-test-results"
 CONCENTRATION=0
@@ -80,32 +80,23 @@ rm -f t_parallel.h5
 # MPI (a plain env var UCX-unaware MPI simply never reads).
 export UCX_TLS=tcp,self,sm
 
-# CI-only MPICH singleton-fallback investigation (every rank independently
-# reports MPI_COMM_WORLD size 1 -- not an error, just a silent per-process
-# singleton MPI_Init()), now root-caused after seven mpiexec-layer rounds
-# (see git log for this file). VOL_STREAM_DEBUG_PMI_ENV makes t_parallel.c
-# print PMI_RANK/SIZE/FD/PORT/KVSNAME/ID/DEBUG from inside each child before
-# MPI_Init() runs -- kept on permanently, it costs nothing and is what
-# finally supplied ground truth instead of another blind guess: CI's own
-# printout showed PMI_PORT=runnervmvrwv9:<port> -- hydra *does* configure
-# each child correctly, with the *same* PMI_PORT+PMI_ID bootstrap style a
-# local run also uses, but pointed at the runner's own machine hostname
-# ("runnervmvrwv9") instead of "localhost.localdomain" the way a local run's
-# PMI_PORT reads. The child's connect() to that hostname:port is what fails
-# silently in the CI network namespace -- MPICH's PMI_PORT-init code treats
-# a failed connection the same as "no process manager available" and falls
-# through to singleton rather than erroring, matching the exact symptom.
-#
-# Fix: "-localhost localhost" (mpiexec --help: "local hostname for the
-# launching node") overrides the hostname hydra uses for its own bootstrap,
-# which turns out to change more than just the string -- it switches hydra
-# to an entirely different, unambiguously-local PMI bootstrap (PMI_RANK/
-# PMI_SIZE/PMI_FD -- a pre-connected, fork-inherited file descriptor) that
-# needs no hostname resolution or TCP connect() at all, sidestepping the
-# whole failure class rather than trying to make the port-based path's
-# hostname resolve correctly. Confirmed locally: without this flag PMI_PORT
-# is used (matching CI's failing shape); with it, PMI_FD is used instead
-# and the gate passes with real 3-rank coordination.
+# CI-only MPICH singleton-fallback (every rank independently reports
+# MPI_COMM_WORLD size 1 -- not an error, just a silent per-process
+# singleton MPI_Init()): eight rounds of mpiexec-layer flags/env-vars (see
+# git log for this file) narrowed it down but never fully fixed it. The
+# PMI-env diagnostic below (VOL_STREAM_DEBUG_PMI_ENV) proved hydra_pmi_proxy
+# configures each child's PMI bootstrap correctly on CI -- the handshake
+# itself then silently fails regardless of which of MPICH's two bootstrap
+# mechanisms is forced (PMI_PORT: connect() to the runner's own hostname
+# fails; PMI_FD: a pre-connected fork-inherited descriptor, fails
+# differently). This machine's own MPICH 5.0.0 never reproduced the failure
+# in any configuration tried -- the signature of a version-specific
+# upstream bug in Ubuntu's packaged MPICH 4.2.0, not an environment/flag
+# problem. The actual fix is in .github/workflows/ci.yml: CI now builds
+# MPICH 5.0.0 from source instead of relying on the distro package. The
+# flags below (harmless and independently correct regardless of MPICH
+# version) and the diagnostic stay in place as a defensive measure and in
+# case a future CI environment change resurfaces something in this family.
 export VOL_STREAM_DEBUG_PMI_ENV=1
 
 echo "mpirun: $MPIRUN"

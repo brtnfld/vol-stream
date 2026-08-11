@@ -42,11 +42,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Ubuntu's packaged MPICH (4.2.0 as of this runner image) hits a
+      # CI-only bug: hydra_pmi_proxy configures each child's PMI bootstrap
+      # correctly (confirmed via a diagnostic printout of PMI_RANK/SIZE/FD/
+      # PORT from inside the child, before MPI_Init() runs -- see git log
+      # for test/run_parallel_test.sh's own investigation, six-plus rounds
+      # of mpiexec flags/env-vars), but the handshake itself silently fails
+      # regardless of which of MPICH's two bootstrap mechanisms is used
+      # (PMI_PORT: the child's connect() to the runner's own hostname:port
+      # fails; PMI_FD: a pre-connected fork-inherited descriptor, also
+      # fails, differently). Every rank then falls back to MPICH's
+      # documented singleton-init behavior -- MPI_COMM_WORLD size 1, no
+      # error, just silently wrong. This machine's own MPICH 5.0.0 (built
+      # from source, same distro family) has never reproduced this in any
+      # configuration tried, which is the signature of a version-specific
+      # upstream bug rather than an environment/flag problem -- so build
+      # MPICH 5.0.0 from source here instead of relying on the distro
+      # package, sidestepping it entirely rather than continuing to chase
+      # workarounds for 4.2.0's hydra.
       - name: Install build dependencies
         run: |
           sudo apt-get update
           if [ "${{ matrix.mpi }}" = "mpich" ]; then
-            sudo apt-get install -y mpich libmpich-dev
+            curl -sSL https://www.mpich.org/static/downloads/5.0.0/mpich-5.0.0.tar.gz | tar xz
+            cd mpich-5.0.0
+            ./configure --prefix=/usr/local --with-device=ch3 --enable-shared --disable-fortran
+            make -j"$(nproc)"
+            sudo make install
+            sudo ldconfig
+            cd ..
+            mpiexec --version
           else
             sudo apt-get install -y openmpi-bin libopenmpi-dev
           fi
