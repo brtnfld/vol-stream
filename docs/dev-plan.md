@@ -501,16 +501,22 @@ variable-length datatype, that buffer is an array of `{len, pointer}`
 process memory — capturing them verbatim and replaying them later (a
 different `H5Dwrite` call, against a different handle, however much later
 `end_step()` runs) reads through stale pointers rather than the data itself.
-This is a live correctness gap, not a latency or cost concern: writing VL
-data through this connector today is unsafe, and nothing currently detects
-or rejects it. Needs either (a) a real deep-serialization capture path before
-VL/references can be called supported, or (b) an explicit reject-with-clear-
-error at capture time for VL/reference datatypes until (a) exists, so the
-failure mode is a diagnostic instead of silent corruption. Reference
-translation, once built, should happen at write-time (intercepting
-`H5Rcreate_object`/`H5Rcreate_region`) rather than by walking the whole
-step's references synchronously inside `COMMITTING` — the latter would stall
-the collective barrier in proportion to reference count.
+This was a live correctness gap, not just a latency or cost concern: writing
+VL data through this connector was unsafe, and nothing detected or rejected
+it. **Update:** option (b) has landed —
+`H5VL__stream_type_unsafe_to_capture()` rejects a `DsetWrite`/`Attr` capture
+outright (return -1, clear HDF5 error) for `H5T_VLEN`, `H5T_REFERENCE`, and
+variable-length-string types, checked recursively through `H5T_COMPOUND`/
+`H5T_ARRAY` members so a struct or array *containing* one of these is caught
+too. A rejected write does not poison the rest of the step — a plain write
+to a different object in the same step still replays correctly (verified in
+`test/t_vl_reject.c`, the exit gate for this fix). Real deep-serialization
+(a) is still not built; this closes the silent-corruption failure mode, not
+the missing feature. Reference translation, once built, should happen at
+write-time (intercepting `H5Rcreate_object`/`H5Rcreate_region`) rather than
+by walking the whole step's references synchronously inside `COMMITTING` —
+the latter would stall the collective barrier in proportion to reference
+count.
 
 **The dependency risk is quality, not quantity.** Criteria before adding
 anything: actively maintained, deployed at target facilities, Spack-installable,

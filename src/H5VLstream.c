@@ -355,6 +355,7 @@ static H5VL_stream_t *H5VL__stream_new_child_obj(void *under_obj, hid_t under_vo
 static size_t H5VL__stream_pending_append(H5VL_stream_file_state_t *fs,
                              const H5VL_stream_pending_entry_t *entry);
 static hid_t  H5VL__stream_resolve_space(hid_t space_id, hid_t fallback_space_id);
+static htri_t H5VL__stream_type_unsafe_to_capture(hid_t type_id);
 static herr_t H5VL__stream_build_manifest(H5VL_stream_file_state_t *fs, uint8_t **out_manifest_buf,
                              size_t *out_manifest_len, uint8_t **out_payload_buf, size_t *out_payload_len);
 static herr_t H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_buf,
@@ -1500,6 +1501,83 @@ H5VL__stream_resolve_space(hid_t space_id, hid_t fallback_space_id)
 {
     return (space_id == H5S_ALL) ? fallback_space_id : space_id;
 } /* end H5VL__stream_resolve_space() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_type_unsafe_to_capture
+ *
+ * Purpose:     A DsetWrite/Attr capture memcpy()s whatever buffer the
+ *              caller handed H5Dwrite()/H5Awrite() straight into the
+ *              pending entry's payload, replayed later via a *different*
+ *              H5VLdataset_write()/H5VLattr_write() call once end_step()
+ *              runs. That is only correct for buffers whose bytes are
+ *              self-contained. Variable-length types (H5T_VLEN, and
+ *              variable-length strings, H5Tis_variable_str()) violate that:
+ *              the buffer is an array of {len, pointer} structs whose
+ *              pointers are only valid in the caller's own process memory,
+ *              not portable bytes -- capturing them verbatim and replaying
+ *              later reads through a pointer that may already be stale (the
+ *              caller is free to reclaim it, H5Treclaim(), the moment
+ *              H5Dwrite() returns). H5T_REFERENCE has the same problem for
+ *              a different reason: an H5R_ref_t's bytes are only meaningful
+ *              resolved against the file/object that created it, and this
+ *              connector has no name-translation step for references (see
+ *              docs/dev-plan.md's Decision #4 and residual-risks section --
+ *              designed, never implemented).
+ *
+ *              Until real deep-serialization (VL) and name-translation
+ *              (references) capture paths exist, both must be rejected
+ *              here with a clear error rather than silently captured and
+ *              corrupted on replay.
+ *
+ * Return:      Success:    TRUE/FALSE -- whether type_id (or a member of it,
+ *                          for compound/array types) is unsafe to capture
+ *              Failure:    -1 (an H5T call itself failed)
+ *-------------------------------------------------------------------------
+ */
+static htri_t
+H5VL__stream_type_unsafe_to_capture(hid_t type_id)
+{
+    H5T_class_t cls = H5Tget_class(type_id);
+
+    if (cls == H5T_NO_CLASS)
+        return -1;
+    if (cls == H5T_VLEN || cls == H5T_REFERENCE)
+        return 1;
+    if (cls == H5T_STRING) {
+        htri_t is_vl = H5Tis_variable_str(type_id);
+        return is_vl;
+    }
+    if (cls == H5T_COMPOUND) {
+        int nmembers = H5Tget_nmembers(type_id);
+        int m;
+
+        if (nmembers < 0)
+            return -1;
+        for (m = 0; m < nmembers; m++) {
+            hid_t  member_type = H5Tget_member_type(type_id, m);
+            htri_t unsafe;
+
+            if (member_type < 0)
+                return -1;
+            unsafe = H5VL__stream_type_unsafe_to_capture(member_type);
+            H5Tclose(member_type);
+            if (unsafe != 0)
+                return unsafe;
+        }
+        return 0;
+    }
+    if (cls == H5T_ARRAY) {
+        hid_t base_type = H5Tget_super(type_id);
+        htri_t unsafe;
+
+        if (base_type < 0)
+            return -1;
+        unsafe = H5VL__stream_type_unsafe_to_capture(base_type);
+        H5Tclose(base_type);
+        return unsafe;
+    }
+    return 0;
+} /* end H5VL__stream_type_unsafe_to_capture() */
 
 /*-------------------------------------------------------------------------
  * H5Tencode/H5Sencode2/H5Pencode2 all use a two-call size-then-fill idiom,
@@ -4889,6 +4967,12 @@ H5VL_stream_attr_write(void *attr, hid_t mem_type_id, const void *buf, hid_t dxp
         if ((n_elem = H5Sget_select_npoints(e->space_id)) < 0)
             return -1;
 
+        /* See H5VL__stream_type_unsafe_to_capture()'s comment: reject a
+         * VL/reference-typed attribute rather than memcpy-ing pointers that
+         * are only valid in this process. */
+        if (H5VL__stream_type_unsafe_to_capture(e->type_id) != 0)
+            return -1;
+
         nbytes = (size_t)n_elem * H5Tget_size(e->type_id);
 
         free(e->payload);
@@ -5342,6 +5426,15 @@ H5VL_stream_dataset_write(size_t count, void *dset[], hid_t mem_type_id[], hid_t
             write_entry.dcpl_id  = H5I_INVALID_HID;
             write_entry.dapl_id  = H5I_INVALID_HID;
             if (!write_entry.path || write_entry.type_id < 0 || write_entry.space_id < 0) {
+                H5VL__stream_pending_entry_clear(&write_entry);
+                return -1;
+            }
+
+            /* See H5VL__stream_type_unsafe_to_capture()'s comment: a raw
+             * memcpy of a VL/reference buffer captures pointers that are
+             * only valid in this process, not portable bytes -- reject
+             * rather than silently corrupt on replay. */
+            if (H5VL__stream_type_unsafe_to_capture(write_entry.type_id) != 0) {
                 H5VL__stream_pending_entry_clear(&write_entry);
                 return -1;
             }
