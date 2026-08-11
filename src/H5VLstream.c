@@ -381,6 +381,17 @@ static herr_t H5VL__stream_merge_agg_manifests(H5VL_stream_file_state_t *fs, uin
                              size_t *out_n_wiring);
 static herr_t H5VL__stream_replay_local_writes(H5VL_stream_t *file_obj, uint64_t physical_step);
 static herr_t H5VL__stream_replay_step_parallel(H5VL_stream_t *file_obj);
+/* M6.5 (concentrator topology): see H5VL__stream_replay_concentrated_writes()'s
+ * comment for the design. */
+static int    H5VL__stream_concentration_factor(void);
+static herr_t H5VL__stream_write_replica(H5VL_stream_t *file_obj, uint64_t physical_step,
+                             const char *rel_path, hid_t type_id, hid_t space_id, const void *payload);
+static herr_t H5VL__stream_send_write_entry_to_concentrator(const H5VL_stream_pending_entry_t *pe,
+                             int concentrator, MPI_Comm comm);
+static herr_t H5VL__stream_recv_and_write_entry(H5VL_stream_t *file_obj, uint64_t physical_step,
+                             int source, MPI_Comm comm);
+static herr_t H5VL__stream_replay_concentrated_writes(H5VL_stream_t *file_obj, uint64_t physical_step,
+                             int group_size);
 #endif
 
 /* M3: reader helpers */
@@ -3312,19 +3323,90 @@ done:
 } /* end H5VL__stream_merge_agg_manifests() */
 
 /*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_write_replica
+ *
+ * Purpose:     M6.5. Reopen "/step/<physical_step><rel_path>" by path and
+ *              issue one real H5VLdataset_write() of payload against
+ *              space_id/type_id. Factored out of H5VL__stream_replay_local_
+ *              writes() so the concentrator path below
+ *              (H5VL__stream_recv_and_write_entry()) can perform the exact
+ *              same write on behalf of a payload that arrived over MPI
+ *              instead of from this rank's own pending[] array -- the file
+ *              ends up with byte-identical content either way, since the
+ *              path/type/space/payload are all that ever mattered.
+ *
+ * Return:      Success:    0
+ *              Failure:    -1
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_write_replica(H5VL_stream_t *file_obj, uint64_t physical_step, const char *rel_path,
+                            hid_t type_id, hid_t space_id, const void *payload)
+{
+    char               step_root[32];
+    char              *full_path;
+    size_t             full_len;
+    H5VL_loc_params_t  loc_params;
+    void              *real;
+    hid_t              mem_space = -1;
+    hssize_t           n_elem;
+    herr_t             ret_value = 0;
+
+    snprintf(step_root, sizeof(step_root), "/step/%llu", (unsigned long long)physical_step);
+
+    full_len = strlen(step_root) + strlen(rel_path) + 1;
+    if (NULL == (full_path = (char *)malloc(full_len)))
+        return -1;
+    snprintf(full_path, full_len, "%s%s", step_root, rel_path);
+
+    memset(&loc_params, 0, sizeof(loc_params));
+    loc_params.obj_type = H5I_FILE;
+    loc_params.type     = H5VL_OBJECT_BY_SELF;
+
+    real = H5VLdataset_open(file_obj->under_object, &loc_params, file_obj->under_vol_id, full_path,
+                              H5P_DATASET_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL);
+    free(full_path);
+    if (!real)
+        return -1;
+
+    if ((n_elem = H5Sget_select_npoints(space_id)) < 0) {
+        H5VLdataset_close(real, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+        return -1;
+    }
+    {
+        hsize_t n_elem_h = (hsize_t)n_elem;
+
+        if ((mem_space = H5Screate_simple(1, &n_elem_h, NULL)) < 0) {
+            H5VLdataset_close(real, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+            return -1;
+        }
+    }
+
+    {
+        herr_t w = H5VLdataset_write(1, &real, file_obj->under_vol_id, &type_id, &mem_space, &space_id,
+                                      H5P_DATASET_XFER_DEFAULT, &payload, NULL);
+
+        H5Sclose(mem_space);
+        H5VLdataset_close(real, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+        if (w < 0)
+            ret_value = -1;
+    }
+
+    return ret_value;
+} /* end H5VL__stream_write_replica() */
+
+/*-------------------------------------------------------------------------
  * Function:    H5VL__stream_replay_local_writes
  *
  * Purpose:     M6.5. The independent half of a heterogeneous parallel
  *              writer's replay: this rank's own DsetWrite entries, applied
  *              after H5VL__stream_merge_agg_manifests()'s collective pass
  *              has ensured every target object exists (whether this rank
- *              or another one originated its creation). Reopens each
- *              target by path rather than reusing a live handle from the
- *              collective pass -- simpler than threading object handles
- *              across two separate replay calls, and DsetWrite entries
+ *              or another one originated its creation). DsetWrite entries
  *              always have a matching DsetCreate earlier in the same step
- *              (the capture side never lets one exist otherwise), so the
- *              open always succeeds once the collective pass has run.
+ *              (the capture side never lets one exist otherwise), so
+ *              H5VL__stream_write_replica()'s reopen-by-path always
+ *              succeeds once the collective pass has run.
  *
  * Return:      Success:    0
  *              Failure:    -1
@@ -3334,75 +3416,313 @@ static herr_t
 H5VL__stream_replay_local_writes(H5VL_stream_t *file_obj, uint64_t physical_step)
 {
     H5VL_stream_file_state_t *fs = file_obj->file_state;
-    char                       step_root[32];
     size_t                     i;
-    herr_t                     ret_value = 0;
-
-    snprintf(step_root, sizeof(step_root), "/step/%llu", (unsigned long long)physical_step);
 
     for (i = 0; i < fs->n_pending; i++) {
         H5VL_stream_pending_entry_t *pe = &fs->pending[i];
-        char                          *full_path;
-        size_t                         full_len;
-        H5VL_loc_params_t              loc_params;
-        void                          *real;
-        hid_t                          mem_space = -1;
-        hssize_t                       n_elem;
 
         if (pe->kind != vs_Kind_DsetWrite)
             continue;
 
-        full_len = strlen(step_root) + strlen(pe->path) + 1;
-        if (NULL == (full_path = (char *)malloc(full_len))) {
-            ret_value = -1;
-            goto done;
-        }
-        snprintf(full_path, full_len, "%s%s", step_root, pe->path);
-
-        memset(&loc_params, 0, sizeof(loc_params));
-        loc_params.obj_type = H5I_FILE;
-        loc_params.type     = H5VL_OBJECT_BY_SELF;
-
-        real = H5VLdataset_open(file_obj->under_object, &loc_params, file_obj->under_vol_id, full_path,
-                                  H5P_DATASET_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL);
-        free(full_path);
-        if (!real) {
-            ret_value = -1;
-            goto done;
-        }
-
-        if ((n_elem = H5Sget_select_npoints(pe->space_id)) < 0) {
-            H5VLdataset_close(real, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
-            ret_value = -1;
-            goto done;
-        }
-        {
-            hsize_t n_elem_h = (hsize_t)n_elem;
-
-            if ((mem_space = H5Screate_simple(1, &n_elem_h, NULL)) < 0) {
-                H5VLdataset_close(real, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
-                ret_value = -1;
-                goto done;
-            }
-        }
-
-        {
-            const void *payload_ptr = pe->payload;
-            herr_t      w = H5VLdataset_write(1, &real, file_obj->under_vol_id, &pe->type_id, &mem_space,
-                                               &pe->space_id, H5P_DATASET_XFER_DEFAULT, &payload_ptr, NULL);
-
-            H5Sclose(mem_space);
-            H5VLdataset_close(real, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
-            if (w < 0) {
-                ret_value = -1;
-                goto done;
-            }
-        }
+        if (H5VL__stream_write_replica(file_obj, physical_step, pe->path, pe->type_id, pe->space_id,
+                                        pe->payload) < 0)
+            return -1;
     }
 
-done:
-    return ret_value;
+    return 0;
 } /* end H5VL__stream_replay_local_writes() */
+
+/*-------------------------------------------------------------------------
+ * H5VL__stream_concentration_factor: how many consecutive writer ranks
+ * share one I/O concentrator (Subfiling VFD's sf_topology_t/
+ * n_io_concentrators, mirrored here at the application level). 1 (the
+ * unset default) means "no concentration", exactly M6.5's first
+ * increment -- every rank still does its own raw-data I/O directly.
+ * VOL_STREAM_CONCENTRATION opts in explicitly, same convention as
+ * VOL_STREAM_NA/VOL_STREAM_SPILL_DIR, so this is fully backward
+ * compatible unless requested.
+ *-------------------------------------------------------------------------
+ */
+static int
+H5VL__stream_concentration_factor(void)
+{
+    const char *s = getenv("VOL_STREAM_CONCENTRATION");
+    long        v;
+
+    if (!s || !*s)
+        return 1;
+    v = strtol(s, NULL, 10);
+    return (v > 1) ? (int)v : 1;
+} /* end H5VL__stream_concentration_factor() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_send_write_entry_to_concentrator
+ *
+ * Purpose:     M6.5 concentrator topology. Ship one DsetWrite pending
+ *              entry to the rank that will perform the actual I/O on this
+ *              rank's behalf: [path][type_enc][space_enc][payload], each
+ *              length-prefixed with a uint64_t, one MPI_Send per entry.
+ *              type_enc/space_enc reuse H5VL__stream_encode_type()/
+ *              H5VL__stream_encode_space() -- the same H5Tencode()/
+ *              H5Sencode2() idiom this file already uses to move a
+ *              type/dataspace's id across a process boundary (see the
+ *              manifest replay code above), so an arbitrary selection
+ *              survives the trip, not just a 1-D contiguous slice.
+ *
+ * Return:      Success:    0
+ *              Failure:    -1
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_send_write_entry_to_concentrator(const H5VL_stream_pending_entry_t *pe, int concentrator,
+                                               MPI_Comm comm)
+{
+    uint8_t *type_enc = NULL, *space_enc = NULL;
+    size_t   type_len = 0, space_len = 0;
+    size_t   path_len = strlen(pe->path);
+    uint8_t *msg      = NULL;
+    size_t   msg_len, off = 0;
+    herr_t   ret_value = 0;
+
+    if (H5VL__stream_encode_type(pe->type_id, &type_enc, &type_len) < 0 ||
+        H5VL__stream_encode_space(pe->space_id, &space_enc, &space_len) < 0) {
+        ret_value = -1;
+        goto done;
+    }
+
+    msg_len = 4 * sizeof(uint64_t) + path_len + type_len + space_len + pe->payload_len;
+    if (NULL == (msg = (uint8_t *)malloc(msg_len))) {
+        ret_value = -1;
+        goto done;
+    }
+
+    {
+        uint64_t v;
+
+        v = (uint64_t)path_len;
+        memcpy(msg + off, &v, sizeof(v));
+        off += sizeof(v);
+        memcpy(msg + off, pe->path, path_len);
+        off += path_len;
+
+        v = (uint64_t)type_len;
+        memcpy(msg + off, &v, sizeof(v));
+        off += sizeof(v);
+        memcpy(msg + off, type_enc, type_len);
+        off += type_len;
+
+        v = (uint64_t)space_len;
+        memcpy(msg + off, &v, sizeof(v));
+        off += sizeof(v);
+        memcpy(msg + off, space_enc, space_len);
+        off += space_len;
+
+        v = (uint64_t)pe->payload_len;
+        memcpy(msg + off, &v, sizeof(v));
+        off += sizeof(v);
+        if (pe->payload_len > 0)
+            memcpy(msg + off, pe->payload, pe->payload_len);
+    }
+
+    if (MPI_SUCCESS != MPI_Send(msg, (int)msg_len, MPI_BYTE, concentrator, 9102, comm))
+        ret_value = -1;
+
+done:
+    free(type_enc);
+    free(space_enc);
+    free(msg);
+    return ret_value;
+} /* end H5VL__stream_send_write_entry_to_concentrator() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_recv_and_write_entry
+ *
+ * Purpose:     M6.5 concentrator topology. The receive side of
+ *              H5VL__stream_send_write_entry_to_concentrator(): MPI_Probe
+ *              to learn the incoming message's exact size (entries are
+ *              variable-length -- payload size differs per write), decode
+ *              the type/space back into real ids via H5Tdecode2()/
+ *              H5Sdecode() (mirrors how H5VL__stream_replay_manifest()
+ *              already decodes a manifest entry's type_enc/space_enc), and
+ *              perform the write via H5VL__stream_write_replica() exactly
+ *              as if this rank had originated the entry itself.
+ *
+ * Return:      Success:    0
+ *              Failure:    -1
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_recv_and_write_entry(H5VL_stream_t *file_obj, uint64_t physical_step, int source, MPI_Comm comm)
+{
+    MPI_Status status;
+    int        count = 0;
+    uint8_t   *msg  = NULL;
+    size_t     off  = 0;
+    uint64_t   v;
+    char      *path = NULL;
+    uint8_t   *type_enc, *space_enc, *payload;
+    hid_t      type_id = -1, space_id = -1;
+    herr_t     ret_value = 0;
+
+    if (MPI_SUCCESS != MPI_Probe(source, 9102, comm, &status)) {
+        ret_value = -1;
+        goto done;
+    }
+    MPI_Get_count(&status, MPI_BYTE, &count);
+    if (NULL == (msg = (uint8_t *)malloc((size_t)count))) {
+        ret_value = -1;
+        goto done;
+    }
+    if (MPI_SUCCESS != MPI_Recv(msg, count, MPI_BYTE, source, 9102, comm, MPI_STATUS_IGNORE)) {
+        ret_value = -1;
+        goto done;
+    }
+
+    memcpy(&v, msg + off, sizeof(v));
+    off += sizeof(v);
+    if (NULL == (path = (char *)malloc((size_t)v + 1))) {
+        ret_value = -1;
+        goto done;
+    }
+    memcpy(path, msg + off, (size_t)v);
+    path[v] = '\0';
+    off += (size_t)v;
+
+    memcpy(&v, msg + off, sizeof(v));
+    off += sizeof(v);
+    type_enc = msg + off;
+    off += (size_t)v;
+    if ((type_id = H5Tdecode2(type_enc, (size_t)v)) < 0) {
+        ret_value = -1;
+        goto done;
+    }
+
+    memcpy(&v, msg + off, sizeof(v));
+    off += sizeof(v);
+    space_enc = msg + off;
+    off += (size_t)v;
+    if ((space_id = H5Sdecode(space_enc)) < 0) {
+        ret_value = -1;
+        goto done;
+    }
+
+    memcpy(&v, msg + off, sizeof(v));
+    off += sizeof(v);
+    payload = msg + off;
+
+    if (H5VL__stream_write_replica(file_obj, physical_step, path, type_id, space_id, payload) < 0)
+        ret_value = -1;
+
+done:
+    if (type_id >= 0)
+        H5Tclose(type_id);
+    if (space_id >= 0)
+        H5Sclose(space_id);
+    free(path);
+    free(msg);
+    return ret_value;
+} /* end H5VL__stream_recv_and_write_entry() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_replay_concentrated_writes
+ *
+ * Purpose:     M6.5's remaining scope: route DsetWrite entries through a
+ *              Subfiling-style I/O-concentrator topology instead of every
+ *              rank touching the underlying file directly (see the
+ *              dev-plan.md M6.5 exit gate's "...routed through at least
+ *              one concentrator that aggregates more than one writer
+ *              rank"). Ranks are partitioned into contiguous groups of
+ *              group_size; the first rank in each group is that group's
+ *              concentrator. A non-concentrator rank ships each of its own
+ *              DsetWrite entries to its concentrator
+ *              (H5VL__stream_send_write_entry_to_concentrator()) instead
+ *              of writing it directly; the concentrator writes its own
+ *              entries as usual (H5VL__stream_write_replica()) and then,
+ *              for each other member of its group in ascending rank
+ *              order, receives and writes that member's entries too
+ *              (H5VL__stream_recv_and_write_entry()). The file ends up
+ *              byte-identical to the non-concentrated path -- this changes
+ *              *which rank* issues each H5VLdataset_write() call, not
+ *              *what* gets written -- so it does not need
+ *              H5Sselect_project_intersection() to combine contributors'
+ *              selections into fewer, larger writes; that would be a
+ *              further throughput optimization on top of this, not
+ *              something correctness depends on, and is not attempted
+ *              here.
+ *
+ *              Deadlock-safety: a non-concentrator rank's sends never wait
+ *              on anything from its concentrator, and a concentrator
+ *              receives from its members in a fixed order, one member's
+ *              entire entry count at a time -- a bipartite, acyclic
+ *              communication pattern (members only ever talk to their own
+ *              concentrator), so ordinary blocking MPI_Send/MPI_Recv
+ *              cannot deadlock regardless of message size or how far
+ *              ahead/behind any one rank runs.
+ *
+ * Return:      Success:    0
+ *              Failure:    -1
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_replay_concentrated_writes(H5VL_stream_t *file_obj, uint64_t physical_step, int group_size)
+{
+    H5VL_stream_file_state_t *fs            = file_obj->file_state;
+    int                        my_rank       = fs->mpi_rank;
+    int                        nranks        = fs->mpi_size;
+    int                        concentrator  = (my_rank / group_size) * group_size;
+    int                        group_end     = concentrator + group_size;
+    size_t                     i;
+    int                        m;
+
+    if (group_end > nranks)
+        group_end = nranks;
+
+    if (my_rank != concentrator) {
+        int n_entries = 0;
+
+        for (i = 0; i < fs->n_pending; i++)
+            if (fs->pending[i].kind == vs_Kind_DsetWrite)
+                n_entries++;
+
+        if (MPI_SUCCESS != MPI_Send(&n_entries, 1, MPI_INT, concentrator, 9101, fs->comm))
+            return -1;
+
+        for (i = 0; i < fs->n_pending; i++) {
+            if (fs->pending[i].kind != vs_Kind_DsetWrite)
+                continue;
+            if (H5VL__stream_send_write_entry_to_concentrator(&fs->pending[i], concentrator, fs->comm) < 0)
+                return -1;
+        }
+
+        if (n_entries > 0)
+            printf("  rank %d routed %d DsetWrite entries through concentrator %d\n", my_rank, n_entries,
+                   concentrator);
+
+        return 0;
+    }
+
+    /* This rank is a concentrator: its own entries first, exactly like the
+     * non-concentrated path. */
+    if (H5VL__stream_replay_local_writes(file_obj, physical_step) < 0)
+        return -1;
+
+    for (m = concentrator + 1; m < group_end; m++) {
+        int n_entries = 0, k;
+
+        if (MPI_SUCCESS != MPI_Recv(&n_entries, 1, MPI_INT, m, 9101, fs->comm, MPI_STATUS_IGNORE))
+            return -1;
+
+        for (k = 0; k < n_entries; k++)
+            if (H5VL__stream_recv_and_write_entry(file_obj, physical_step, m, fs->comm) < 0)
+                return -1;
+
+        if (n_entries > 0)
+            printf("  concentrator rank %d wrote %d DsetWrite entries on behalf of rank %d\n", my_rank,
+                   n_entries, m);
+    }
+
+    return 0;
+} /* end H5VL__stream_replay_concentrated_writes() */
 
 /*-------------------------------------------------------------------------
  * Function:    H5VL__stream_replay_step_parallel
@@ -3427,17 +3747,18 @@ done:
  *              -- the ordinary H5Dcreate2()/H5Acreate2() collective-
  *              metadata calls this connector has always used, now just
  *              covering the union of what every rank asked for rather than
- *              only this rank's own subset). Finally, each rank
- *              independently replays its own DsetWrite entries
- *              (H5VL__stream_replay_local_writes()) now that every target
- *              object exists.
+ *              only this rank's own subset). Finally, each rank replays
+ *              its own DsetWrite entries -- directly
+ *              (H5VL__stream_replay_local_writes()) by default, or routed
+ *              through a Subfiling-style I/O-concentrator topology
+ *              (H5VL__stream_replay_concentrated_writes()) when
+ *              VOL_STREAM_CONCENTRATION opts in (see that function's
+ *              comment) -- now that every target object exists.
  *
- *              This increment does not yet route through a Subfiling-style
- *              I/O-concentrator topology -- every rank still does its own
- *              raw-data I/O directly, which is correct (not a shortcut)
- *              for any rank count, just not the aggregation-point
- *              architecture dev-plan.md's M6 section names for scale. See
- *              docs/dev-plan.md's M6.5 section.
+ *              M7's queue policy is not yet integrated with this parallel
+ *              path; end_step()'s Block/Discard/Spill handling still only
+ *              applies to the serial (!has_comm) path. See docs/dev-plan.md's
+ *              M6.5 section.
  *
  * Return:      Success:    0
  *              Failure:    -1
@@ -3529,9 +3850,16 @@ H5VL__stream_replay_step_parallel(H5VL_stream_t *file_obj)
         goto done;
     }
 
-    if (H5VL__stream_replay_local_writes(file_obj, fs->physical_step) < 0) {
-        ret_value = -1;
-        goto done;
+    {
+        int group_size = H5VL__stream_concentration_factor();
+        herr_t write_ret = (group_size > 1)
+                                ? H5VL__stream_replay_concentrated_writes(file_obj, fs->physical_step, group_size)
+                                : H5VL__stream_replay_local_writes(file_obj, fs->physical_step);
+
+        if (write_ret < 0) {
+            ret_value = -1;
+            goto done;
+        }
     }
 
 done:

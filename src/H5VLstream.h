@@ -83,13 +83,22 @@
  *              handling does the rest, so no connector-level cross-rank
  *              manifest aggregation is needed for this case. Verified
  *              byte-exact with the M6 exit gate's own coprime rank counts
- *              (7 writers/3 readers, 64/5). Heterogeneous per-rank object
- *              sets and the Subfiling-style I/O-concentrator aggregation
- *              topology dev-plan.md's M6 section calls for are not
- *              implemented yet -- both need real cross-rank manifest
- *              aggregation (H5Sselect_project_intersection), which this
- *              increment's uniform-topology assumption avoids needing. See
- *              docs/dev-plan.md's M6.5 for that generalization's own scope.
+ *              (7 writers/3 readers, 64/5).
+ *
+ *              M6.5 status: the two things M6's first increment named but
+ *              didn't need are both done. Heterogeneous per-rank object sets
+ *              (rank 0 creating a dataset rank 1 never touches) work via
+ *              cross-rank manifest aggregation -- see
+ *              H5VL__stream_replay_step_parallel()'s comment in
+ *              src/H5VLstream.c. The Subfiling-style I/O-concentrator
+ *              topology is opt-in via VOL_STREAM_CONCENTRATION -- see
+ *              H5VL__stream_replay_concentrated_writes()'s comment. Both
+ *              verified byte-exact at 7/3 and 64/5 (aggregation) and 3/2,
+ *              7/3 (concentration). H5Sselect_project_intersection-based
+ *              reader resolution -- combining a concentrator's contributors
+ *              into fewer/larger reads -- remains the one open M6.5 item;
+ *              neither of the above needed it, since the file's bytes are
+ *              identical regardless of which rank wrote them.
  *
  *              M7 status: queue policy for a lagging reader
  *              (H5Fset_stream_queue_policy(), src/tr_mercury.c's reader-ack
@@ -114,13 +123,24 @@
  *              path, and the writer pushes that path's actual payload bytes
  *              (Mercury's first RPC ever to carry more than small fixed
  *              scalars) to every subscriber at replay time. Retrieved via
- *              the new H5Fget_subscribed_data(). Routing is whole-object
- *              only this increment: an unsubscribed sibling object in the
- *              same step is never sent, which is the core thesis, but the
- *              dataspace subvolume/precision H5Fsubscribe() already accepts
- *              is validated, not yet acted on -- that needs chunk-level
- *              intersection (H5Sselect_intersect_block) and per-subscriber
- *              re-filtering, both flagged as follow-up scope.
+ *              the new H5Fget_subscribed_data(). An unsubscribed sibling
+ *              object in the same step is never sent, the increment's core
+ *              thesis.
+ *
+ *              M8.5 status: subscription routing now honors a 1-D element
+ *              subrange, not just the whole object -- H5Fsubscribe()'s
+ *              dataspace selection (H5Sget_select_bounds(), dimension 0)
+ *              travels with the subscription, and the writer computes the
+ *              integer overlap between what it just wrote and each
+ *              subscriber's requested range, sending only that slice.
+ *              H5Fget_subscribed_data() reports the covered subrange via its
+ *              elem_start/elem_count OUT params. Attribute paths ("@"-joined,
+ *              H5VL__stream_attr_path()) are subscribable too. Still open:
+ *              HDF5-storage-chunk-granularity routing (would need
+ *              H5Sselect_intersect_block against a FilteredChunks payload
+ *              form this codebase has never actually built, despite it
+ *              being schema-defined since M2) and per-subscriber precision
+ *              (the subscription's DCPL is accepted and still ignored).
  */
 
 #ifndef H5VLstream_H

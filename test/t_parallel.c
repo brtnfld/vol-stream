@@ -38,10 +38,15 @@
  * every writer rank still exists and is correct, on top of the shared
  * dataset's own M×N redistribution check.
  *
- * Still out of scope: the Subfiling-style I/O-concentrator aggregation
- * topology (every rank still does its own raw-data I/O directly -- correct,
- * just not the aggregation-point architecture dev-plan.md's M6 section
- * names for scale).
+ * The Subfiling-style I/O-concentrator aggregation topology has also
+ * landed (see H5VL__stream_replay_concentrated_writes()'s comment), but it
+ * is opt-in via VOL_STREAM_CONCENTRATION and off by default, so this file
+ * itself needs no changes to exercise it -- test/run_parallel_test.sh's
+ * --concentration flag sets the env var around the write phase only and
+ * checks the concentrator actually logged aggregating another rank's
+ * writes. Still out of scope: H5Sselect_project_intersection-based reader
+ * resolution -- the concentrator topology only changes which rank issues
+ * each write, not what a reader does.
  */
 
 #include <mpi.h>

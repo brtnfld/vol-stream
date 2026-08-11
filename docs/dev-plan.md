@@ -355,11 +355,25 @@ more than one writer rank.
 Cross-rank manifest aggregation and heterogeneous per-rank object sets shipped
 and are verified byte-exact at this gate's own 7→3 and 64→5 rank counts, real
 per-rank-private datasets included — see `H5VL__stream_replay_step_parallel()`
-in `src/H5VLstream.c`. The Subfiling-style I/O-concentrator topology and
-`H5Sselect_project_intersection`-based reader resolution remain open: every
-rank still does its own raw-data I/O directly, correct at any rank count
-tested so far but not the aggregation-point architecture this section
-describes for scale.
+in `src/H5VLstream.c`.
+
+**Update:** the Subfiling-style I/O-concentrator topology has also landed,
+opt-in via `VOL_STREAM_CONCENTRATION` (unset/1 = every rank still does its own
+raw-data I/O directly, unchanged from the paragraph above). Writer ranks are
+partitioned into contiguous groups of that size; each group's first rank is
+its concentrator, and every other member ships its `DsetWrite` entries to it
+over MPI point-to-point instead of writing directly (type/dataspace carried
+via `H5Tencode`/`H5Sencode2`, the same idiom the manifest replay already
+uses) — see `H5VL__stream_replay_concentrated_writes()`. Verified byte-exact
+with real aggregation at 3→2 (one 3-rank concentrator group) and 7→3 (two
+concentrator groups of 3, one singleton), via
+`run_parallel_test.sh --concentration N`, which also asserts the concentrator
+actually logged writing on another rank's behalf rather than silently
+no-op'ing. Still open: `H5Sselect_project_intersection`-based reader
+resolution — this increment only changes *which rank* issues each
+`H5VLdataset_write()`, not what a reader does, so a concentrator's aggregated
+region is not yet combined into fewer/larger writes or specially resolved on
+read.
 
 ### M7 — Queue policy and BAKE spill · M
 
