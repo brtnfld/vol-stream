@@ -2354,6 +2354,44 @@ done:
 } /* end H5VL__stream_build_manifest() */
 
 /*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_space_1d_bounds
+ *
+ * Purpose:     M8.5. The 1-D element range [*start, *start + *count) space_id
+ *              covers, for subscription routing (H5Fsubscribe()'s handler
+ *              and the DsetWrite/Attr push hooks in
+ *              H5VL__stream_replay_manifest()). H5Sget_select_bounds()
+ *              writes one array entry per dimension, so for a SCALAR
+ *              dataspace (rank 0 -- H5S_SCALAR, the natural shape for an
+ *              attribute) it writes nothing at all into low[0]/high[0],
+ *              which would otherwise be read as uninitialized stack
+ *              garbage (found by actually running the attribute-push test
+ *              this function exists for -- see project_m8_status.md).
+ *              Scalar is treated as exactly one element at index 0.
+ *
+ * Return:      Success:    0
+ *              Failure:    -1
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_space_1d_bounds(hid_t space_id, uint64_t *start, uint64_t *count)
+{
+    if (H5Sget_simple_extent_type(space_id) == H5S_SCALAR) {
+        *start = 0;
+        *count = 1;
+        return 0;
+    }
+    {
+        hsize_t low[32], high[32];
+
+        if (H5Sget_select_bounds(space_id, low, high) < 0)
+            return -1;
+        *start = (uint64_t)low[0];
+        *count = (uint64_t)(high[0] - low[0] + 1);
+    }
+    return 0;
+} /* end H5VL__stream_space_1d_bounds() */
+
+/*-------------------------------------------------------------------------
  * Function:    H5VL__stream_replay_manifest
  *
  * Purpose:     The M2 core (M7: the second half of what was
@@ -2615,11 +2653,11 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                      * must not fail the replay that already durably
                      * committed this data to the real file. */
                     if (file_obj->file_state && file_obj->file_state->transport) {
-                        hsize_t low[32], high[32];
+                        uint64_t w_start, w_count;
 
-                        if (H5Sget_select_bounds(dspace, low, high) >= 0)
+                        if (H5VL__stream_space_1d_bounds(dspace, &w_start, &w_count) >= 0)
                             vs_tr_writer_push_data(file_obj->file_state->transport, physical_step, path,
-                                                     payload_ptr, H5Tget_size(dtype), (uint64_t)low[0],
+                                                     payload_ptr, H5Tget_size(dtype), w_start,
                                                      (uint64_t)n_elem);
                     }
 #endif
@@ -2734,6 +2772,26 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                         ret_value = -1;
                         goto done;
                     }
+
+#ifdef VOL_STREAM_HAVE_MERCURY
+                    /* M8.5: same push as a DsetWrite entry gets, for the same
+                     * reason -- a subscription to an attribute path
+                     * previously validated fine but silently never received
+                     * anything. path is the "@"-joined internal form
+                     * H5VL__stream_attr_path() builds (e.g. "/group@name"),
+                     * so a subscriber wanting attribute data must subscribe
+                     * using that same form -- not documented as public API
+                     * yet, since M8/M8.5 never claimed attribute
+                     * subscriptions as in scope; this closes the silent gap
+                     * without promising more than that. */
+                    if (file_obj->file_state && file_obj->file_state->transport) {
+                        uint64_t a_start, a_count;
+
+                        if (H5VL__stream_space_1d_bounds(dspace, &a_start, &a_count) >= 0)
+                            vs_tr_writer_push_data(file_obj->file_state->transport, physical_step, path,
+                                                     payload_ptr, H5Tget_size(dtype), a_start, a_count);
+                    }
+#endif
                 }
 
                 if (pending_for_wiring && pending_for_wiring[i].owner_wrapper) {
@@ -5936,13 +5994,9 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
 #ifdef VOL_STREAM_HAVE_MERCURY
         if (o->file_state && o->file_state->transport) {
             for (size_t i = 0; i < sargs->count; i++) {
-                hsize_t  low[32], high[32];
                 uint64_t sel_start = 0, sel_count = UINT64_MAX;
 
-                if (H5Sget_select_bounds(sargs->spaces[i], low, high) >= 0) {
-                    sel_start = (uint64_t)low[0];
-                    sel_count = (uint64_t)(high[0] - low[0] + 1);
-                }
+                H5VL__stream_space_1d_bounds(sargs->spaces[i], &sel_start, &sel_count);
                 vs_tr_reader_subscribe(o->file_state->transport, sargs->paths[i], sel_start, sel_count);
             }
         }

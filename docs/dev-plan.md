@@ -352,6 +352,15 @@ object set — not every rank creating the same objects — still byte-exact and
 replay-invariant, routed through at least one concentrator that aggregates
 more than one writer rank.
 
+Cross-rank manifest aggregation and heterogeneous per-rank object sets shipped
+and are verified byte-exact at this gate's own 7→3 and 64→5 rank counts, real
+per-rank-private datasets included — see `H5VL__stream_replay_step_parallel()`
+in `src/H5VLstream.c`. The Subfiling-style I/O-concentrator topology and
+`H5Sselect_project_intersection`-based reader resolution remain open: every
+rank still does its own raw-data I/O directly, correct at any rank count
+tested so far but not the aggregation-point architecture this section
+describes for scale.
+
 ### M7 — Queue policy and BAKE spill · M
 
 `Block`, `Discard` and `Spill`, plus reserve slots and latest-step-only for
@@ -393,6 +402,16 @@ increment already accepts and validates but never acts on.
 **Exit gate.** Two subscribers on one stream at different precisions from a
 single `end_step`, wire bytes measured (not just asserted less-than) to scale
 with subscribed volume — dev-plan.md's M8 exit gate, in full.
+
+1-D element-range intersection shipped: a subscription's `H5Sencode2` bounds
+(via `H5Sget_select_bounds()`, dimension 0) now thread through to the writer,
+which intersects each subscriber's requested range against what it actually
+wrote and pushes only the overlap — verified with a bounded subrange
+subscription receiving exactly its requested elements, not the whole object.
+See `vs_tr_writer_push_data()` in `src/tr_mercury.c`. Chunk-storage-granularity
+routing (`H5Sselect_intersect_block` against `FilteredChunks`, which this
+connector has never actually built despite being in the schema since M2) and
+per-subscriber precision (re-filtering) remain open.
 
 ### M9 — Tools, bindings, and the long tail · M
 

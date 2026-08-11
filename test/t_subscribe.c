@@ -147,14 +147,27 @@ run_reader(void)
             return 1;
         }
     }
+    /* M8.5 closing a silent gap: a subscription to an attribute path (the
+     * "@"-joined internal form H5VL__stream_attr_path() builds) now also
+     * gets pushed, not just datasets. Whole-object (scalar, nothing to
+     * bound a subrange of). */
     {
-        const char *paths[1]  = {"/sub"};
-        const hid_t spaces[1] = {sub_space};
+        hid_t attr_space;
 
-        if (H5Fsubscribe(fid, 1, paths, spaces, NULL) < 0) {
-            printf("reader: FAIL subscribe\n");
+        if ((attr_space = H5Screate(H5S_SCALAR)) < 0) {
+            printf("reader: FAIL create attr subscription dataspace\n");
             return 1;
         }
+        {
+            const char *paths[2]  = {"/sub", "/sub@meta"};
+            const hid_t spaces[2] = {sub_space, attr_space};
+
+            if (H5Fsubscribe(fid, 2, paths, spaces, NULL) < 0) {
+                printf("reader: FAIL subscribe\n");
+                return 1;
+            }
+        }
+        H5Sclose(attr_space);
     }
     H5Sclose(sub_space);
 
@@ -204,6 +217,35 @@ run_reader(void)
                    size, NSUB * sizeof(int));
         free(path);
         free(buf);
+    }
+
+    /* Attribute push -- closes the silent gap noted above. */
+    {
+        uint64_t phys3 = (uint64_t)-1, es3 = 0, ec3 = 0;
+        char    *path3  = NULL;
+        void    *buf3   = NULL;
+        size_t   size3  = 0;
+
+        if (H5Fget_subscribed_data(fid, 10000, &phys3, &path3, &buf3, &size3, &es3, &ec3) < 0) {
+            printf("  FAIL  never received pushed data for /sub@meta\n");
+            rc = 1;
+        }
+        else {
+            int ok = 1;
+
+            if (!path3 || strcmp(path3, "/sub@meta") != 0) {
+                printf("  FAIL  pushed path is '%s', expected '/sub@meta'\n", path3 ? path3 : "(null)");
+                ok = 0;
+            }
+            if (size3 != sizeof(int) || (buf3 && *(const int *)buf3 != 777)) {
+                printf("  FAIL  attribute value wrong (size=%zu)\n", size3);
+                ok = 0;
+            }
+            if (ok)
+                printf("  ok    attribute subscription pushed too -- /sub@meta = 777\n");
+            free(path3);
+            free(buf3);
+        }
     }
 
     /* The core thesis, made concrete: /unsub is NUSUB*8 = %zu bytes -- far
@@ -300,6 +342,22 @@ run_writer(void)
         H5Dwrite(ds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, sub_vals) < 0) {
         printf("writer: FAIL write /sub\n");
         return 1;
+    }
+    /* An attribute subscription (M8.5) should get pushed too, closing a gap
+     * M8's first increment left silent -- see run_reader()'s matching
+     * block. */
+    {
+        hid_t   attr_space, attr;
+        int     meta_val = 777;
+
+        if ((attr_space = H5Screate(H5S_SCALAR)) < 0 ||
+            (attr = H5Acreate2(ds, "meta", H5T_NATIVE_INT, attr_space, H5P_DEFAULT, H5P_DEFAULT)) < 0 ||
+            H5Awrite(attr, H5T_NATIVE_INT, &meta_val) < 0) {
+            printf("writer: FAIL create/write /sub@meta\n");
+            return 1;
+        }
+        H5Aclose(attr);
+        H5Sclose(attr_space);
     }
     H5Dclose(ds);
     if ((ds = H5Dcreate2(fid, "/unsub", H5T_NATIVE_DOUBLE, unsub_space, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT)) <
