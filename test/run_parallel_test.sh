@@ -76,17 +76,21 @@ echo "mpirun: $MPIRUN"
 echo
 
 # Slot/host declaration is not portable between implementations the way a
-# plain env var is -- Open MPI's "-host localhost:N declares N slots" and
-# MPICH's hydra do not reliably agree on that syntax (confirmed in CI: with
-# -host localhost:N, Open MPI launches N properly coordinated ranks, but
-# MPICH's hydra silently launches N independent single-rank jobs instead --
-# each one sees MPI_COMM_WORLD size 1, a correctness bug, not just a
-# warning). Detect the implementation from its own --version banner
-# ("HYDRA build details" is MPICH's hydra signature) and give each its own
-# idiomatic flags rather than guessing at one syntax that works for both.
+# plain env var is. Two earlier attempts here both tried to hand MPICH's
+# hydra an explicit host/launcher flag ("-host localhost:N", then "-hosts
+# localhost -launcher fork") to fix the same CI-only symptom (every rank
+# independently reports MPI_COMM_WORLD size 1 -- a silent per-process
+# singleton-init fallback, not an error) -- and neither one actually fixed
+# it, which means the flags were never the real cause. HDF5's own upstream
+# CI (main-par.yml) runs MPICH parallel tests on the same GH Actions ubuntu
+# runners with nothing beyond "-n N" -- no -hosts, no -launcher -- so that's
+# the known-working baseline to match rather than keep guessing at hydra
+# flags. -verbose is added for MPICH specifically so that IF this still
+# degrades to singleton mode, the next CI log actually shows hydra's own
+# proxy/PMI launch trace instead of nothing.
 if "$MPIRUN" --version 2>&1 | grep -qi "HYDRA build details"; then
-    MPI_EXTRA_ARGS=(-hosts localhost -launcher fork)
-    echo "detected MPICH hydra -- using: ${MPI_EXTRA_ARGS[*]}"
+    MPI_EXTRA_ARGS=(-verbose)
+    echo "detected MPICH hydra -- matching HDF5's own CI recipe (bare -n, no -hosts/-launcher), plus -verbose for diagnostics: ${MPI_EXTRA_ARGS[*]}"
 else
     MPI_EXTRA_ARGS=(-host localhost --oversubscribe)
     echo "detected Open MPI (or unrecognized -- assuming Open MPI-compatible flags) -- using: ${MPI_EXTRA_ARGS[*]}"
