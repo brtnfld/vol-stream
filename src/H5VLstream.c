@@ -2568,6 +2568,36 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
             goto done;
         }
 
+        /* dev-plan.md's residual risks: H5Tdecode2()/H5Sdecode() below lean
+         * on HDF5's own encoding compatibility, which is not guaranteed
+         * across a minor version bump (H5Sencode2() itself widened to
+         * 64-bit selections between 1.10 and 1.12 -- the precedent this
+         * schema's hdf5_version field exists to catch). Compare at
+         * major.minor granularity, ignoring the release/patch digits
+         * (HDF5's versioning policy never changes on-disk/encoding format
+         * in a patch release): a mismatch here is refused with a clear
+         * diagnostic before either decode call runs, rather than risking
+         * whatever H5Tdecode2()/H5Sdecode() do with bytes from an
+         * incompatible encoder. written_ver encodes maj*1e6 + minor*1e3 +
+         * release, the same packing H5VL__stream_build_manifest() (and its
+         * M6.5/M7 siblings) used to write it. */
+        {
+            uint32_t written_ver = vs_Step_hdf5_version(step);
+            unsigned  cur_maj, cur_minor, cur_rel;
+
+            H5get_libversion(&cur_maj, &cur_minor, &cur_rel);
+
+            if (written_ver / 1000u != ((uint32_t)cur_maj * 1000u + (uint32_t)cur_minor)) {
+                fprintf(stderr,
+                        "vol-stream: manifest was written by HDF5 %u.%u.x, this process is running HDF5 "
+                        "%u.%u.%u -- refusing to decode (H5Tdecode2()/H5Sdecode() compatibility is not "
+                        "guaranteed across a minor version change; see docs/dev-plan.md's residual risks)\n",
+                        written_ver / 1000000u, (written_ver / 1000u) % 1000u, cur_maj, cur_minor, cur_rel);
+                ret_value = -1;
+                goto done;
+            }
+        }
+
         /* Schema-recorded, not recomputed from entries: build_manifest()
          * writes it once as the authoritative total (dev-plan.md's Step
          * manifest section), and this is exactly the value the persistence

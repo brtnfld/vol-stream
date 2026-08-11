@@ -468,13 +468,21 @@ writer, subscribing to a subvolume, with no user-written C glue.
 `H5Tencode` and `H5Sencode2` is the right trade, but it couples the wire format to
 them, and `H5Sencode2` already changed once to widen selections to 64-bit. The
 schema records `hdf5_version` from the first commit and CI runs a cross-endian
-encode round-trip, so a future change is *detectable*. **Not yet closed:**
-`hdf5_version` is written at every manifest-build call site but never read back
-or checked anywhere before `H5Sdecode`/`H5Tdecode2` run on it — a genuine
-cross-major-version mismatch (writer on one HDF5 series, reader on another)
-currently risks a crash inside HDF5 core rather than the clear diagnostic this
-paragraph implies. Needs an explicit compatibility check gating those decode
-calls.
+encode round-trip, so a future change is *detectable*. **Update:**
+`H5VL__stream_replay_manifest()` now reads `hdf5_version` back and compares it
+against the running library's own major.minor (ignoring the release/patch
+digit, which HDF5's versioning policy never lets change encoding format) before
+either decode call runs, refusing with a clear `stderr` diagnostic on a
+mismatch rather than risking whatever `H5Tdecode2()`/`H5Sdecode()` do with
+bytes from an incompatible encoder. Verified two ways: the full existing test
+suite (writer and reader always share one build here, so this exercises the
+no-op/compatible path end-to-end) and the comparison arithmetic itself checked
+in isolation against the actual 1.10→1.12 precedent. **Not verified
+end-to-end:** the mismatch-detected branch itself, which needs a second real
+HDF5 build (a different minor series) to trigger for real — not available this
+session; the CI matrix's own "HDF5 version" axis builds the *connector*
+against different HDF5 series one at a time, it does not yet write with one and
+read with another in the same test.
 
 **Manifest metadata is fully re-encoded every step, with no dictionary.**
 `H5VL__stream_build_manifest()` calls `H5Tencode`/`H5Sencode2` (and
