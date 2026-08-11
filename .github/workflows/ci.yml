@@ -99,9 +99,120 @@ jobs:
           if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
+  # M4: Mercury transport, Margo progress, deferred I/O.
+  # M5: SSG rendezvous and late joiners.
+  #
+  # mercury, argobots, mochi-margo and mochi-ssg are not Ubuntu packages, so
+  # build them from source -- the exact versions and configure flags verified
+  # locally: argobots 1.2, mercury 2.3.1 (+sm +ofi), mochi-margo 0.17.0,
+  # mochi-ssg 0.5.4 (--disable-mpi --disable-pmix -- this connector never
+  # co-launches writer and reader under one MPI job, so neither is needed).
+  # CMAKE_POLICY_VERSION_MINIMUM=3.5 works around mercury's and flatcc's
+  # cmake_minimum_required() predating what CMake 4 accepts -- the same
+  # env-var escape hatch ../CMakeLists.txt uses for the vendored flatcc build.
+  #
+  # Only na+sm is exercised here (shared memory, needs no network setup);
+  # ofi+tcp is part of the CI matrix table in dev-plan.md but not yet wired
+  # up here.
+  # ---------------------------------------------------------------------------
+  m4-m5-transport:
+    name: M4/M5 transport and rendezvous (na+sm)
+    runs-on: ubuntu-latest
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build zlib1g-dev \
+            libfabric-dev libjson-c-dev libboost-dev pkg-config autoconf automake libtool
+
+      - name: Build HDF5 develop
+        run: |
+          git clone --depth 1 --branch develop \
+            https://github.com/HDFGroup/hdf5.git hdf5-src
+          cmake -S hdf5-src -B hdf5-build -G Ninja \
+            -DCMAKE_INSTALL_PREFIX=$PWD/hdf5-install \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DHDF5_BUILD_TOOLS=ON \
+            -DHDF5_BUILD_EXAMPLES=OFF \
+            -DHDF5_BUILD_FORTRAN=OFF \
+            -DHDF5_BUILD_CPP_LIB=OFF
+          cmake --build hdf5-build --parallel
+          cmake --install hdf5-build
+
+      - name: Build argobots 1.2
+        run: |
+          curl -sSL https://github.com/pmodels/argobots/releases/download/v1.2/argobots-1.2.tar.gz | tar xz
+          cd argobots-1.2
+          ./configure --prefix=$HOME/mochi-install
+          make -j"$(nproc)" && make install
+
+      - name: Build mercury 2.3.1
+        run: |
+          curl -sSL https://github.com/mercury-hpc/mercury/releases/download/v2.3.1/mercury-2.3.1.tar.bz2 | tar xj
+          cmake -S mercury-2.3.1 -B mercury-build -G Ninja \
+            -DCMAKE_INSTALL_PREFIX=$HOME/mochi-install \
+            -DCMAKE_PREFIX_PATH=$HOME/mochi-install \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DNA_USE_SM=ON \
+            -DNA_USE_OFI=ON \
+            -DMERCURY_USE_BOOST_PP=ON
+          cmake --build mercury-build --parallel
+          cmake --install mercury-build
+
+      - name: Build mochi-margo 0.17.0
+        run: |
+          curl -sSL https://github.com/mochi-hpc/mochi-margo/archive/v0.17.0.tar.gz | tar xz
+          cd mochi-margo-0.17.0
+          ./prepare.sh
+          PKG_CONFIG_PATH=$HOME/mochi-install/lib/pkgconfig:$HOME/mochi-install/lib64/pkgconfig:$PKG_CONFIG_PATH \
+            ./configure --prefix=$HOME/mochi-install
+          make -j"$(nproc)" && make install
+
+      - name: Build mochi-ssg 0.5.4
+        run: |
+          curl -sSL https://github.com/mochi-hpc/mochi-ssg/archive/refs/tags/v0.5.4.tar.gz | tar xz
+          cd mochi-ssg-0.5.4
+          ./prepare.sh
+          PKG_CONFIG_PATH=$HOME/mochi-install/lib/pkgconfig:$HOME/mochi-install/lib64/pkgconfig:$PKG_CONFIG_PATH \
+            ./configure --prefix=$HOME/mochi-install --disable-mpi --disable-pmix
+          make -j"$(nproc)" && make install
+
+      - name: Build vol-stream with the transport
+        run: |
+          export PKG_CONFIG_PATH=$HOME/mochi-install/lib/pkgconfig:$HOME/mochi-install/lib64/pkgconfig:$PKG_CONFIG_PATH
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_PREFIX_PATH="$PWD/hdf5-install;$HOME/mochi-install" \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DVOL_STREAM_ENABLE_MERCURY=ON \
+            -DVOL_STREAM_H5DIFF=$PWD/hdf5-install/bin/h5diff
+          cmake --build build --parallel
+
+      - name: Test (Mercury round trip and SSG rendezvous, each as two processes)
+        run: |
+          LD_LIBRARY_PATH=$HOME/mochi-install/lib:$HOME/mochi-install/lib64:$LD_LIBRARY_PATH \
+            ctest --test-dir build --output-on-failure
+
+  # ---------------------------------------------------------------------------
   # Sanitizers. A background progress thread plus a step queue is the classic
   # place for races, so TSan is in the matrix before the queue exists rather
   # than after it misbehaves.
+  #
+  # Deliberately does not build with VOL_STREAM_ENABLE_MERCURY (Mercury is not
+  # installed in this job, so CMakeLists.txt's AUTO detection leaves it off
+  # regardless): Argobots' ucontext-based user-level threading has no TSan
+  # fiber-switch annotations, so the moment it actually spins up an execution
+  # stream, ThreadSanitizer segfaults trying to track a stack switch it
+  # doesn't understand -- a tooling incompatibility, not a vol-stream race.
+  # Confirmed locally: t_deferred (M4's other new code path, no Argobots
+  # involved) passes clean under TSan; only t_transport/t_rendezvous crash,
+  # and only under thread. The m4-m5-transport job above exercises the
+  # transport instead, without sanitizers.
   # ---------------------------------------------------------------------------
   sanitizers:
     name: ${{ matrix.san }}

@@ -53,6 +53,15 @@
 #include "vol_stream_builder.h"
 #include "vol_stream_verifier.h"
 
+/* M4: the Mercury/Margo transport. Optional -- see CMakeLists.txt's
+ * VOL_STREAM_ENABLE_MERCURY. Without it, begin_step/end_step/file_create/
+ * file_open behave exactly as in M2/M3: no step_ready notification, no
+ * address sidecar file. */
+#ifdef VOL_STREAM_HAVE_MERCURY
+#include "tr_mercury.h"
+#include <unistd.h> /* usleep() -- bounded retry waiting for a writer's address sidecar file */
+#endif
+
 /* Pin the VOL class struct version.
  *
  * The connector compiles H5VL_VERSION into its class struct, and a library
@@ -126,6 +135,33 @@ typedef struct H5VL_stream_path_steps_t {
     size_t    cap_steps;
 } H5VL_stream_path_steps_t;
 
+/* One H5VL_stream_request_notify() registration still waiting on a step's
+ * completion cell to resolve -- a singly linked list since there is no
+ * bound on how many deferred requests from the same step get a callback
+ * registered before end_step() runs. */
+typedef struct H5VL_stream_step_notify_t {
+    H5VL_request_notify_t              cb;
+    void                               *ctx;
+    struct H5VL_stream_step_notify_t   *next;
+} H5VL_stream_step_notify_t;
+
+/* M4: the fate every deferred write/attr-write request issued during one
+ * step shares. A step is the unit of atomicity (dev-plan.md's state-machine
+ * table: "COMMITTING: Barrier over this step's requests"), so request
+ * objects do not track completion per entry -- they share one refcounted
+ * cell, created when a step opens and resolved by end_step() once replay
+ * finishes (or fails). status: 0 = pending, 1 = succeeded, -1 = failed.
+ * notify_list is drained (each callback invoked) by end_step() at the same
+ * point status is resolved; any left over when the cell is freed (an
+ * unclosed step at file_close(), see H5VL__stream_file_state_decref()) are
+ * freed without being invoked -- correct, since that step never committed
+ * and never will. */
+typedef struct H5VL_stream_step_completion_t {
+    unsigned                    refcount;
+    int                         status;
+    H5VL_stream_step_notify_t  *notify_list;
+} H5VL_stream_step_completion_t;
+
 /* Step state and the pending-entry buffer for one open file. Refcounted: the
  * file's own wrapper and every dataset/attribute/group/datatype wrapper
  * opened under it borrow this pointer, so it outlives the file wrapper if a
@@ -141,6 +177,18 @@ struct H5VL_stream_file_state_t {
     H5VL_stream_pending_entry_t *pending;        /* growable array */
     size_t                       n_pending;
     size_t                       cap_pending;
+
+    /* M4: the open step's shared completion cell (NULL outside IN_STEP/
+     * COMMITTING), and the transport used to announce a committed step to
+     * attached readers. transport is NULL unless the file was opened with
+     * the connector's transport enabled (see H5VL__stream_transport_env());
+     * a NULL transport makes end_step()'s notification a no-op, so this is
+     * fully backward compatible with M0-M3 byte-identity/replay-invariant
+     * behavior. */
+    H5VL_stream_step_completion_t *current_completion;
+#ifdef VOL_STREAM_HAVE_MERCURY
+    vs_tr_t *transport;
+#endif
 
     /* M3: reader state. under_object/under_vol_id (on H5VL_stream_t) belong
      * to whatever object a given wrapper wraps; file_under_object/
@@ -175,12 +223,17 @@ struct H5VL_stream_file_state_t {
  * is 0, the calloc() default, so every object not explicitly made something
  * else is correctly LIVE. */
 typedef enum H5VL_stream_obj_state_t {
-    H5VL_STREAM_OBJ_LIVE           = 0,
-    H5VL_STREAM_OBJ_PLACEHOLDER    = 1,
-    H5VL_STREAM_OBJ_READER_VIRTUAL = 2 /* M3: reader-mode group wrapper -- path/
-                                         * file_state bookkeeping only, no single
-                                         * underlying object exists. See
-                                         * H5VL_stream_group_open(). */
+    H5VL_STREAM_OBJ_LIVE               = 0,
+    H5VL_STREAM_OBJ_PLACEHOLDER        = 1,
+    H5VL_STREAM_OBJ_READER_VIRTUAL     = 2, /* M3: reader-mode group wrapper -- path/
+                                              * file_state bookkeeping only, no single
+                                              * underlying object exists. See
+                                              * H5VL_stream_group_open(). */
+    H5VL_STREAM_OBJ_DEFERRED_REQUEST   = 3  /* M4: a request object returned by a
+                                              * dataset/attribute write captured
+                                              * into the current step. Carries no
+                                              * under_object of its own -- see
+                                              * deferred_completion below. */
 } H5VL_stream_obj_state_t;
 
 /* The pass through VOL info object */
@@ -200,6 +253,11 @@ struct H5VL_stream_t {
     H5VL_stream_obj_state_t   obj_state;
     size_t                    pending_index; /* valid only when obj_state ==
                                                * H5VL_STREAM_OBJ_PLACEHOLDER */
+    H5VL_stream_step_completion_t *deferred_completion; /* valid only when obj_state ==
+                                                           * H5VL_STREAM_OBJ_DEFERRED_REQUEST;
+                                                           * a reference this request object
+                                                           * owns, dropped in request_free()/
+                                                           * on resolution. */
 } /* H5VL_stream_t -- see forward-declared typedef above */;
 
 /* The pass through VOL wrapper context */
@@ -241,6 +299,19 @@ static void  *H5VL__stream_reader_open_dataset(H5VL_stream_t *o, const char *nam
                              hid_t dxpl_id, void **req);
 static void  *H5VL__stream_reader_open_attr(H5VL_stream_t *o, const char *name, hid_t aapl_id,
                              hid_t dxpl_id, void **req);
+
+/* M4: deferred-request and transport helpers */
+static H5VL_stream_step_completion_t *H5VL__stream_step_completion_new(void);
+static void H5VL__stream_step_completion_incref(H5VL_stream_step_completion_t *c);
+static void H5VL__stream_step_completion_decref(H5VL_stream_step_completion_t *c);
+static herr_t H5VL__stream_make_deferred_request(H5VL_stream_file_state_t *fs, void **req);
+static void H5VL__stream_deferred_request_free(H5VL_stream_t *r);
+#ifdef VOL_STREAM_HAVE_MERCURY
+static const char *H5VL__stream_transport_na(void);
+static char *H5VL__stream_vsaddr_path(const char *filename);
+static void H5VL__stream_transport_start_writer(H5VL_stream_file_state_t *fs, const char *name);
+static void H5VL__stream_transport_start_reader(H5VL_stream_file_state_t *fs, const char *name);
+#endif
 
 /* "Management" callbacks */
 static herr_t H5VL_stream_init(hid_t vipl_id);
@@ -415,6 +486,7 @@ static int H5VL_stream_op_step_status        = -1;
 static int H5VL_stream_op_subscribe          = -1;
 static int H5VL_stream_op_begin_logical_step = -1;
 static int H5VL_stream_op_get_logical_steps  = -1;
+static int H5VL_stream_op_wait_step_ready    = -1;
 
 /* Argument structs for the step operations. */
 typedef struct H5VL_stream_args_begin_step_t {
@@ -443,6 +515,13 @@ typedef struct H5VL_stream_args_get_logical_steps_t {
     size_t   *n_logical;   /* INOUT, two-call size-then-fill idiom */
     uint64_t *logical_ids; /* OUT; NULL on the size-query call */
 } H5VL_stream_args_get_logical_steps_t;
+
+/* M4 */
+typedef struct H5VL_stream_args_wait_step_ready_t {
+    uint64_t  timeout_ms;
+    uint64_t *physical_step; /* OUT */
+    uint64_t *wall_time_ns;  /* OUT; NULL if not wanted */
+} H5VL_stream_args_wait_step_ready_t;
 
 /*-------------------------------------------------------------------------
  * Default connector info.
@@ -780,8 +859,266 @@ H5VL__stream_file_state_decref(H5VL_stream_file_state_t *fs)
     }
     free(fs->path_index);
 
+    /* M4: an unclosed step at file_close() leaves current_completion set --
+     * same "no partial-step state worth preserving" reasoning as an unclosed
+     * step's pending buffer above. Any request object still holding a
+     * reference keeps the cell alive (it stays pending forever, which is
+     * correct: the step it belonged to was never committed) until that
+     * request is freed too. */
+    if (fs->current_completion)
+        H5VL__stream_step_completion_decref(fs->current_completion);
+
+#ifdef VOL_STREAM_HAVE_MERCURY
+    if (fs->transport)
+        vs_tr_stop(fs->transport);
+#endif
+
     free(fs);
 } /* end H5VL__stream_file_state_decref() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_step_completion_new/incref/decref
+ *
+ * Purpose:     The M4 deferred-request completion cell -- see its typedef's
+ *              comment. _new() starts refcount at 1 (the caller's own
+ *              reference, typically file_state->current_completion);
+ *              request_wait/notify/cancel/free on a request created by
+ *              H5VL__stream_make_deferred_request() drop the reference they
+ *              took when the request was made available to the application.
+ *-------------------------------------------------------------------------
+ */
+static H5VL_stream_step_completion_t *
+H5VL__stream_step_completion_new(void)
+{
+    H5VL_stream_step_completion_t *c;
+
+    if (NULL == (c = (H5VL_stream_step_completion_t *)malloc(sizeof(*c))))
+        return NULL;
+    c->refcount    = 1;
+    c->status      = 0;
+    c->notify_list = NULL;
+    return c;
+} /* end H5VL__stream_step_completion_new() */
+
+static void
+H5VL__stream_step_completion_incref(H5VL_stream_step_completion_t *c)
+{
+    c->refcount++;
+} /* end H5VL__stream_step_completion_incref() */
+
+static void
+H5VL__stream_step_completion_decref(H5VL_stream_step_completion_t *c)
+{
+    if (--c->refcount == 0) {
+        H5VL_stream_step_notify_t *n = c->notify_list;
+
+        while (n) {
+            H5VL_stream_step_notify_t *next = n->next;
+
+            free(n);
+            n = next;
+        }
+        free(c);
+    }
+} /* end H5VL__stream_step_completion_decref() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_make_deferred_request
+ *
+ * Purpose:     Populate *req with a request object for a dataset/attribute
+ *              write just captured into fs's pending buffer. Lazily creates
+ *              fs->current_completion if this is the first deferred request
+ *              of the open step (begin_step() does not allocate one
+ *              up front, since most steps never have req != NULL -- ordinary
+ *              H5Dwrite()/H5Awrite() pass req == NULL).
+ *
+ *              Does nothing when req is NULL, which is the common case and
+ *              not an error: a connector may always complete an operation
+ *              synchronously and report no request, and the payload is
+ *              already safely copied into the pending entry by the time this
+ *              is called either way. What the returned request tracks is
+ *              durability -- whether end_step()'s replay has landed this
+ *              entry in the underlying file -- not buffer safety.
+ *
+ * Return:      Success:    0 (including the req == NULL no-op case)
+ *              Failure:    -1
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_make_deferred_request(H5VL_stream_file_state_t *fs, void **req)
+{
+    H5VL_stream_t *r;
+
+    if (!req)
+        return 0;
+
+    if (!fs->current_completion && NULL == (fs->current_completion = H5VL__stream_step_completion_new()))
+        return -1;
+
+    if (NULL == (r = (H5VL_stream_t *)calloc(1, sizeof(*r))))
+        return -1;
+
+    H5VL__stream_step_completion_incref(fs->current_completion);
+    r->obj_state           = H5VL_STREAM_OBJ_DEFERRED_REQUEST;
+    r->deferred_completion = fs->current_completion;
+    /* under_vol_id/under_object are deliberately left at their calloc()
+     * default (0/NULL): this object is never passed to H5VLrequest_*() on
+     * an underlying connector, only handled directly by obj_state ==
+     * H5VL_STREAM_OBJ_DEFERRED_REQUEST branches below, and it must NOT be
+     * freed via H5VL_stream_free_obj() -- that calls H5Idec_ref() on
+     * under_vol_id, which we never incremented. See
+     * H5VL__stream_deferred_request_free(). */
+
+    *req = r;
+    return 0;
+} /* end H5VL__stream_make_deferred_request() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_deferred_request_free
+ *
+ * Purpose:     Release a request object made by
+ *              H5VL__stream_make_deferred_request() -- drops its reference
+ *              on the shared completion cell, freeing it if this was the
+ *              last one. Deliberately not H5VL_stream_free_obj(): that
+ *              function calls H5Idec_ref() on under_vol_id, a reference this
+ *              request object never took.
+ *-------------------------------------------------------------------------
+ */
+static void
+H5VL__stream_deferred_request_free(H5VL_stream_t *r)
+{
+    H5VL__stream_step_completion_decref(r->deferred_completion);
+    free(r);
+} /* end H5VL__stream_deferred_request_free() */
+
+#ifdef VOL_STREAM_HAVE_MERCURY
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_transport_na
+ *
+ * Purpose:     The Mercury NA plugin string to start the transport with, or
+ *              NULL if the transport is not requested for this process.
+ *              VOL_STREAM_NA opts in explicitly (default: unset, transport
+ *              off) rather than a connector-info flag, so M0-M3's info
+ *              struct (and its info_to_str/str_to_info/info_copy/info_cmp
+ *              callbacks) need no change -- see docs/dev-plan.md's M4
+ *              section on this choice.
+ *-------------------------------------------------------------------------
+ */
+static const char *
+H5VL__stream_transport_na(void)
+{
+    return getenv("VOL_STREAM_NA");
+} /* end H5VL__stream_transport_na() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_ssg_group_path
+ *
+ * Purpose:     Path of the sidecar file a writer stores its SSG group id
+ *              to (via vs_tr_writer_start_group()), and a reader loads it
+ *              from (via vs_tr_reader_join_group()): "<filename>.vsgroup".
+ *              Caller frees the returned string.
+ *-------------------------------------------------------------------------
+ */
+static char *
+H5VL__stream_ssg_group_path(const char *filename)
+{
+    char  *path;
+    size_t len = strlen(filename) + strlen(".vsgroup") + 1;
+
+    if (NULL == (path = (char *)malloc(len)))
+        return NULL;
+    snprintf(path, len, "%s.vsgroup", filename);
+    return path;
+} /* end H5VL__stream_ssg_group_path() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_transport_start_writer
+ *
+ * Purpose:     If VOL_STREAM_NA is set, start the transport for a writer:
+ *              start Margo, create this process's single-member SSG group,
+ *              and store its id to name's sidecar file so a reader can join
+ *              it. Not an error for VOL_STREAM_NA to be unset (fs->transport
+ *              stays NULL, matching M0-M3 exactly) or for Margo/SSG/the
+ *              sidecar write to fail -- a writer proceeding with no readers
+ *              listening is exactly the M5 exit gate this is building
+ *              toward, so a transport that never comes up must not fail
+ *              file_create()/file_open().
+ *
+ *              Flushes the underlying file before publishing the sidecar:
+ *              a reader that opens the moment the sidecar appears must see
+ *              a durable superblock, not race H5Fcreate()'s own buffered
+ *              writes -- "file signature not found" otherwise.
+ *-------------------------------------------------------------------------
+ */
+static void
+H5VL__stream_transport_start_writer(H5VL_stream_file_state_t *fs, const char *name)
+{
+    const char *na_str = H5VL__stream_transport_na();
+    char       *group_file;
+
+    if (!na_str)
+        return;
+    if (NULL == (fs->transport = vs_tr_start(na_str)))
+        return;
+
+    {
+        H5VL_file_specific_args_t flush_args;
+
+        flush_args.op_type            = H5VL_FILE_FLUSH;
+        flush_args.args.flush.obj_type = H5I_FILE;
+        flush_args.args.flush.scope    = H5F_SCOPE_GLOBAL;
+        H5VLfile_specific(fs->file_under_object, fs->file_under_vol_id, &flush_args,
+                           H5P_DATASET_XFER_DEFAULT, NULL);
+    }
+
+    if (NULL != (group_file = H5VL__stream_ssg_group_path(name))) {
+        vs_tr_writer_start_group(fs->transport, group_file);
+        free(group_file);
+    }
+} /* end H5VL__stream_transport_start_writer() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_transport_start_reader
+ *
+ * Purpose:     If VOL_STREAM_NA is set, start the transport for a reader:
+ *              start Margo, then look for name's SSG group-id sidecar file
+ *              and join the group there. The writer may not have created it
+ *              yet (file_open() racing file_create() across two processes
+ *              is the whole point of M4's exit gate), so this retries for
+ *              up to 5 seconds rather than failing on the first miss --
+ *              still bounded, so a writer that never shows up does not hang
+ *              file_open() forever. Joining the group is what gives this
+ *              reader a "coherent view" as of whatever step the writer has
+ *              already committed -- see vs_tr_reader_join_group()'s comment.
+ *-------------------------------------------------------------------------
+ */
+static void
+H5VL__stream_transport_start_reader(H5VL_stream_file_state_t *fs, const char *name)
+{
+    const char *na_str = H5VL__stream_transport_na();
+    char       *group_file;
+    int         attempt;
+
+    if (!na_str)
+        return;
+    if (NULL == (fs->transport = vs_tr_start(na_str)))
+        return;
+    if (NULL == (group_file = H5VL__stream_ssg_group_path(name)))
+        return;
+
+    for (attempt = 0; attempt < 50; attempt++) {
+        FILE *f = fopen(group_file, "r");
+
+        if (f) {
+            fclose(f);
+            vs_tr_reader_join_group(fs->transport, group_file);
+            break;
+        }
+        usleep(100000); /* 100ms */
+    }
+    free(group_file);
+} /* end H5VL__stream_transport_start_reader() */
+#endif /* VOL_STREAM_HAVE_MERCURY */
 
 /*-------------------------------------------------------------------------
  * Function:    H5VL__stream_child_path
@@ -2216,6 +2553,9 @@ H5VL_stream_init(hid_t vipl_id)
     if (H5VLregister_opt_operation(H5VL_SUBCLS_FILE, H5VL_STREAM_OP_GET_LOGICAL_STEPS,
                                     &H5VL_stream_op_get_logical_steps) < 0)
         return -1;
+    if (H5VLregister_opt_operation(H5VL_SUBCLS_FILE, H5VL_STREAM_OP_WAIT_STEP_READY,
+                                    &H5VL_stream_op_wait_step_ready) < 0)
+        return -1;
 
     return 0;
 } /* end H5VL_stream_init() */
@@ -2510,6 +2850,21 @@ H5VL_stream_get_wrap_ctx(const void *obj, void **wrap_ctx)
     /* Allocate new VOL object wrapping context for the pass through connector */
     new_wrap_ctx = (H5VL_stream_wrap_ctx_t *)calloc(1, sizeof(H5VL_stream_wrap_ctx_t));
 
+    /* M4: a deferred write/attr-write request has no under_object/
+     * under_vol_id (deliberately -- see H5VL__stream_make_deferred_request()'s
+     * comment). H5VL_set_vol_wrapper() calls get_wrap_ctx() on every object
+     * core VOL dispatch touches, including a request handed to H5ESwait(),
+     * so this needs a defined answer rather than an invalid-ID error from
+     * incref'ing under_vol_id == 0. Return an empty context instead (both
+     * fields left at their calloc() default): nothing legal to do with a
+     * deferred request ever calls wrap_object() on it, so it is never
+     * actually used -- it only needs to exist and free cleanly, which
+     * H5VL_stream_free_wrap_ctx()'s under_vol_id > 0 guard arranges. */
+    if (o->obj_state == H5VL_STREAM_OBJ_DEFERRED_REQUEST) {
+        *wrap_ctx = new_wrap_ctx;
+        return 0;
+    }
+
     /* Increment reference count on underlying VOL ID, and copy the VOL info */
     new_wrap_ctx->under_vol_id = o->under_vol_id;
 
@@ -2609,10 +2964,15 @@ H5VL_stream_free_wrap_ctx(void *_wrap_ctx)
 
     err_id = H5Eget_current_stack();
 
-    /* Release underlying VOL ID and wrap context */
+    /* Release underlying VOL ID and wrap context. under_vol_id stays 0 (its
+     * calloc() default, never a real registered ID) only for the empty
+     * context H5VL_stream_get_wrap_ctx() returns for a deferred write/
+     * attr-write request (see that function's M4 comment) -- skip the
+     * matching decref there, since no incref was ever taken for it. */
     if (wrap_ctx->under_wrap_ctx)
         H5VLfree_wrap_ctx(wrap_ctx->under_wrap_ctx, wrap_ctx->under_vol_id);
-    H5Idec_ref(wrap_ctx->under_vol_id);
+    if (wrap_ctx->under_vol_id > 0)
+        H5Idec_ref(wrap_ctx->under_vol_id);
 
     H5Eset_current_stack(err_id);
 
@@ -2839,6 +3199,11 @@ H5VL_stream_attr_write(void *attr, hid_t mem_type_id, const void *buf, hid_t dxp
             memcpy(e->payload, buf, nbytes);
             e->payload_len = nbytes;
         }
+
+        /* M4: same durability-tracking request as the dataset-write deferred
+         * path above -- see H5VL__stream_make_deferred_request()'s comment. */
+        if (H5VL__stream_make_deferred_request(o->file_state, req) < 0)
+            return -1;
 
         return 0;
     }
@@ -3296,6 +3661,14 @@ H5VL_stream_dataset_write(size_t count, void *dset[], hid_t mem_type_id[], hid_t
                 return -1;
             }
         }
+
+        /* M4: the buffer is already safely copied above; what a caller that
+         * passed a non-NULL req is waiting on is durability -- end_step()'s
+         * replay landing this batch in the underlying file. One request
+         * covers the whole batch, matching count == 1 request per H5VL
+         * dataset-write call regardless of how many datasets it targets. */
+        if (H5VL__stream_make_deferred_request(((H5VL_stream_t *)dset[0])->file_state, req) < 0)
+            return -1;
 
         return 0;
     }
@@ -3767,6 +4140,9 @@ H5VL_stream_file_create(const char *name, unsigned flags, hid_t fcpl_id, hid_t f
             file->path                             = strdup("");
             file->file_state->file_under_object   = under;
             file->file_state->file_under_vol_id   = info->under_vol_id;
+#ifdef VOL_STREAM_HAVE_MERCURY
+            H5VL__stream_transport_start_writer(file->file_state, name);
+#endif
         }
 
         /* Check for async request */
@@ -3836,6 +4212,12 @@ H5VL_stream_file_open(const char *name, unsigned flags, hid_t fapl_id, hid_t dxp
             file->file_state->file_under_object = under;
             file->file_state->file_under_vol_id = info->under_vol_id;
             file->file_state->is_reader         = ((flags & H5F_ACC_RDWR) == 0) ? 1 : 0;
+#ifdef VOL_STREAM_HAVE_MERCURY
+            if (file->file_state->is_reader)
+                H5VL__stream_transport_start_reader(file->file_state, name);
+            else
+                H5VL__stream_transport_start_writer(file->file_state, name);
+#endif
         }
 
         /* Check for async request */
@@ -4067,7 +4449,8 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
         return 0;
     }
     else if (args->op_type == H5VL_stream_op_end_step) {
-        herr_t replay_ret;
+        herr_t   replay_ret;
+        uint64_t committed_step, committed_wall_time_ns;
 
         if (!o->file_state || o->file_state->step_state != H5F_STEP_IN_STEP)
             return -1;
@@ -4085,13 +4468,55 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
         o->file_state->logical_ids = NULL;
         o->file_state->n_logical   = 0;
 
+        /* M4: resolve this step's deferred-request completion cell (see
+         * H5VL_stream_step_completion_t's comment), invoke and drain any
+         * notify() callbacks queued on it, and drop file_state's own
+         * reference -- any request object the application is still holding
+         * onto keeps the cell alive until it waits/frees it. A fresh cell is
+         * created lazily by the next step's first deferred write. */
+        if (o->file_state->current_completion) {
+            H5VL_stream_step_completion_t *c = o->file_state->current_completion;
+            H5VL_stream_step_notify_t     *n;
+
+            c->status = (replay_ret < 0) ? -1 : 1;
+
+            n              = c->notify_list;
+            c->notify_list = NULL;
+            while (n) {
+                H5VL_stream_step_notify_t *next = n->next;
+
+                n->cb(n->ctx, (c->status > 0) ? H5VL_REQUEST_STATUS_SUCCEED : H5VL_REQUEST_STATUS_FAIL);
+                free(n);
+                n = next;
+            }
+
+            H5VL__stream_step_completion_decref(c);
+            o->file_state->current_completion = NULL;
+        }
+
         if (replay_ret < 0) {
             o->file_state->step_state = H5F_STEP_NOT_IN_STEP;
             return -1;
         }
 
+        committed_step          = o->file_state->physical_step;
+        committed_wall_time_ns  = o->file_state->wall_time_ns;
+
         o->file_state->physical_step++;
         o->file_state->step_state = H5F_STEP_NOT_IN_STEP;
+
+#ifdef VOL_STREAM_HAVE_MERCURY
+        /* Best-effort: a stalled or absent reader must not fail (or stall)
+         * the writer's end_step(). Data is already durable in the file at
+         * this point regardless of whether any reader is listening. */
+        if (o->file_state->transport)
+            vs_tr_writer_broadcast_step_ready(o->file_state->transport, committed_step,
+                                               committed_wall_time_ns);
+#else
+        (void)committed_step;
+        (void)committed_wall_time_ns;
+#endif
+
         return 0;
     }
     else if (args->op_type == H5VL_stream_op_step_status) {
@@ -4163,6 +4588,20 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
             *sargs->n_logical = o->file_state->n_logical_map;
         }
         return 0;
+    }
+    else if (args->op_type == H5VL_stream_op_wait_step_ready) {
+#ifdef VOL_STREAM_HAVE_MERCURY
+        H5VL_stream_args_wait_step_ready_t *sargs = (H5VL_stream_args_wait_step_ready_t *)args->args;
+
+        if (!sargs || !sargs->physical_step || !o->file_state || !o->file_state->is_reader ||
+            !o->file_state->transport)
+            return -1;
+
+        return (herr_t)vs_tr_reader_wait_step_ready(o->file_state->transport, sargs->timeout_ms,
+                                                     sargs->physical_step, sargs->wall_time_ns);
+#else
+        return -1;
+#endif
     }
 
     ret_value = H5VLfile_optional(o->under_object, o->under_vol_id, args, dxpl_id, req);
@@ -5033,6 +5472,15 @@ H5VL_stream_introspect_opt_query(void *obj, H5VL_subclass_t cls, int opt_type, u
         *flags = H5VL_OPT_QUERY_SUPPORTED | H5VL_OPT_QUERY_QUERY_METADATA;
         return 0;
     }
+    else if (cls == H5VL_SUBCLS_FILE && opt_type == H5VL_stream_op_wait_step_ready) {
+        /* Registered either way (so H5VLquery_optional() always resolves the
+         * op string), but only meaningfully usable when the connector was
+         * built with Mercury and the file's transport came up -- the
+         * file_optional() handler above is what actually enforces that,
+         * returning -1 rather than blocking forever when it is not. */
+        *flags = H5VL_OPT_QUERY_SUPPORTED | H5VL_OPT_QUERY_QUERY_METADATA;
+        return 0;
+    }
 
     ret_value = H5VLintrospect_opt_query(o->under_object, o->under_vol_id, cls, opt_type, flags);
 
@@ -5044,8 +5492,14 @@ H5VL_stream_introspect_opt_query(void *obj, H5VL_subclass_t cls, int opt_type, u
  *
  * Purpose:     Wait (with a timeout) for an async operation to complete
  *
- * Note:        Releases the request if the operation has completed and the
- *              connector callback succeeds
+ * Note:        Does NOT release the request on completion. H5ES's own
+ *              H5ES__event_free() unconditionally calls the connector's
+ *              request_free() on every completed event regardless of what
+ *              wait() reported, via H5ES__event_completed() ->
+ *              H5ES__event_free() -> H5VL_request_free() in the same
+ *              H5ESwait() call. A version of this function that freed the
+ *              request as soon as *status left IN_PROGRESS double-freed it
+ *              here. free() is the sole place a request is released.
  *
  * Return:      Success:    0
  *              Failure:    -1
@@ -5062,10 +5516,23 @@ H5VL_stream_request_wait(void *obj, uint64_t timeout, H5VL_request_status_t *sta
     printf("------- VOL-STREAM REQUEST Wait\n");
 #endif
 
-    ret_value = H5VLrequest_wait(o->under_object, o->under_vol_id, timeout, status);
+    /* M4: a deferred write/attr-write request -- see
+     * H5VL_stream_step_completion_t's comment. There is no background
+     * progress to wait on: resolution only happens inside end_step(), called
+     * explicitly by the application, so this is a non-blocking status check
+     * regardless of timeout, exactly like the under-connector case above
+     * when the underlying operation already finished. */
+    if (o->obj_state == H5VL_STREAM_OBJ_DEFERRED_REQUEST) {
+        (void)timeout;
+        if (o->deferred_completion->status == 0)
+            *status = H5VL_REQUEST_STATUS_IN_PROGRESS;
+        else
+            *status = (o->deferred_completion->status > 0) ? H5VL_REQUEST_STATUS_SUCCEED
+                                                             : H5VL_REQUEST_STATUS_FAIL;
+        return 0;
+    }
 
-    if (ret_value >= 0 && *status != H5VL_REQUEST_STATUS_IN_PROGRESS)
-        H5VL_stream_free_obj(o);
+    ret_value = H5VLrequest_wait(o->under_object, o->under_vol_id, timeout, status);
 
     return ret_value;
 } /* end H5VL_stream_request_wait() */
@@ -5092,6 +5559,32 @@ H5VL_stream_request_notify(void *obj, H5VL_request_notify_t cb, void *ctx)
 #ifdef ENABLE_STREAM_LOGGING
     printf("------- VOL-STREAM REQUEST Notify\n");
 #endif
+
+    /* M4: a deferred write/attr-write request. If the step already resolved,
+     * invoke cb immediately; otherwise queue it on the completion cell --
+     * end_step() drains and invokes the whole list when it resolves the
+     * cell. Either way this request's own reference is dropped now: the
+     * callback registration, once handed to the cell, no longer needs this
+     * particular request object to survive. */
+    if (o->obj_state == H5VL_STREAM_OBJ_DEFERRED_REQUEST) {
+        H5VL_stream_step_completion_t *c = o->deferred_completion;
+
+        if (c->status == 0) {
+            H5VL_stream_step_notify_t *n = (H5VL_stream_step_notify_t *)malloc(sizeof(*n));
+
+            if (!n)
+                return -1;
+            n->cb   = cb;
+            n->ctx  = ctx;
+            n->next = c->notify_list;
+            c->notify_list = n;
+        }
+        else
+            cb(ctx, (c->status > 0) ? H5VL_REQUEST_STATUS_SUCCEED : H5VL_REQUEST_STATUS_FAIL);
+
+        H5VL__stream_deferred_request_free(o);
+        return 0;
+    }
 
     ret_value = H5VLrequest_notify(o->under_object, o->under_vol_id, cb, ctx);
 
@@ -5123,6 +5616,16 @@ H5VL_stream_request_cancel(void *obj, H5VL_request_status_t *status)
     printf("------- VOL-STREAM REQUEST Cancel\n");
 #endif
 
+    /* M4: the payload is already captured; canceling a deferred write would
+     * mean unwinding it out of the pending buffer, which nothing in M4's
+     * scope needs. Report CANT_CANCEL -- a legal, honest answer -- rather
+     * than pretending to support it. */
+    if (o->obj_state == H5VL_STREAM_OBJ_DEFERRED_REQUEST) {
+        *status = H5VL_REQUEST_STATUS_CANT_CANCEL;
+        H5VL__stream_deferred_request_free(o);
+        return 0;
+    }
+
     ret_value = H5VLrequest_cancel(o->under_object, o->under_vol_id, status);
 
     if (ret_value >= 0)
@@ -5151,6 +5654,11 @@ H5VL_stream_request_specific(void *obj, H5VL_request_specific_args_t *args)
     printf("------- VOL-STREAM REQUEST Specific\n");
 #endif
 
+    /* M4: not supported on a deferred write/attr-write request -- wait(),
+     * notify() and free() cover this request kind's whole surface. */
+    if (o->obj_state == H5VL_STREAM_OBJ_DEFERRED_REQUEST)
+        return -1;
+
     ret_value = H5VLrequest_specific(o->under_object, o->under_vol_id, args);
 
     return ret_value;
@@ -5175,6 +5683,10 @@ H5VL_stream_request_optional(void *obj, H5VL_optional_args_t *args)
 #ifdef ENABLE_STREAM_LOGGING
     printf("------- VOL-STREAM REQUEST Optional\n");
 #endif
+
+    /* M4: not supported on a deferred write/attr-write request. */
+    if (o->obj_state == H5VL_STREAM_OBJ_DEFERRED_REQUEST)
+        return -1;
 
     ret_value = H5VLrequest_optional(o->under_object, o->under_vol_id, args);
 
@@ -5201,6 +5713,14 @@ H5VL_stream_request_free(void *obj)
 #ifdef ENABLE_STREAM_LOGGING
     printf("------- VOL-STREAM REQUEST Free\n");
 #endif
+
+    /* M4: releases this request's reference on the step's completion cell.
+     * The cell itself lives on via file_state's reference (if the step
+     * hasn't ended yet) or any other request still holding it. */
+    if (o->obj_state == H5VL_STREAM_OBJ_DEFERRED_REQUEST) {
+        H5VL__stream_deferred_request_free(o);
+        return 0;
+    }
 
     ret_value = H5VLrequest_free(o->under_object, o->under_vol_id);
 
@@ -5575,3 +6095,18 @@ H5Fsubscribe(hid_t file_id, size_t count, const char *const *paths, const hid_t 
 
     return H5VL__stream_file_op(file_id, H5VL_stream_op_subscribe, &op_args);
 } /* end H5Fsubscribe() */
+
+herr_t
+H5Fwait_step_ready(hid_t file_id, uint64_t timeout_ms, uint64_t *physical_step, uint64_t *wall_time_ns)
+{
+    H5VL_stream_args_wait_step_ready_t op_args;
+
+    if (!physical_step)
+        return -1;
+
+    op_args.timeout_ms    = timeout_ms;
+    op_args.physical_step = physical_step;
+    op_args.wall_time_ns  = wall_time_ns;
+
+    return H5VL__stream_file_op(file_id, H5VL_stream_op_wait_step_ready, &op_args);
+} /* end H5Fwait_step_ready() */

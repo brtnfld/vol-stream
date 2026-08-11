@@ -9,11 +9,19 @@
 #   spack env activate vol-stream
 #   spack install
 #
-# The Mochi packages needed from M4 onward are not all in builtin Spack. Add
-# their namespace first:
+# mercury, argobots and mochi-margo (M4) are builtin Spack packages. ssg (M5)
+# and bake (M7) are not -- add the Mochi namespace first when those land:
 #
 #   git clone https://github.com/mochi-hpc/mochi-spack-packages
-#   spack repo add mochi-spack-packages
+#   spack repo add mochi-spack-packages/spack_repo/mochi
+#
+# As of this writing that repo's package.py files use a newer Spack package
+# API (spack_repo.builtin.build_systems imports) than Spack 0.23 supports --
+# spack info/list on a package from it fails with "cannot unpack
+# non-iterable NoneType object" on that version. If that bites, mochi-ssg
+# builds cleanly from source instead (autotools: ./prepare.sh then
+# ./configure --disable-mpi --disable-pmix against an already-installed
+# margo), which is what .github/workflows/ci.yml's m4-transport job does.
 #
 spack:
   specs:
@@ -32,12 +40,14 @@ spack:
     # -- pinned to the same version for behavioral parity either way.
     - flatcc@0.6.1
 
-    # M4-M5: transport, progress engine, and group membership. Mercury and
-    # Argobots are builtin Spack packages; margo, ssg and bake come from the
-    # Mochi namespace above.
-    # - mercury
-    # - argobots
-    # - mochi-margo
+    # M4: transport and progress engine. na+sm is always built; ofi (libfabric)
+    # covers the ofi+tcp CI leg.
+    - mercury +sm +ofi
+    - argobots
+    - mochi-margo
+
+    # M5: group membership. From the Mochi namespace -- not yet added, and
+    # blocked on this environment by the package-API mismatch noted above.
     # - mochi-ssg
 
     # M7: queue spill to node-local storage.

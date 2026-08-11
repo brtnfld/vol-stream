@@ -115,6 +115,82 @@ else()
   set(FLATCC_INCLUDE_DIR ${flatcc_SOURCE_DIR}/include)
 endif()
 
+# ---------------------------------------------------------------------------
+# Mercury / Argobots / Margo / SSG -- transport, progress engine, and group
+# membership (M4/M5)
+#
+# Optional. A build with none of these installed still produces a fully
+# working connector: M0-M3's file-based capture/replay is untouched, and only
+# the step_ready notification path and SSG-based rendezvous (src/tr_mercury.c)
+# are skipped. Detection is via pkg-config, which all four ship -- borrow by
+# default, per dev-plan.md, rather than a bespoke find module.
+#
+# Data still moves through the replicated /step/<n>/ file at these
+# milestones, not over Mercury; Mercury/Margo carry the control-plane
+# notification that a step committed, and SSG (M5) carries group membership
+# and failure detection so a reader can join, leave, or die without a
+# hand-rolled attach protocol or liveness tracking. See docs/dev-plan.md's
+# M4 and M5 sections.
+# ---------------------------------------------------------------------------
+set(VOL_STREAM_ENABLE_MERCURY "AUTO" CACHE STRING
+  "Build the Mercury/Margo/SSG transport (M4/M5): ON, OFF, or AUTO (default; enable if found)")
+set_property(CACHE VOL_STREAM_ENABLE_MERCURY PROPERTY STRINGS AUTO ON OFF)
+
+set(VOL_STREAM_HAVE_MERCURY FALSE)
+if(NOT VOL_STREAM_ENABLE_MERCURY STREQUAL "OFF")
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(VOL_STREAM_MERCURY QUIET mercury)
+    pkg_check_modules(VOL_STREAM_MARGO QUIET margo)
+    pkg_check_modules(VOL_STREAM_ARGOBOTS QUIET argobots)
+    pkg_check_modules(VOL_STREAM_SSG QUIET ssg)
+  endif()
+
+  if(VOL_STREAM_MERCURY_FOUND AND VOL_STREAM_MARGO_FOUND AND VOL_STREAM_ARGOBOTS_FOUND AND VOL_STREAM_SSG_FOUND)
+    set(VOL_STREAM_HAVE_MERCURY TRUE)
+
+    # pkg_check_modules()'s ordinary (non-static) result variables only
+    # cover each module's own direct Libs -- not the Requires.private/
+    # Libs.private closure (na, mercury_util, mchecksum, libfabric,
+    # json-c, ...). That closure is needed here even though everything is
+    # built shared: this system's linker does not resolve an executable's
+    # undefined symbols by walking a directly-linked shared library's own
+    # NEEDED entries at build time (only the dynamic loader does that,
+    # later, at load time), so vol_stream's own link line has to carry the
+    # full transitive closure. `pkg-config --static` computes exactly that;
+    # FindPkgConfig has no equivalent option in this CMake version, so ask
+    # the pkg-config binary directly -- all four modules in one call, so
+    # pkg-config dedupes/orders the merged graph itself.
+    execute_process(
+      COMMAND ${PKG_CONFIG_EXECUTABLE} --static --libs mercury margo argobots ssg
+      OUTPUT_VARIABLE VOL_STREAM_TRANSPORT_STATIC_LIBS
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      RESULT_VARIABLE VOL_STREAM_TRANSPORT_PKGCONFIG_RC)
+    execute_process(
+      COMMAND ${PKG_CONFIG_EXECUTABLE} --static --cflags mercury margo argobots ssg
+      OUTPUT_VARIABLE VOL_STREAM_TRANSPORT_STATIC_CFLAGS
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+    if(NOT VOL_STREAM_TRANSPORT_PKGCONFIG_RC EQUAL 0)
+      message(FATAL_ERROR "pkg-config --static failed for mercury/margo/argobots/ssg")
+    endif()
+
+    separate_arguments(VOL_STREAM_TRANSPORT_STATIC_LIBS UNIX_COMMAND "${VOL_STREAM_TRANSPORT_STATIC_LIBS}")
+    separate_arguments(VOL_STREAM_TRANSPORT_STATIC_CFLAGS UNIX_COMMAND "${VOL_STREAM_TRANSPORT_STATIC_CFLAGS}")
+  elseif(VOL_STREAM_ENABLE_MERCURY STREQUAL "ON")
+    message(FATAL_ERROR
+      "VOL_STREAM_ENABLE_MERCURY=ON but mercury/margo/argobots/ssg were not all found via pkg-config")
+  endif()
+endif()
+
+if(VOL_STREAM_HAVE_MERCURY)
+  message(STATUS "Mercury transport: enabled (mercury ${VOL_STREAM_MERCURY_VERSION}, "
+                  "margo ${VOL_STREAM_MARGO_VERSION}, argobots ${VOL_STREAM_ARGOBOTS_VERSION}, "
+                  "ssg ${VOL_STREAM_SSG_VERSION})")
+else()
+  message(STATUS "Mercury transport: disabled (set VOL_STREAM_ENABLE_MERCURY=ON to require it)")
+endif()
+
 set(VOL_STREAM_FBS ${CMAKE_CURRENT_SOURCE_DIR}/src/vol_stream.fbs)
 set(VOL_STREAM_FBS_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
 set(VOL_STREAM_FBS_GEN_HDR ${VOL_STREAM_FBS_GEN_DIR}/vol_stream_builder.h)
@@ -128,7 +204,12 @@ add_custom_command(
   VERBATIM)
 add_custom_target(vol_stream_fbs_gen DEPENDS ${VOL_STREAM_FBS_GEN_HDR})
 
-add_library(vol_stream SHARED src/H5VLstream.c)
+set(VOL_STREAM_SOURCES src/H5VLstream.c)
+if(VOL_STREAM_HAVE_MERCURY)
+  list(APPEND VOL_STREAM_SOURCES src/tr_mercury.c)
+endif()
+
+add_library(vol_stream SHARED ${VOL_STREAM_SOURCES})
 add_dependencies(vol_stream vol_stream_fbs_gen)
 
 target_include_directories(vol_stream
@@ -149,6 +230,20 @@ target_link_libraries(vol_stream PRIVATE ${VOL_STREAM_FLATCC_RT_TARGET})
 
 if(MPI_C_FOUND)
   target_link_libraries(vol_stream PUBLIC MPI::MPI_C)
+endif()
+
+if(VOL_STREAM_HAVE_MERCURY)
+  # tr_mercury.c's reader-side wait/notify queue is guarded by a pthread
+  # mutex/condvar, not an Argobots primitive -- see the note at the top of
+  # that file for why.
+  find_package(Threads REQUIRED)
+
+  target_compile_definitions(vol_stream PRIVATE VOL_STREAM_HAVE_MERCURY)
+  # PUBLIC: the full `pkg-config --static` closure (flags and libraries
+  # alike) needs to reach consumers' own link lines too -- see the comment
+  # above where these are computed.
+  target_compile_options(vol_stream PUBLIC ${VOL_STREAM_TRANSPORT_STATIC_CFLAGS})
+  target_link_libraries(vol_stream PUBLIC ${VOL_STREAM_TRANSPORT_STATIC_LIBS} Threads::Threads)
 endif()
 
 if(VOL_STREAM_ENABLE_LOGGING)
@@ -237,9 +332,10 @@ install(TARGETS vol_stream LIBRARY DESTINATION lib)
 install(FILES src/H5VLstream.h DESTINATION include)
 
 message(STATUS "")
-message(STATUS "vol-stream ${VOL_STREAM_VERSION}  (M2 - manifest, capture, and the replay invariant)")
+message(STATUS "vol-stream ${VOL_STREAM_VERSION}  (M5 - SSG rendezvous and late joiners)")
 message(STATUS "  HDF5:            ${HDF5_VERSION}")
 message(STATUS "  flatcc:          ${VOL_STREAM_FLATCC_EXE}")
+message(STATUS "  mercury:         ${VOL_STREAM_HAVE_MERCURY}")
 message(STATUS "  logging:         ${VOL_STREAM_ENABLE_LOGGING}")
 message(STATUS "  tests:           ${VOL_STREAM_BUILD_TESTS}")
 message(STATUS "  h5sign:          ${H5SIGN_EXECUTABLE}")

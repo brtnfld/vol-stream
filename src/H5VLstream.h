@@ -26,6 +26,51 @@
  *              actually has an entry for that path. H5Fbegin_logical_step()/
  *              H5Fget_logical_steps() do the same by logical id instead of
  *              physical step, skipping restart-superseded occurrences.
+ *
+ *              M4 status: two additions, both opt-in and both no-ops unless
+ *              exercised, so M0-M3 behavior (byte-identity, the replay
+ *              invariant, reader resolution) is untouched by default.
+ *
+ *              (1) Deferred write/attr-write requests. A dataset/attribute
+ *              write captured into an open step now returns a real request
+ *              object from H5Dwrite_async()/H5Awrite_async() when the
+ *              caller passes an event set. Its completion tracks
+ *              durability -- whether end_step()'s replay landed the entry
+ *              in the underlying file -- not buffer safety, which was
+ *              already guaranteed the moment the call returned (see
+ *              H5VL__stream_make_deferred_request()'s comment in
+ *              src/H5VLstream.c). All deferred requests from one step share
+ *              a single completion cell and resolve together when that step
+ *              commits, matching the step's own atomicity.
+ *
+ *              (2) The Mercury/Margo transport (src/tr_mercury.c), built
+ *              only when VOL_STREAM_ENABLE_MERCURY finds mercury, argobots,
+ *              mochi-margo and mochi-ssg (see CMakeLists.txt). Set the
+ *              VOL_STREAM_NA environment variable (e.g. "na+sm", "ofi+tcp")
+ *              to opt a file_create()/file_open() into it: a writer pushes
+ *              a step_ready notification to every current group member
+ *              (see M5, next) after each successful end_step(); a reader
+ *              can call the new H5Fwait_step_ready() to block for the next
+ *              one. This is the control-plane only -- step data still
+ *              moves through the replicated /step/<n>/ file, not over
+ *              Mercury, and a reader's own step index does not yet grow
+ *              live in response to a notification (that needs reopening
+ *              the file).
+ *
+ *              M5 status: rendezvous is an SSG group, not a hand-rolled
+ *              attach RPC. A writer creates a single-member group at
+ *              file_create()/file_open() time and stores its id to a
+ *              "<filename>.vsgroup" sidecar file; a reader loads it and
+ *              joins. SSG's SWIM failure detector means a reader that dies
+ *              is simply absent from the group view the next time the
+ *              writer broadcasts -- no liveness tracking of vol-stream's
+ *              own, and no risk of a dead reader stalling the writer. A
+ *              reader that joins mid-stream gets a coherent view
+ *              automatically: joining triggers a query for whatever the
+ *              writer has already committed, seeded into the same queue
+ *              H5Fwait_step_ready() drains, so the first call after joining
+ *              returns the current step immediately rather than blocking
+ *              for a write the reader already missed.
  */
 
 #ifndef H5VLstream_H
@@ -96,6 +141,7 @@ H5VL_STREAM_API extern hid_t H5VL_STREAM_g;
 #define H5VL_STREAM_OP_SUBSCRIBE          "vol-stream:subscribe"
 #define H5VL_STREAM_OP_BEGIN_LOGICAL_STEP "vol-stream:begin_logical_step"
 #define H5VL_STREAM_OP_GET_LOGICAL_STEPS  "vol-stream:get_logical_steps"
+#define H5VL_STREAM_OP_WAIT_STEP_READY    "vol-stream:wait_step_ready"
 
 /** Status of the current step */
 typedef enum H5F_step_status_t {
@@ -214,6 +260,36 @@ H5VL_STREAM_API herr_t H5Fget_logical_steps(hid_t file_id, size_t *n_logical, ui
  */
 H5VL_STREAM_API herr_t H5Fsubscribe(hid_t file_id, size_t count, const char *const *paths, const hid_t *spaces,
                     const hid_t *plists);
+
+/**
+ * \brief M4/M5: reader only. Block until the writer's transport announces a
+ *        newly committed step, or \p timeout_ms elapses.
+ *
+ * Unlike H5Fbegin_step(), this does not move the reader's cursor or touch
+ * its step index -- it only reports that \p physical_step committed, with
+ * the wall_time_ns the writer passed to its own H5Fbegin_step() call for
+ * that step. Reading the step's data needs the reader to (re)open the file
+ * so its index picks it up: the index is not yet maintained live against
+ * incoming notifications.
+ *
+ * A reader that joins the writer's group mid-stream (M5: see
+ * H5Fopen()/VOL_STREAM_NA) gets a coherent view automatically: the first
+ * call to this function after opening returns the writer's current step
+ * immediately, seeded by the join itself, rather than blocking for a write
+ * the reader already missed.
+ *
+ * \param file_id       File opened through the vol-stream connector for
+ *                      reading, with the transport enabled (see
+ *                      VOL_STREAM_NA in dev-plan.md's M4 section)
+ * \param timeout_ms    Milliseconds to wait, or 0 to poll without blocking
+ * \param physical_step OUT: the physical step that committed
+ * \param wall_time_ns  OUT: its wall_time_ns, or NULL if not wanted
+ * \return \herr_t, -1 on timeout or if the transport is unavailable for
+ *         this file (VOL_STREAM_NA was unset, the connector was built
+ *         without Mercury, or \p file_id is not a reader)
+ */
+H5VL_STREAM_API herr_t H5Fwait_step_ready(hid_t file_id, uint64_t timeout_ms, uint64_t *physical_step,
+                    uint64_t *wall_time_ns);
 
 /**
  * \brief Register the vol-stream connector and return its ID.
