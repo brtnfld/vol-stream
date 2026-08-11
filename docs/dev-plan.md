@@ -204,6 +204,19 @@ natural routing unit for subscription — paired with `H5Sselect_intersect_block
 the writer decides which chunks a subscriber needs without touching the data.
 Partial-chunk writes degrade to `Raw`.
 
+**This conflicts with per-subscriber precision (decision 3, M8.5) unless
+resolved explicitly.** `FilteredChunks` bytes are already compressed under the
+dataset's own native filter pipeline; a subscriber whose requested
+`H5Pencode2` pipeline differs from that native one cannot be served those
+bytes as-is. Rule: if any current subscriber's pipeline differs from the
+dataset's native DCPL, the writer falls back from `FilteredChunks` to `Raw`
+for that push — decompress, apply the subscriber's own pipeline, re-compress
+— rather than sending mismatched or unfiltered bytes. `FilteredChunks` stays
+zero-copy only for subscribers whose pipeline matches the write-time DCPL
+exactly. (`FilteredChunks` itself is schema-defined but not yet built — see
+M8.5's status in `project_m8_status.md` — so this rule applies once that
+capture path exists, not to the current `Raw`-only implementation.)
+
 ### Connector state machine
 
 | State | Legal operations | Notes |
@@ -455,16 +468,49 @@ writer, subscribing to a subvolume, with no user-written C glue.
 `H5Tencode` and `H5Sencode2` is the right trade, but it couples the wire format to
 them, and `H5Sencode2` already changed once to widen selections to 64-bit. The
 schema records `hdf5_version` from the first commit and CI runs a cross-endian
-encode round-trip, so a future change is a detected incompatibility rather than a
-corrupt read.
+encode round-trip, so a future change is *detectable*. **Not yet closed:**
+`hdf5_version` is written at every manifest-build call site but never read back
+or checked anywhere before `H5Sdecode`/`H5Tdecode2` run on it — a genuine
+cross-major-version mismatch (writer on one HDF5 series, reader on another)
+currently risks a crash inside HDF5 core rather than the clear diagnostic this
+paragraph implies. Needs an explicit compatibility check gating those decode
+calls.
+
+**Manifest metadata is fully re-encoded every step, with no dictionary.**
+`H5VL__stream_build_manifest()` calls `H5Tencode`/`H5Sencode2` (and
+`H5Pencode2` for create-kind entries) on *every* pending entry on *every*
+step, including `DsetWrite` — a dataset whose type and selection never change
+across steps still pays full type/space blob re-encoding and re-transmission
+each time. At high step cadence or with many small per-step datasets, this is
+real, unbounded metadata overhead with no mitigation today. A path forward:
+send `type_enc`/`dcpl_enc` once per `(path, value)` and reference it by a
+small ID afterward, falling back to a full re-send only when the value
+actually changes.
 
 **Existing tools on a live stream.** See the constraint section above.
 
-**VL and reference support widen M2.** Including them is correct on the evidence,
-but it makes M2 the largest early milestone and deep-copying VL data has real
-cost. If M2 slips, ship VL and references behind a property defaulting to off
-rather than cutting the replay-invariant matrix — the matrix protects everything
-after it.
+**VL and reference support (Decision #4) were never implemented, not just
+deferred.** The residual-risk plan here was "ship them behind a property
+defaulting to off" if M2 slipped — but no such property exists, and neither
+`H5Rget_obj_name`/`H5Rcreate_object` (reference name translation) nor
+`H5Dvlen_get_buf_size`/`H5Treclaim`-based deep serialization exist anywhere in
+`src/`. The capture path is datatype-agnostic: it `memcpy`s whatever buffer
+`H5Dwrite`/`H5Awrite` was given straight into the pending entry. For a
+variable-length datatype, that buffer is an array of `{len, pointer}`
+(`hvl_t`) structs, and the pointers are only valid in the writer's own
+process memory — capturing them verbatim and replaying them later (a
+different `H5Dwrite` call, against a different handle, however much later
+`end_step()` runs) reads through stale pointers rather than the data itself.
+This is a live correctness gap, not a latency or cost concern: writing VL
+data through this connector today is unsafe, and nothing currently detects
+or rejects it. Needs either (a) a real deep-serialization capture path before
+VL/references can be called supported, or (b) an explicit reject-with-clear-
+error at capture time for VL/reference datatypes until (a) exists, so the
+failure mode is a diagnostic instead of silent corruption. Reference
+translation, once built, should happen at write-time (intercepting
+`H5Rcreate_object`/`H5Rcreate_region`) rather than by walking the whole
+step's references synchronously inside `COMMITTING` — the latter would stall
+the collective barrier in proportion to reference count.
 
 **The dependency risk is quality, not quantity.** Criteria before adding
 anything: actively maintained, deployed at target facilities, Spack-installable,

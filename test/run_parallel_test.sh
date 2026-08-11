@@ -80,31 +80,46 @@ rm -f t_parallel.h5
 # MPI (a plain env var UCX-unaware MPI simply never reads).
 export UCX_TLS=tcp,self,sm
 
+# MPICH hydra's proxy args on the GH Actions runner show
+# "--control-port runnervmvrwv9:PORT --hostname runnervmvrwv9" -- it uses the
+# CONTAINER'S OWN hostname, not "localhost", for the channels ranks use to
+# complete MPI_Init()'s internal connection setup after PMI bootstrap. If
+# that hostname is not reliably self-connectable inside this runner's
+# network namespace (a known class of container gotcha), each rank's
+# connection to its peers' published "business card" address can fail
+# silently, and MPICH falls back to running that rank as a size-1 singleton
+# rather than erroring -- exactly the symptom four earlier flag-only
+# attempts here couldn't fix (host/launcher flags, bare "-n N", "-bind-to
+# none" -- see git log for this file). The proxy args name the exact lever:
+# "--iface-ip-env-name MPIR_CVAR_CH3_INTERFACE_HOSTNAME" is the env var
+# hydra tells each rank to consult for its own interface hostname. Pin it to
+# localhost so ranks publish/connect on loopback instead of the possibly-
+# unreachable container hostname; harmless locally and for Open MPI (an
+# MPICH-specific CVAR neither reads).
+export MPIR_CVAR_CH3_INTERFACE_HOSTNAME=localhost
+
 echo "mpirun: $MPIRUN"
 "$MPIRUN" --version 2>&1 | head -3
 echo
 
 # Slot/host declaration is not portable between implementations the way a
-# plain env var is. Three earlier attempts here all tried different hydra
-# host/launcher flags ("-host localhost:N", "-hosts localhost -launcher
-# fork", then bare "-n N" matching HDF5's own CI recipe) to fix the same
-# CI-only symptom (every rank independently reports MPI_COMM_WORLD size 1 --
-# a silent per-process singleton-init fallback, not an error) -- none of
-# them actually fixed it. The bare-flags attempt's own -verbose output
-# finally showed the real cause: hydra's proxy reports "--proxy-core-count
-# 1" / "(1 cores)" on this runner -- it believes there is exactly one core
-# available, fewer than the ranks requested -- and, unlike Open MPI's clear
-# "not enough slots" error, MPICH's hydra does not error on that; something
-# in its default process-core binding for the excess ranks silently breaks
-# their PMI rendezvous instead. HDF5's own CI never hits this because it
-# caps MPICH tests at MPIEXEC_MAX_NUMPROCS=2, avoiding oversubscription
-# rather than solving it. "-bind-to none" (disable hydra's process-core
-# binding, letting the OS scheduler timeslice normally) is the standard fix
-# for exactly this -- Open MPI's own --oversubscribe below already does the
-# equivalent for its side. -verbose stays on for MPICH so a repeat failure
-# keeps showing hydra's own trace instead of nothing.
+# plain env var is. Four earlier attempts here all tried different hydra
+# host/launcher/binding flags ("-host localhost:N", "-hosts localhost
+# -launcher fork", bare "-n N" matching HDF5's own CI recipe, "-bind-to
+# none") to fix the same CI-only symptom (every rank independently reports
+# MPI_COMM_WORLD size 1 -- a silent per-process singleton-init fallback, not
+# an error) -- none of them fixed it. One of those attempts' own -verbose
+# output showed hydra's proxy reporting "--proxy-core-count 1" on the
+# runner, which looked like a smoking gun (fewer cores than ranks) -- until
+# the SAME -verbose flag on a local, successful run showed this machine
+# reports "(1 cores)" too. Since local works and CI doesn't with the
+# identical "1 core" reading, core count/binding was never the actual cause
+# -- see MPIR_CVAR_CH3_INTERFACE_HOSTNAME above for the fix that followed
+# from what actually differs (the container's own possibly-unreachable
+# hostname). -verbose stays on for MPICH regardless, since it is what
+# surfaces hydra's trace when something does need diagnosing.
 if "$MPIRUN" --version 2>&1 | grep -qi "HYDRA build details"; then
-    MPI_EXTRA_ARGS=(-bind-to none -verbose)
+    MPI_EXTRA_ARGS=(-verbose)
     echo "detected MPICH hydra -- using: ${MPI_EXTRA_ARGS[*]}"
 else
     MPI_EXTRA_ARGS=(-host localhost --oversubscribe)
