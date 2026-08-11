@@ -53,6 +53,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "hdf5.h"
 #include "H5VLstream.h"
@@ -322,11 +323,35 @@ do_read(const char *fname, int global_size, int writer_ranks)
     return total_errors > 0 ? 1 : 0;
 }
 
+/* CI-only diagnostic: print the PMI-related env vars this process sees
+ * BEFORE calling MPI_Init(), gated behind VOL_STREAM_DEBUG_PMI_ENV so it
+ * costs nothing normally. Ground truth for whether hydra_pmi_proxy set
+ * them at all on a given runner, vs. guessing at mpiexec flags -- see
+ * test/run_parallel_test.sh's own comment on the CI-only MPICH
+ * singleton-fallback investigation. */
+static void
+debug_print_pmi_env(void)
+{
+    static const char *names[] = {"PMI_RANK",       "PMI_SIZE",   "PMI_FD",
+                                   "PMI_PORT",       "PMI_KVSNAME", "PMI_ID",
+                                   "PMI_DEBUG",      NULL};
+    int i;
+
+    if (!getenv("VOL_STREAM_DEBUG_PMI_ENV"))
+        return;
+
+    for (i = 0; names[i]; i++) {
+        const char *v = getenv(names[i]);
+        fprintf(stderr, "  pmi-env  pid=%d %s=%s\n", (int)getpid(), names[i], v ? v : "(unset)");
+    }
+}
+
 int
 main(int argc, char **argv)
 {
     int rc = 1;
 
+    debug_print_pmi_env();
     MPI_Init(&argc, &argv);
 
     if (argc < 4) {
