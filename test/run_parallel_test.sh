@@ -82,39 +82,38 @@ export UCX_TLS=tcp,self,sm
 
 # CI-only MPICH singleton-fallback investigation (every rank independently
 # reports MPI_COMM_WORLD size 1 -- not an error, just a silent per-process
-# singleton MPI_Init()). Six mpiexec-layer flag/env-var rounds so far (host
-# declaration, launcher choice, process-core binding, interface hostname,
-# shared-memory bypass -- see git log for this file) all left the exact
-# symptom unchanged, while Open MPI passes cleanly on the identical runner
-# with the same connector code -- this is specific to MPICH's hydra on this
-# runner, not an application-level MPI mistake.
+# singleton MPI_Init()), now root-caused after seven mpiexec-layer rounds
+# (see git log for this file). VOL_STREAM_DEBUG_PMI_ENV makes t_parallel.c
+# print PMI_RANK/SIZE/FD/PORT/KVSNAME/ID/DEBUG from inside each child before
+# MPI_Init() runs -- kept on permanently, it costs nothing and is what
+# finally supplied ground truth instead of another blind guess: CI's own
+# printout showed PMI_PORT=runnervmvrwv9:<port> -- hydra *does* configure
+# each child correctly, with the *same* PMI_PORT+PMI_ID bootstrap style a
+# local run also uses, but pointed at the runner's own machine hostname
+# ("runnervmvrwv9") instead of "localhost.localdomain" the way a local run's
+# PMI_PORT reads. The child's connect() to that hostname:port is what fails
+# silently in the CI network namespace -- MPICH's PMI_PORT-init code treats
+# a failed connection the same as "no process manager available" and falls
+# through to singleton rather than erroring, matching the exact symptom.
 #
-# The decisive clue came from comparing CI's own -verbose hydra trace
-# against a LOCAL one: a working local run logs many "got pmi command from
-# downstream" lines (barrier/put/get exchanges between the proxy and each
-# child); the CI log has ZERO such lines. The children are not attempting
-# and failing a PMI handshake -- they are never trying one at all, which is
-# exactly MPICH's documented singleton-init fallback when MPI_Init() does
-# not find the PMI_* environment variables hydra_pmi_proxy is supposed to
-# set on each child before exec'ing it. VOL_STREAM_DEBUG_PMI_ENV makes
-# t_parallel.c print those exact variables (PMI_RANK/PMI_SIZE/PMI_FD/
-# PMI_PORT/PMI_KVSNAME/PMI_ID/PMI_DEBUG) from inside the child, before
-# MPI_Init() runs -- ground truth for whether hydra set them at all on a
-# given runner, instead of guessing at another mpiexec flag blind.
+# Fix: "-localhost localhost" (mpiexec --help: "local hostname for the
+# launching node") overrides the hostname hydra uses for its own bootstrap,
+# which turns out to change more than just the string -- it switches hydra
+# to an entirely different, unambiguously-local PMI bootstrap (PMI_RANK/
+# PMI_SIZE/PMI_FD -- a pre-connected, fork-inherited file descriptor) that
+# needs no hostname resolution or TCP connect() at all, sidestepping the
+# whole failure class rather than trying to make the port-based path's
+# hostname resolve correctly. Confirmed locally: without this flag PMI_PORT
+# is used (matching CI's failing shape); with it, PMI_FD is used instead
+# and the gate passes with real 3-rank coordination.
 export VOL_STREAM_DEBUG_PMI_ENV=1
 
 echo "mpirun: $MPIRUN"
 "$MPIRUN" --version 2>&1 | head -3
 echo
 
-# -pmi-port explicitly selects hydra's PMI_PORT-based child bootstrap
-# (mpiexec --help: "use the PMI_PORT model", implying the default for local/
-# forked children is something else, PMI_FD/socketpair-based). If the
-# default mechanism's env vars are the ones going missing on this runner,
-# forcing the other one is a genuinely different bootstrap path to test --
-# not yet tried in six rounds of flag guessing.
 if "$MPIRUN" --version 2>&1 | grep -qi "HYDRA build details"; then
-    MPI_EXTRA_ARGS=(-verbose -pmi-port)
+    MPI_EXTRA_ARGS=(-verbose -localhost localhost)
     echo "detected MPICH hydra -- using: ${MPI_EXTRA_ARGS[*]}"
 else
     MPI_EXTRA_ARGS=(-host localhost --oversubscribe)
