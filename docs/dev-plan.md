@@ -213,9 +213,14 @@ dataset's native DCPL, the writer falls back from `FilteredChunks` to `Raw`
 for that push — decompress, apply the subscriber's own pipeline, re-compress
 — rather than sending mismatched or unfiltered bytes. `FilteredChunks` stays
 zero-copy only for subscribers whose pipeline matches the write-time DCPL
-exactly. (`FilteredChunks` itself is schema-defined but not yet built — see
-M8.5's status in `project_m8_status.md` — so this rule applies once that
-capture path exists, not to the current `Raw`-only implementation.)
+exactly.
+
+Per-subscriber precision has since shipped (M8.5) and this rule is currently
+satisfied *trivially*, not by an implemented branch: every payload is still
+the `Raw` form, so re-filtering always starts from unfiltered bytes and the
+conflict cannot arise. The rule above becomes live code the moment
+`FilteredChunks` capture is built — that is the first thing to implement
+alongside it, not an afterthought.
 
 ### Connector state machine
 
@@ -435,10 +440,41 @@ with subscribed volume — dev-plan.md's M8 exit gate, in full.
 which intersects each subscriber's requested range against what it actually
 wrote and pushes only the overlap — verified with a bounded subrange
 subscription receiving exactly its requested elements, not the whole object.
-See `vs_tr_writer_push_data()` in `src/tr_mercury.c`. Chunk-storage-granularity
-routing (`H5Sselect_intersect_block` against `FilteredChunks`, which this
-connector has never actually built despite being in the schema since M2) and
-per-subscriber precision (re-filtering) remain open.
+See `vs_tr_writer_push_data()` in `src/tr_mercury.c`.
+
+**Update: per-subscriber precision shipped too.** A subscription's
+`H5Pencode2` DCPL (accepted and ignored since M8) now travels with the
+subscribe RPC, and the writer re-filters that subscriber's own overlap slice
+through the requested pipeline before sending it. HDF5 exposes no public
+"apply this pipeline to a buffer" call outside ordinary dataset I/O, so the
+mechanism is a throwaway `H5FD_CORE` (in-memory, no backing store) dataset
+built with the subscriber's decoded DCPL: `H5Dwrite()` applies the filters,
+`H5Dread_chunk2()` pulls the filtered bytes straight back out, and the
+receiving side mirrors it exactly (`H5Dwrite_chunk()` to inject the already-
+filtered bytes, ordinary `H5Dread()` to decode). Decision #3's "reuse the
+existing filter pipeline instead of new compression code" holds literally —
+there is no codec here, only HDF5's own. `src/tr_mercury.c` stays HDF5-free
+via a registered `vs_tr_refilter_fn` callback rather than decoding property
+lists itself.
+
+Reversal is transparent: `H5Fget_subscribed_data()` always returns decoded
+values, so a caller never sees filtered bytes and existing subscribers are
+byte-for-byte unaffected. Verified end-to-end in `test/t_precision.c`: a
+writer stores `/precise` **uncompressed** (`H5P_DEFAULT`), a subscriber
+requests GZIP, and the push measurably shrinks **8000 → 48 bytes on the wire**
+while decoding back to the exact original 2000 values — real measured wire
+bytes, this section's exit gate asks for, from a pipeline the dataset itself
+never had.
+
+Still open: chunk-storage-granularity routing (`H5Sselect_intersect_block`
+against `FilteredChunks`, which this connector has never actually built
+despite being in the schema since M2). Because of that, re-filtering always
+uses a single chunk spanning the whole pushed subrange rather than honoring a
+chunk shape the subscriber's DCPL requested. The exit gate's literal *two
+simultaneous subscribers at different precisions* configuration is also not
+yet a test — the mechanism is per-subscriber by construction (the pipeline is
+looked up per `sub_table` entry inside the per-member push loop), but that
+specific scenario is asserted by design, not demonstrated.
 
 ### M9 — Tools, bindings, and the long tail · M
 

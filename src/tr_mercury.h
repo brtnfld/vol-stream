@@ -63,6 +63,19 @@
  *          block-based chunk routing and per-subscriber re-filtering are the
  *          flagged follow-up (M8.5, mirroring M6.5's pattern), see
  *          docs/dev-plan.md.
+ *
+ *          M8.5, per-subscriber precision: a subscription may carry an
+ *          optional DCPL (H5Pencode2 bytes, opaque to this module -- see the
+ *          "deliberately independent of HDF5" note below) requesting a
+ *          filter pipeline different from the dataset's own. This module
+ *          stays HDF5-free by never decoding those bytes itself: it invokes
+ *          a caller-registered vs_tr_refilter_fn (vs_tr_set_refilter_cb())
+ *          to turn a subscriber's raw overlap slice into that subscriber's
+ *          own filtered bytes, and simply carries the result (plus the DCPL/
+ *          type bytes the far side needs to reverse it) as more opaque
+ *          blobs, mirroring how payload bytes already move today. A
+ *          subscription with no DCPL (or one the refilter callback declines)
+ *          gets the exact M8/M8.5 raw-bytes behavior unchanged.
  */
 
 #ifndef VOL_STREAM_TR_MERCURY_H
@@ -79,6 +92,32 @@ extern "C" {
 #endif
 
 typedef struct vs_tr_t vs_tr_t;
+
+/* M8.5: implemented by H5VLstream.c, registered via vs_tr_set_refilter_cb()
+ * below -- this module stays HDF5-free (see the header comment above), so
+ * it never decodes dcpl_enc/type_enc itself, only carries them. Given
+ * raw_buf (count elements of elem_size bytes, uncompressed/unfiltered),
+ * dcpl_enc (H5Pencode2 bytes, the subscriber's requested pipeline) and
+ * type_enc (H5Tencode bytes, the data's own type), the callback must run
+ * raw_buf through that pipeline (H5VLstream.c does this via a temporary
+ * in-memory dataset and H5Dread_chunk2()) and fill *out_buf (malloc'd --
+ * vs_tr_writer_push_data() frees it once sent), *out_len and
+ * *out_filter_mask (H5Dget_chunk_info_by_coord()'s filter_mask, needed on
+ * the far side to reconstruct correctly if any filter chose to skip
+ * itself). Returns 0 on success; a non-zero return falls back to sending
+ * this subscriber raw, unfiltered bytes instead of failing the push. */
+typedef int (*vs_tr_refilter_fn)(const void *raw_buf, uint64_t elem_size, uint64_t count,
+                                   const uint8_t *dcpl_enc, uint64_t dcpl_enc_len, const uint8_t *type_enc,
+                                   uint64_t type_enc_len, void **out_buf, uint64_t *out_len,
+                                   uint32_t *out_filter_mask);
+
+/* Registers the callback used to re-filter a subscriber's overlap slice
+ * through their own requested DCPL (M8.5). NULL (the default) means every
+ * push goes out as raw bytes regardless of what a subscriber requested,
+ * exactly M8/M8.5's original whole-object/subrange-only behavior. Not
+ * thread-safe against a concurrent vs_tr_writer_push_data() call -- call
+ * once, right after vs_tr_start(), before any step replay can run. */
+void vs_tr_set_refilter_cb(vs_tr_t *tr, vs_tr_refilter_fn fn);
 
 /* Starts Margo and SSG on na_str (e.g. "na+sm", "ofi+tcp"). Both writer and
  * reader run in server mode: a writer must receive RPCs (get_current_step,
@@ -173,24 +212,33 @@ int vs_tr_writer_min_acked_step(vs_tr_t *tr, uint64_t *min_acked_step);
 /* Reader side: declare interest in path, bounded to the 1-D element range
  * [sel_start, sel_start + sel_count) -- M8.5's subvolume routing (see this
  * file's M8/M8.5 comment); pass sel_start=0, sel_count=UINT64_MAX for the
- * whole object. Best-effort like vs_tr_reader_ack_step(): a failed RPC just
+ * whole object. dcpl_enc/dcpl_enc_len (M8.5 precision) is the caller's own
+ * H5Pencode2() bytes for the filter pipeline this subscriber wants pushed
+ * data re-filtered through; pass NULL/0 for none (the original raw-bytes
+ * behavior). Best-effort like vs_tr_reader_ack_step(): a failed RPC just
  * means this subscription is not registered and no data for path will
  * arrive, not a fatal error to the caller. Returns 0 if the RPC was
  * delivered and acknowledged, -1 otherwise. */
-int vs_tr_reader_subscribe(vs_tr_t *tr, const char *path, uint64_t sel_start, uint64_t sel_count);
+int vs_tr_reader_subscribe(vs_tr_t *tr, const char *path, uint64_t sel_start, uint64_t sel_count,
+                            const uint8_t *dcpl_enc, uint64_t dcpl_enc_len);
 
 /* Writer side: push the subset of buf that overlaps each subscriber's own
  * requested range to that subscriber (M8.5) -- buf holds write_count
  * elements of elem_size bytes each, starting at global element offset
  * write_start; a subscriber whose [sel_start, sel_start+sel_count) does not
  * overlap [write_start, write_start+write_count) at all receives nothing
- * for this call, not an empty push. Not an error for there to be no
- * subscribers at all (the ordinary case for most paths on most steps) --
+ * for this call, not an empty push. type_enc/type_enc_len (M8.5 precision)
+ * is buf's own H5Tencode() bytes, handed to the registered refilter
+ * callback (vs_tr_set_refilter_cb()) for any subscriber that provided a
+ * dcpl_enc at subscribe time; pass NULL/0 if the caller never registers a
+ * callback (the type is then simply unused). Not an error for there to be
+ * no subscribers at all (the ordinary case for most paths on most steps) --
  * mirrors vs_tr_writer_broadcast_step_ready()'s "no readers, proceed"
  * tolerance. Returns 0 on success (even if an individual member's RPC
  * failed), -1 only on a local error. */
 int vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, const void *buf,
-                            uint64_t elem_size, uint64_t write_start, uint64_t write_count);
+                            uint64_t elem_size, uint64_t write_start, uint64_t write_count,
+                            const uint8_t *type_enc, uint64_t type_enc_len);
 
 /* Reader side: block up to timeout_ms for a pushed data item (one may
  * already be queued), filling *physical_step, *out_path (newly malloc'd,
@@ -198,12 +246,18 @@ int vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path
  * *out_elem_start, *out_elem_count -- the (element-granularity) subrange of
  * the subscribed object this push covers (M8.5): the whole object's extent
  * for a whole-object subscription, or the overlap with what the writer
- * happened to write for a bounded one. timeout_ms == 0 polls without
- * blocking. Returns 0 on success, -1 on timeout or if vs_tr_stop() was
- * called while waiting and no item remains queued. */
+ * happened to write for a bounded one. *out_dcpl_enc/*out_dcpl_enc_len and
+ * *out_type_enc/*out_type_enc_len (M8.5 precision, both newly malloc'd,
+ * caller frees, NULL/0 if this push was not re-filtered) and
+ * *out_filter_mask are what a caller needs to reverse the filtering (see
+ * vs_tr_refilter_fn's comment) -- *out_buf is the *filtered* bytes in that
+ * case, not decoded values. timeout_ms == 0 polls without blocking. Returns
+ * 0 on success, -1 on timeout or if vs_tr_stop() was called while waiting
+ * and no item remains queued. */
 int vs_tr_reader_wait_data(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physical_step, char **out_path,
                             void **out_buf, uint64_t *out_size, uint64_t *out_elem_start,
-                            uint64_t *out_elem_count);
+                            uint64_t *out_elem_count, uint8_t **out_dcpl_enc, uint64_t *out_dcpl_enc_len,
+                            uint8_t **out_type_enc, uint64_t *out_type_enc_len, uint32_t *out_filter_mask);
 
 #ifdef __cplusplus
 }

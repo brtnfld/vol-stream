@@ -449,6 +449,17 @@ static const char *H5VL__stream_transport_na(void);
 static char *H5VL__stream_vsaddr_path(const char *filename);
 static void H5VL__stream_transport_start_writer(H5VL_stream_file_state_t *fs, const char *name);
 static void H5VL__stream_transport_start_reader(H5VL_stream_file_state_t *fs, const char *name);
+/* M8.5 precision: see H5VL__stream_refilter_for_subscriber()'s comment --
+ * vs_tr_refilter_fn's implementation, and H5VL__stream_unfilter_pushed_
+ * data()'s the reverse operation, used in the get_subscribed_data handler. */
+static int H5VL__stream_refilter_for_subscriber(const void *raw_buf, uint64_t elem_size, uint64_t count,
+                             const uint8_t *dcpl_enc, uint64_t dcpl_enc_len, const uint8_t *type_enc,
+                             uint64_t type_enc_len, void **out_buf, uint64_t *out_len,
+                             uint32_t *out_filter_mask);
+static int H5VL__stream_unfilter_pushed_data(const void *filtered_buf, uint64_t filtered_len,
+                             const uint8_t *dcpl_enc, uint64_t dcpl_enc_len, const uint8_t *type_enc,
+                             uint64_t type_enc_len, uint64_t count, uint32_t filter_mask, void **out_buf,
+                             size_t *out_len);
 #endif
 #ifdef H5_HAVE_PARALLEL
 static void H5VL__stream_detect_mpi_comm(H5VL_stream_file_state_t *fs, hid_t fapl_id);
@@ -1271,6 +1282,10 @@ H5VL__stream_transport_start_writer(H5VL_stream_file_state_t *fs, const char *na
     if (NULL == (fs->transport = vs_tr_start(na_str)))
         return;
 
+    /* M8.5 precision: register once, right after start -- see vs_tr_
+     * set_refilter_cb()'s comment. */
+    vs_tr_set_refilter_cb(fs->transport, H5VL__stream_refilter_for_subscriber);
+
     {
         H5VL_file_specific_args_t flush_args;
 
@@ -1675,6 +1690,211 @@ H5VL__stream_encode_dcpl(hid_t dcpl_id, uint8_t **buf, size_t *len)
     *len = nalloc;
     return 0;
 } /* end H5VL__stream_encode_dcpl() */
+
+#ifdef VOL_STREAM_HAVE_MERCURY
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_refilter_for_subscriber
+ *
+ * Purpose:     M8.5 precision: vs_tr_refilter_fn's implementation (see that
+ *              typedef's comment in tr_mercury.h) -- run raw_buf through a
+ *              subscriber's own requested filter pipeline before it goes on
+ *              the wire. HDF5 has no public "apply this filter pipeline to
+ *              a buffer" call outside ordinary dataset I/O, so this builds
+ *              a throwaway in-memory dataset (H5FD_CORE, backing_store =
+ *              false -- nothing ever touches disk) using the subscriber's
+ *              own decoded DCPL, writes raw_buf into it (H5Dwrite() applies
+ *              the filters), then pulls the resulting *filtered* bytes back
+ *              out directly via H5Dread_chunk2() (bypasses the chunk cache
+ *              and decompression -- the whole point).
+ *
+ *              Always forces a single chunk spanning the whole extent,
+ *              overriding whatever chunk shape the subscriber's own DCPL
+ *              requested, so exactly one H5Dget_chunk_info_by_coord()/
+ *              H5Dread_chunk2() pair always suffices -- a real limitation
+ *              (the subscriber's own chunk-size preference is not
+ *              honored), acceptable for this first increment given the
+ *              alternative is iterating an arbitrary number of chunks.
+ *              H5VL__stream_unfilter_pushed_data() undoes this on the
+ *              receiving end.
+ *
+ * Return:      0 on success, -1 to fall back to sending this subscriber
+ *              raw, unfiltered bytes instead (not a fatal error to the
+ *              caller -- see vs_tr_refilter_fn's own comment).
+ *-------------------------------------------------------------------------
+ */
+static int
+H5VL__stream_refilter_for_subscriber(const void *raw_buf, uint64_t elem_size, uint64_t count,
+                                       const uint8_t *dcpl_enc, uint64_t dcpl_enc_len, const uint8_t *type_enc,
+                                       uint64_t type_enc_len, void **out_buf, uint64_t *out_len,
+                                       uint32_t *out_filter_mask)
+{
+    hid_t    dcpl = -1, type = -1, space = -1, fapl = -1, fid = -1, ds = -1;
+    hsize_t  dims[1];
+    hsize_t  chunk_offset[1] = {0};
+    void    *filtered = NULL;
+    unsigned chunk_filter_mask = 0;
+    haddr_t  addr;
+    hsize_t  chunk_size = 0;
+    int      ret_value = -1;
+
+    if (count == 0 || !dcpl_enc || dcpl_enc_len == 0 || !type_enc || type_enc_len == 0)
+        return -1;
+
+    if ((dcpl = H5Pdecode(dcpl_enc)) < 0)
+        goto done;
+    if ((type = H5Tdecode2(type_enc, (size_t)type_enc_len)) < 0)
+        goto done;
+
+    dims[0] = (hsize_t)count;
+    if ((space = H5Screate_simple(1, dims, NULL)) < 0)
+        goto done;
+    if (H5Pset_chunk(dcpl, 1, dims) < 0)
+        goto done;
+
+    if ((fapl = H5Pcreate(H5P_FILE_ACCESS)) < 0 || H5Pset_fapl_core(fapl, 1 << 20, false) < 0)
+        goto done;
+    if ((fid = H5Fcreate("vol_stream_refilter_tmp.h5", H5F_ACC_TRUNC, H5P_DEFAULT, fapl)) < 0)
+        goto done;
+    if ((ds = H5Dcreate2(fid, "d", type, space, H5P_DEFAULT, dcpl, H5P_DEFAULT)) < 0)
+        goto done;
+    if (H5Dwrite(ds, type, H5S_ALL, H5S_ALL, H5P_DEFAULT, raw_buf) < 0)
+        goto done;
+    if (H5Dflush(ds) < 0)
+        goto done;
+
+    if (H5Dget_chunk_info_by_coord(ds, chunk_offset, &chunk_filter_mask, &addr, &chunk_size) < 0)
+        goto done;
+    if (chunk_size == 0)
+        goto done;
+    if (NULL == (filtered = malloc((size_t)chunk_size)))
+        goto done;
+    {
+        size_t buf_size = (size_t)chunk_size;
+        uint32_t filters32 = (uint32_t)chunk_filter_mask;
+
+        if (H5Dread_chunk2(ds, H5P_DEFAULT, chunk_offset, &filters32, filtered, &buf_size) < 0)
+            goto done;
+        chunk_filter_mask = (unsigned)filters32;
+    }
+
+    /* Diagnostic only, gated the same opt-in-env-var way as VOL_STREAM_
+     * DEBUG_PMI_ENV (test/t_parallel.c): real, observable evidence a test
+     * can check that precision re-filtering actually ran and actually
+     * changed the wire size, since H5Fget_subscribed_data() itself always
+     * hands back decoded values regardless -- transparent by design, so
+     * there is no other way for a caller to see this happened. */
+    if (getenv("VOL_STREAM_DEBUG_REFILTER"))
+        fprintf(stderr, "  refilter  raw=%llu filtered=%llu bytes\n", (unsigned long long)(elem_size * count),
+                (unsigned long long)chunk_size);
+
+    *out_buf         = filtered;
+    *out_len         = (uint64_t)chunk_size;
+    *out_filter_mask = (uint32_t)chunk_filter_mask;
+    filtered         = NULL;
+    ret_value        = 0;
+
+done:
+    free(filtered);
+    if (ds >= 0)
+        H5Dclose(ds);
+    if (fid >= 0)
+        H5Fclose(fid);
+    if (fapl >= 0)
+        H5Pclose(fapl);
+    if (space >= 0)
+        H5Sclose(space);
+    if (type >= 0)
+        H5Tclose(type);
+    if (dcpl >= 0)
+        H5Pclose(dcpl);
+    return ret_value;
+} /* end H5VL__stream_refilter_for_subscriber() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_unfilter_pushed_data
+ *
+ * Purpose:     M8.5 precision: the reverse of H5VL__stream_refilter_for_
+ *              subscriber() -- given the filtered bytes a push carried plus
+ *              the dcpl_enc/type_enc/filter_mask it arrived with, reconstruct
+ *              the decoded values a caller of H5Fget_subscribed_data()
+ *              actually wants. Builds the identical single-whole-extent-
+ *              chunk in-memory dataset the writer side built, injects the
+ *              already-filtered bytes directly into chunk storage via
+ *              H5Dwrite_chunk() (bypassing the pipeline on the way in, since
+ *              they are already filtered), then reads it back normally
+ *              (H5Dread(), which decodes: unfilters via that same pipeline)
+ *              to get the real values.
+ *
+ * Return:      0 on success, with *out_buf (malloc'd, caller frees) and
+ *              *out_len filled in; -1 on failure (caller falls back to
+ *              handing back the raw filtered bytes -- degraded, not fatal).
+ *-------------------------------------------------------------------------
+ */
+static int
+H5VL__stream_unfilter_pushed_data(const void *filtered_buf, uint64_t filtered_len, const uint8_t *dcpl_enc,
+                                    uint64_t dcpl_enc_len, const uint8_t *type_enc, uint64_t type_enc_len,
+                                    uint64_t count, uint32_t filter_mask, void **out_buf, size_t *out_len)
+{
+    hid_t   dcpl = -1, type = -1, space = -1, fapl = -1, fid = -1, ds = -1;
+    hsize_t dims[1];
+    hsize_t chunk_offset[1] = {0};
+    void   *decoded = NULL;
+    size_t  elem_size;
+    int     ret_value = -1;
+
+    if (count == 0 || !dcpl_enc || dcpl_enc_len == 0 || !type_enc || type_enc_len == 0)
+        return -1;
+
+    if ((dcpl = H5Pdecode(dcpl_enc)) < 0)
+        goto done;
+    if ((type = H5Tdecode2(type_enc, (size_t)type_enc_len)) < 0)
+        goto done;
+    if ((elem_size = H5Tget_size(type)) == 0)
+        goto done;
+
+    dims[0] = (hsize_t)count;
+    if ((space = H5Screate_simple(1, dims, NULL)) < 0)
+        goto done;
+    if (H5Pset_chunk(dcpl, 1, dims) < 0)
+        goto done;
+
+    if ((fapl = H5Pcreate(H5P_FILE_ACCESS)) < 0 || H5Pset_fapl_core(fapl, 1 << 20, false) < 0)
+        goto done;
+    if ((fid = H5Fcreate("vol_stream_unfilter_tmp.h5", H5F_ACC_TRUNC, H5P_DEFAULT, fapl)) < 0)
+        goto done;
+    if ((ds = H5Dcreate2(fid, "d", type, space, H5P_DEFAULT, dcpl, H5P_DEFAULT)) < 0)
+        goto done;
+
+    if (H5Dwrite_chunk(ds, H5P_DEFAULT, filter_mask, chunk_offset, (size_t)filtered_len, filtered_buf) < 0)
+        goto done;
+
+    if (NULL == (decoded = malloc(elem_size * (size_t)count)))
+        goto done;
+    if (H5Dread(ds, type, H5S_ALL, H5S_ALL, H5P_DEFAULT, decoded) < 0)
+        goto done;
+
+    *out_buf  = decoded;
+    *out_len  = elem_size * (size_t)count;
+    decoded   = NULL;
+    ret_value = 0;
+
+done:
+    free(decoded);
+    if (ds >= 0)
+        H5Dclose(ds);
+    if (fid >= 0)
+        H5Fclose(fid);
+    if (fapl >= 0)
+        H5Pclose(fapl);
+    if (space >= 0)
+        H5Sclose(space);
+    if (type >= 0)
+        H5Tclose(type);
+    if (dcpl >= 0)
+        H5Pclose(dcpl);
+    return ret_value;
+} /* end H5VL__stream_unfilter_pushed_data() */
+#endif /* VOL_STREAM_HAVE_MERCURY */
 
 /*-------------------------------------------------------------------------
  * Function:    H5VL__stream_type_cache_lookup / H5VL__stream_type_cache_upsert
@@ -2969,10 +3189,25 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                     if (file_obj->file_state && file_obj->file_state->transport) {
                         uint64_t w_start, w_count;
 
-                        if (H5VL__stream_space_1d_bounds(dspace, &w_start, &w_count) >= 0)
+                        if (H5VL__stream_space_1d_bounds(dspace, &w_start, &w_count) >= 0) {
+                            uint8_t *push_type_enc     = NULL;
+                            size_t   push_type_enc_len = 0;
+
+                            /* Only needed if a subscriber actually wants
+                             * precision re-filtering (vs_tr_writer_push_
+                             * data() hands this to the registered callback,
+                             * see vs_tr_refilter_fn's comment) -- encoded
+                             * unconditionally here since whether any
+                             * subscriber wants it is tr_mercury.c's own
+                             * per-subscriber decision, not something this
+                             * call site can know in advance. */
+                            H5VL__stream_encode_type(dtype, &push_type_enc, &push_type_enc_len);
                             vs_tr_writer_push_data(file_obj->file_state->transport, physical_step, path,
                                                      payload_ptr, H5Tget_size(dtype), w_start,
-                                                     (uint64_t)n_elem);
+                                                     (uint64_t)n_elem, push_type_enc,
+                                                     (uint64_t)push_type_enc_len);
+                            free(push_type_enc);
+                        }
                     }
 #endif
                     (void)plen;
@@ -3101,9 +3336,16 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                     if (file_obj->file_state && file_obj->file_state->transport) {
                         uint64_t a_start, a_count;
 
-                        if (H5VL__stream_space_1d_bounds(dspace, &a_start, &a_count) >= 0)
+                        if (H5VL__stream_space_1d_bounds(dspace, &a_start, &a_count) >= 0) {
+                            uint8_t *push_type_enc     = NULL;
+                            size_t   push_type_enc_len = 0;
+
+                            H5VL__stream_encode_type(dtype, &push_type_enc, &push_type_enc_len);
                             vs_tr_writer_push_data(file_obj->file_state->transport, physical_step, path,
-                                                     payload_ptr, H5Tget_size(dtype), a_start, a_count);
+                                                     payload_ptr, H5Tget_size(dtype), a_start, a_count,
+                                                     push_type_enc, (uint64_t)push_type_enc_len);
+                            free(push_type_enc);
+                        }
                     }
 #endif
                 }
@@ -6623,27 +6865,42 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
 
         /* Validated regardless of transport: a subscription naming a path
          * that cannot be expressed should fail where the caller made the
-         * mistake. plists[i] is validated but not yet acted on -- per-
-         * subscriber precision (re-filtering) is M8.5 follow-up scope, see
-         * H5Fsubscribe()'s doc comment. spaces[i]'s selection bounds ARE
-         * acted on (M8.5): H5Sget_select_bounds()'s dimension-0 low/high
-         * become the 1-D element range this subscription routes on, the
-         * general-N-D-selection/H5Sselect_intersect_block case dev-plan.md's
-         * M8.5 text describes remains out of scope. */
+         * mistake. spaces[i]'s selection bounds ARE acted on (M8.5):
+         * H5Sget_select_bounds()'s dimension-0 low/high become the 1-D
+         * element range this subscription routes on, the general-N-D-
+         * selection/H5Sselect_intersect_block case dev-plan.md's M8.5 text
+         * describes remains out of scope. plists[i] (M8.5 precision), when
+         * given, must be a real DCPL -- a subscription cannot request a
+         * filter pipeline through anything else. */
         for (size_t i = 0; i < sargs->count; i++) {
+            hid_t plist_id = sargs->plists ? sargs->plists[i] : H5P_DEFAULT;
+
             if (!sargs->paths[i] || sargs->paths[i][0] == '\0')
                 return -1;
             if (H5Sget_simple_extent_ndims(sargs->spaces[i]) < 0)
                 return -1;
+            if (plist_id != H5P_DEFAULT) {
+                hid_t cls = H5Pget_class(plist_id);
+
+                if (cls < 0 || H5Pequal(cls, H5P_DATASET_CREATE) <= 0)
+                    return -1;
+            }
         }
 
 #ifdef VOL_STREAM_HAVE_MERCURY
         if (o->file_state && o->file_state->transport) {
             for (size_t i = 0; i < sargs->count; i++) {
                 uint64_t sel_start = 0, sel_count = UINT64_MAX;
+                hid_t    plist_id = sargs->plists ? sargs->plists[i] : H5P_DEFAULT;
+                uint8_t *dcpl_enc = NULL;
+                size_t   dcpl_enc_len = 0;
 
                 H5VL__stream_space_1d_bounds(sargs->spaces[i], &sel_start, &sel_count);
-                vs_tr_reader_subscribe(o->file_state->transport, sargs->paths[i], sel_start, sel_count);
+                if (plist_id != H5P_DEFAULT)
+                    H5VL__stream_encode_dcpl(plist_id, &dcpl_enc, &dcpl_enc_len);
+                vs_tr_reader_subscribe(o->file_state->transport, sargs->paths[i], sel_start, sel_count,
+                                         dcpl_enc, (uint64_t)dcpl_enc_len);
+                free(dcpl_enc);
             }
         }
 #endif
@@ -6731,11 +6988,40 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
 
         {
             uint64_t size64 = 0;
+            uint8_t *dcpl_enc = NULL, *type_enc = NULL;
+            uint64_t dcpl_enc_len = 0, type_enc_len = 0;
+            uint32_t filter_mask = 0;
             int      r = vs_tr_reader_wait_data(o->file_state->transport, sargs->timeout_ms,
                                                   sargs->physical_step, sargs->path, sargs->buf, &size64,
-                                                  sargs->elem_start, sargs->elem_count);
+                                                  sargs->elem_start, sargs->elem_count, &dcpl_enc,
+                                                  &dcpl_enc_len, &type_enc, &type_enc_len, &filter_mask);
 
             *sargs->size = (size_t)size64;
+
+            /* M8.5 precision: this push was re-filtered (see
+             * H5VL__stream_refilter_for_subscriber()'s comment) -- *buf is
+             * the *filtered* bytes as received, not decoded values. Reverse
+             * it before handing anything back, so a caller of
+             * H5Fget_subscribed_data() always gets real values regardless
+             * of whether this particular push happened to be re-filtered.
+             * A failed reconstruction is not fatal to an otherwise-
+             * successful wait_data() -- falls back to the raw filtered
+             * bytes rather than failing the call. */
+            if (r == 0 && dcpl_enc_len > 0 && type_enc_len > 0 && sargs->elem_count) {
+                void  *decoded     = NULL;
+                size_t decoded_len = 0;
+
+                if (H5VL__stream_unfilter_pushed_data(*sargs->buf, size64, dcpl_enc, dcpl_enc_len, type_enc,
+                                                         type_enc_len, *sargs->elem_count, filter_mask,
+                                                         &decoded, &decoded_len) == 0) {
+                    free(*sargs->buf);
+                    *sargs->buf  = decoded;
+                    *sargs->size = decoded_len;
+                }
+            }
+            free(dcpl_enc);
+            free(type_enc);
+
             return (herr_t)r;
         }
 #else

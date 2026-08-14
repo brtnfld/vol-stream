@@ -88,16 +88,25 @@ hg_proc_vs_blob_t(hg_proc_t proc, void *data)
 
 /* M8: reader -> writer, "send me path's data". M8.5: bounded to the 1-D
  * element range [sel_start, sel_start+sel_count) -- see this file's M8/M8.5
- * header comment. */
-MERCURY_GEN_PROC(vs_subscribe_in_t,
-                  ((uint64_t)(member_id))((hg_string_t)(path))((uint64_t)(sel_start))((uint64_t)(sel_count)))
+ * header comment. dcpl_enc (M8.5 precision) is the subscriber's own
+ * H5Pencode2() bytes for the filter pipeline it wants pushed data
+ * re-filtered through; a 0-length blob means none requested, the original
+ * raw-bytes behavior. */
+MERCURY_GEN_PROC(vs_subscribe_in_t, ((uint64_t)(member_id))((hg_string_t)(path))((uint64_t)(sel_start))(
+                                          (uint64_t)(sel_count))((vs_blob_t)(dcpl_enc)))
 MERCURY_GEN_PROC(vs_subscribe_out_t, ((int32_t)(status)))
 /* M8: writer -> reader, one entry's actual bytes. M8.5: elem_start/
  * elem_count identify which element range of the subscribed object payload
  * covers -- the overlap between what was written and what was requested,
- * not necessarily the subscriber's whole requested range. */
-MERCURY_GEN_PROC(vs_data_push_in_t, ((uint64_t)(physical_step))((hg_string_t)(path))((uint64_t)(elem_start))(
-                                          (uint64_t)(elem_count))((vs_blob_t)(payload)))
+ * not necessarily the subscriber's whole requested range. dcpl_enc/
+ * type_enc/filter_mask (M8.5 precision) are set only when this push was
+ * re-filtered through the subscriber's own requested pipeline (see
+ * vs_tr_refilter_fn's comment) -- 0-length dcpl_enc means payload is raw,
+ * unfiltered bytes, the original M8/M8.5 behavior. */
+MERCURY_GEN_PROC(vs_data_push_in_t,
+                  ((uint64_t)(physical_step))((hg_string_t)(path))((uint64_t)(elem_start))((uint64_t)(
+                      elem_count))((vs_blob_t)(payload))((vs_blob_t)(dcpl_enc))((vs_blob_t)(type_enc))(
+                      (uint32_t)(filter_mask)))
 MERCURY_GEN_PROC(vs_data_push_out_t, ((int32_t)(status)))
 
 typedef struct vs_tr_pending_t {
@@ -117,17 +126,23 @@ typedef struct vs_tr_lag_entry_t {
  * with several subscriptions appears once per path, not once per reader --
  * simplest thing that works, and small enough not to need a smarter index.
  * M8.5: sel_start/sel_count is the subscriber's own requested 1-D element
- * range; [0, UINT64_MAX) means "whole object". */
+ * range; [0, UINT64_MAX) means "whole object". dcpl_enc/dcpl_enc_len (M8.5
+ * precision) is this subscriber's requested filter pipeline, NULL/0 for
+ * none. */
 typedef struct vs_tr_sub_entry_t {
     ssg_member_id_t member_id;
     char            *path;
     uint64_t          sel_start;
     uint64_t          sel_count;
+    uint8_t          *dcpl_enc;
+    uint64_t          dcpl_enc_len;
 } vs_tr_sub_entry_t;
 
 /* M8, reader side: one pushed data item queued for vs_tr_reader_wait_data().
  * M8.5: elem_start/elem_count is the element range buf actually covers (see
- * vs_data_push_in_t's comment). */
+ * vs_data_push_in_t's comment). dcpl_enc/type_enc/filter_mask (M8.5
+ * precision) are set only when buf is re-filtered bytes rather than raw
+ * ones -- NULL/0 dcpl_enc means raw, the original M8/M8.5 behavior. */
 typedef struct vs_tr_data_item_t {
     uint64_t physical_step;
     char    *path;
@@ -135,6 +150,11 @@ typedef struct vs_tr_data_item_t {
     uint64_t size;
     uint64_t elem_start;
     uint64_t elem_count;
+    uint8_t *dcpl_enc;
+    uint64_t dcpl_enc_len;
+    uint8_t *type_enc;
+    uint64_t type_enc_len;
+    uint32_t filter_mask;
 } vs_tr_data_item_t;
 
 struct vs_tr_t {
@@ -207,6 +227,12 @@ struct vs_tr_t {
     vs_tr_data_item_t *data_queue;
     size_t              n_data;
     size_t              cap_data;
+
+    /* M8.5, writer side: precision-refiltering callback, see vs_tr_refilter_
+     * fn's comment in tr_mercury.h. NULL (calloc()'s default) until
+     * vs_tr_set_refilter_cb() is called -- every push is raw bytes, the
+     * original M8/M8.5 behavior, until then. */
+    vs_tr_refilter_fn refilter_fn;
 };
 
 /*-------------------------------------------------------------------------
@@ -236,11 +262,14 @@ vs_push_pending(vs_tr_t *tr, uint64_t physical_step, uint64_t wall_time_ns)
     pthread_mutex_unlock(&tr->pending_lock);
 } /* end vs_push_pending() */
 
-/* M8: takes ownership of path/buf on success (frees them itself if the queue
- * cannot grow); the caller's own copies must not be used afterward. */
+/* M8: takes ownership of path/buf/dcpl_enc/type_enc on success (frees them
+ * itself if the queue cannot grow); the caller's own copies must not be
+ * used afterward. M8.5: dcpl_enc/type_enc may each be NULL/0 (the ordinary
+ * unfiltered push). */
 static void
 vs_push_data_item(vs_tr_t *tr, uint64_t physical_step, char *path, void *buf, uint64_t size,
-                    uint64_t elem_start, uint64_t elem_count)
+                    uint64_t elem_start, uint64_t elem_count, uint8_t *dcpl_enc, uint64_t dcpl_enc_len,
+                    uint8_t *type_enc, uint64_t type_enc_len, uint32_t filter_mask)
 {
     pthread_mutex_lock(&tr->data_lock);
 
@@ -260,11 +289,18 @@ vs_push_data_item(vs_tr_t *tr, uint64_t physical_step, char *path, void *buf, ui
         tr->data_queue[tr->n_data].size          = size;
         tr->data_queue[tr->n_data].elem_start    = elem_start;
         tr->data_queue[tr->n_data].elem_count    = elem_count;
+        tr->data_queue[tr->n_data].dcpl_enc      = dcpl_enc;
+        tr->data_queue[tr->n_data].dcpl_enc_len  = dcpl_enc_len;
+        tr->data_queue[tr->n_data].type_enc      = type_enc;
+        tr->data_queue[tr->n_data].type_enc_len  = type_enc_len;
+        tr->data_queue[tr->n_data].filter_mask   = filter_mask;
         tr->n_data++;
     }
     else {
         free(path);
         free(buf);
+        free(dcpl_enc);
+        free(type_enc);
     }
     pthread_cond_broadcast(&tr->data_cond);
     pthread_mutex_unlock(&tr->data_lock);
@@ -423,6 +459,26 @@ vs_reader_ack_ult(hg_handle_t handle)
 }
 DEFINE_MARGO_RPC_HANDLER(vs_reader_ack_ult)
 
+/* A copy, not an ownership transfer: used where the source (an `in` struct
+ * margo_get_input() decoded) is about to be freed by margo_free_input(), but
+ * the destination (a long-lived table entry) needs its own buffer. Returns
+ * 0 on success (even for a genuinely empty blob -- *out_buf is then NULL,
+ * *out_len 0), -1 only on allocation failure. */
+static int
+vs_blob_dup(const vs_blob_t *b, uint8_t **out_buf, uint64_t *out_len)
+{
+    if (b->size == 0) {
+        *out_buf = NULL;
+        *out_len = 0;
+        return 0;
+    }
+    if (NULL == (*out_buf = (uint8_t *)malloc((size_t)b->size)))
+        return -1;
+    memcpy(*out_buf, b->buf, (size_t)b->size);
+    *out_len = b->size;
+    return 0;
+} /* end vs_blob_dup() */
+
 /* M8: writer-side handler for vs_subscribe_in_t. Same thread discipline as
  * vs_reader_ack_ult -- touches only sub_table under sub_lock. A repeat
  * subscription from the same member for the same path replaces the stored
@@ -450,6 +506,14 @@ vs_subscribe_ult(hg_handle_t handle)
         for (i = 0; i < tr->n_sub; i++)
             if (tr->sub_table[i].member_id == (ssg_member_id_t)in.member_id &&
                 strcmp(tr->sub_table[i].path, in.path) == 0) {
+                uint8_t *dcpl_copy;
+                uint64_t dcpl_copy_len;
+
+                if (vs_blob_dup(&in.dcpl_enc, &dcpl_copy, &dcpl_copy_len) == 0) {
+                    free(tr->sub_table[i].dcpl_enc);
+                    tr->sub_table[i].dcpl_enc     = dcpl_copy;
+                    tr->sub_table[i].dcpl_enc_len = dcpl_copy_len;
+                }
                 tr->sub_table[i].sel_start = in.sel_start;
                 tr->sub_table[i].sel_count = in.sel_count;
                 found = 1;
@@ -468,15 +532,21 @@ vs_subscribe_ult(hg_handle_t handle)
                 }
             }
             if (tr->n_sub < tr->cap_sub) {
-                char *path_copy = strdup(in.path);
+                char    *path_copy = strdup(in.path);
+                uint8_t *dcpl_copy = NULL;
+                uint64_t dcpl_copy_len = 0;
 
-                if (path_copy) {
-                    tr->sub_table[tr->n_sub].member_id = (ssg_member_id_t)in.member_id;
-                    tr->sub_table[tr->n_sub].path      = path_copy;
-                    tr->sub_table[tr->n_sub].sel_start = in.sel_start;
-                    tr->sub_table[tr->n_sub].sel_count = in.sel_count;
+                if (path_copy && vs_blob_dup(&in.dcpl_enc, &dcpl_copy, &dcpl_copy_len) == 0) {
+                    tr->sub_table[tr->n_sub].member_id     = (ssg_member_id_t)in.member_id;
+                    tr->sub_table[tr->n_sub].path          = path_copy;
+                    tr->sub_table[tr->n_sub].sel_start     = in.sel_start;
+                    tr->sub_table[tr->n_sub].sel_count     = in.sel_count;
+                    tr->sub_table[tr->n_sub].dcpl_enc      = dcpl_copy;
+                    tr->sub_table[tr->n_sub].dcpl_enc_len  = dcpl_copy_len;
                     tr->n_sub++;
                 }
+                else
+                    free(path_copy);
             }
         }
 
@@ -492,11 +562,13 @@ vs_subscribe_ult(hg_handle_t handle)
 DEFINE_MARGO_RPC_HANDLER(vs_subscribe_ult)
 
 /* M8: reader-side handler for vs_data_push_in_t -- just queues the item;
- * see vs_push_data_item(). Ownership of the decoded path/payload buffers
- * moves into the queue (or is freed by vs_push_data_item() itself if the
- * queue could not grow), so this handler must not touch in.path/in.payload
- * again after handing them off, and must not margo_free_input() them --
- * that would free memory the queue now owns. */
+ * see vs_push_data_item(). Ownership of the decoded path/payload/dcpl_enc/
+ * type_enc buffers moves into the queue (or is freed by vs_push_data_item()
+ * itself if the queue could not grow); each moved blob's .buf is set to
+ * NULL first so the subsequent margo_free_input() -- which still runs, to
+ * free everything NOT handed off (in.path itself; in's own top-level
+ * struct) -- sees a harmless no-op free() for those fields instead of a
+ * double free (see hg_proc_vs_blob_t's HG_FREE case). */
 static void
 vs_data_push_ult(hg_handle_t handle)
 {
@@ -513,8 +585,12 @@ vs_data_push_ult(hg_handle_t handle)
 
         if (path_copy) {
             vs_push_data_item(tr, in.physical_step, path_copy, in.payload.buf, in.payload.size, in.elem_start,
-                                in.elem_count);
-            in.payload.buf = NULL; /* ownership moved -- do not let margo_free_input() free it too */
+                                in.elem_count, (uint8_t *)in.dcpl_enc.buf, in.dcpl_enc.size,
+                                (uint8_t *)in.type_enc.buf, in.type_enc.size, in.filter_mask);
+            /* ownership moved -- do not let margo_free_input() free these too */
+            in.payload.buf  = NULL;
+            in.dcpl_enc.buf = NULL;
+            in.type_enc.buf = NULL;
             out.status      = 0;
         }
         margo_free_input(handle, &in);
@@ -587,6 +663,13 @@ vs_tr_start(const char *na_str)
 }
 
 void
+vs_tr_set_refilter_cb(vs_tr_t *tr, vs_tr_refilter_fn fn)
+{
+    if (tr)
+        tr->refilter_fn = fn;
+}
+
+void
 vs_tr_stop(vs_tr_t *tr)
 {
     if (!tr)
@@ -624,12 +707,16 @@ vs_tr_stop(vs_tr_t *tr)
     {
         size_t i;
 
-        for (i = 0; i < tr->n_sub; i++)
+        for (i = 0; i < tr->n_sub; i++) {
             free(tr->sub_table[i].path);
+            free(tr->sub_table[i].dcpl_enc);
+        }
         free(tr->sub_table);
         for (i = 0; i < tr->n_data; i++) {
             free(tr->data_queue[i].path);
             free(tr->data_queue[i].buf);
+            free(tr->data_queue[i].dcpl_enc);
+            free(tr->data_queue[i].type_enc);
         }
         free(tr->data_queue);
     }
@@ -1016,7 +1103,8 @@ vs_tr_writer_min_acked_step(vs_tr_t *tr, uint64_t *min_acked_step)
 }
 
 int
-vs_tr_reader_subscribe(vs_tr_t *tr, const char *path, uint64_t sel_start, uint64_t sel_count)
+vs_tr_reader_subscribe(vs_tr_t *tr, const char *path, uint64_t sel_start, uint64_t sel_count,
+                        const uint8_t *dcpl_enc, uint64_t dcpl_enc_len)
 {
     ssg_member_id_t     self_id;
     vs_subscribe_in_t in;
@@ -1031,6 +1119,10 @@ vs_tr_reader_subscribe(vs_tr_t *tr, const char *path, uint64_t sel_start, uint64
     in.path       = (hg_string_t)path;
     in.sel_start  = sel_start;
     in.sel_count  = sel_count;
+    /* HG_ENCODE only reads this -- see hg_proc_vs_blob_t() -- so pointing
+     * directly at the caller's own buffer needs no copy here. */
+    in.dcpl_enc.buf  = (void *)(uintptr_t)dcpl_enc;
+    in.dcpl_enc.size = dcpl_enc_len;
 
     /* Same target-the-cached-writer-then-fall-back-to-probing approach as
      * vs_tr_reader_ack_step() -- see that function's comment. */
@@ -1097,7 +1189,8 @@ vs_tr_reader_subscribe(vs_tr_t *tr, const char *path, uint64_t sel_start, uint64
 
 int
 vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, const void *buf,
-                        uint64_t elem_size, uint64_t write_start, uint64_t write_count)
+                        uint64_t elem_size, uint64_t write_start, uint64_t write_count,
+                        const uint8_t *type_enc, uint64_t type_enc_len)
 {
     ssg_member_id_t   self_id;
     int                 group_size, i;
@@ -1121,6 +1214,12 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
         size_t             j;
         int                subscribed = 0;
         uint64_t           sub_start = 0, sub_end = 0, overlap_start, overlap_end, overlap_count;
+        uint8_t           *sub_dcpl_enc = NULL;
+        uint64_t           sub_dcpl_enc_len = 0;
+        void              *filtered_buf = NULL;
+        uint64_t           filtered_len = 0;
+        uint32_t           filter_mask = 0;
+        int                did_refilter = 0;
         vs_data_push_in_t in;
 
         if (SSG_SUCCESS != ssg_get_group_member_id_from_rank(tr->group_id, i, &member_id))
@@ -1137,6 +1236,16 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
                  * sel_start + sel_count, which would overflow. */
                 sub_end   = (tr->sub_table[j].sel_count == UINT64_MAX) ? UINT64_MAX
                                                                         : sub_start + tr->sub_table[j].sel_count;
+                /* Copy, not a borrowed pointer: a concurrent re-subscribe
+                 * could free/replace tr->sub_table[j].dcpl_enc after this
+                 * function releases sub_lock below, while the refilter call
+                 * further down (real work -- building a temp dataset,
+                 * writing, reading back) is still using it. */
+                if (tr->sub_table[j].dcpl_enc_len > 0 &&
+                    NULL != (sub_dcpl_enc = (uint8_t *)malloc(tr->sub_table[j].dcpl_enc_len))) {
+                    memcpy(sub_dcpl_enc, tr->sub_table[j].dcpl_enc, tr->sub_table[j].dcpl_enc_len);
+                    sub_dcpl_enc_len = tr->sub_table[j].dcpl_enc_len;
+                }
                 subscribed = 1;
                 break;
             }
@@ -1152,23 +1261,61 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
          * empty push (see this function's header comment). */
         overlap_start = (sub_start > write_start) ? sub_start : write_start;
         overlap_end   = (sub_end < write_end) ? sub_end : write_end;
-        if (overlap_start >= overlap_end)
+        if (overlap_start >= overlap_end) {
+            free(sub_dcpl_enc);
             continue;
+        }
         overlap_count = overlap_end - overlap_start;
 
-        in.physical_step = physical_step;
-        in.path             = (hg_string_t)path;
-        in.elem_start       = overlap_start;
-        in.elem_count       = overlap_count;
-        in.payload.size    = overlap_count * elem_size;
-        /* HG_ENCODE only reads this -- see hg_proc_vs_blob_t(). Slicing by
-         * byte offset into buf: buf's own first element is write_start, so
-         * the overlap begins (overlap_start - write_start) elements in. */
-        in.payload.buf =
-            (void *)((const uint8_t *)buf + (overlap_start - write_start) * elem_size);
+        {
+            /* HG_ENCODE only reads this -- see hg_proc_vs_blob_t(). Slicing
+             * by byte offset into buf: buf's own first element is
+             * write_start, so the overlap begins (overlap_start -
+             * write_start) elements in. */
+            const void *overlap_ptr =
+                (const uint8_t *)buf + (overlap_start - write_start) * elem_size;
 
-        if (SSG_SUCCESS != ssg_get_group_member_addr(tr->group_id, member_id, &addr))
+            /* M8.5 precision: this subscriber asked for a specific filter
+             * pipeline -- run the overlap slice through it via the
+             * registered callback (see vs_tr_refilter_fn's comment) instead
+             * of sending raw bytes. A declined/failed refilter (no callback
+             * registered, or the callback itself fails) is not an error --
+             * fall back to the exact raw-bytes behavior this subscriber
+             * would have gotten without a dcpl_enc at all. */
+            if (sub_dcpl_enc_len > 0 && tr->refilter_fn &&
+                0 == tr->refilter_fn(overlap_ptr, elem_size, overlap_count, sub_dcpl_enc, sub_dcpl_enc_len,
+                                       type_enc, type_enc_len, &filtered_buf, &filtered_len, &filter_mask))
+                did_refilter = 1;
+
+            in.physical_step = physical_step;
+            in.path             = (hg_string_t)path;
+            in.elem_start       = overlap_start;
+            in.elem_count       = overlap_count;
+            in.filter_mask      = filter_mask;
+
+            if (did_refilter) {
+                in.payload.buf     = filtered_buf;
+                in.payload.size    = filtered_len;
+                in.dcpl_enc.buf    = sub_dcpl_enc;
+                in.dcpl_enc.size   = sub_dcpl_enc_len;
+                in.type_enc.buf    = (void *)(uintptr_t)type_enc;
+                in.type_enc.size   = type_enc_len;
+            }
+            else {
+                in.payload.buf   = (void *)(uintptr_t)overlap_ptr;
+                in.payload.size  = overlap_count * elem_size;
+                in.dcpl_enc.buf  = NULL;
+                in.dcpl_enc.size = 0;
+                in.type_enc.buf  = NULL;
+                in.type_enc.size = 0;
+            }
+        }
+
+        if (SSG_SUCCESS != ssg_get_group_member_addr(tr->group_id, member_id, &addr)) {
+            free(sub_dcpl_enc);
+            free(filtered_buf);
             continue;
+        }
 
         /* Same bounded, best-effort forward as vs_tr_writer_broadcast_step_ready() --
          * a stalled or gone subscriber must not stall the writer. */
@@ -1182,6 +1329,8 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
             margo_destroy(handle);
         }
         margo_addr_free(tr->mid, addr);
+        free(sub_dcpl_enc);
+        free(filtered_buf);
     }
 
     return 0;
@@ -1190,7 +1339,8 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
 int
 vs_tr_reader_wait_data(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physical_step, char **out_path,
                          void **out_buf, uint64_t *out_size, uint64_t *out_elem_start,
-                         uint64_t *out_elem_count)
+                         uint64_t *out_elem_count, uint8_t **out_dcpl_enc, uint64_t *out_dcpl_enc_len,
+                         uint8_t **out_type_enc, uint64_t *out_type_enc_len, uint32_t *out_filter_mask)
 {
     struct timespec deadline;
     int             ret = -1;
@@ -1229,6 +1379,20 @@ vs_tr_reader_wait_data(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physical_step
             *out_elem_start = tr->data_queue[0].elem_start;
         if (out_elem_count)
             *out_elem_count = tr->data_queue[0].elem_count;
+        if (out_dcpl_enc)
+            *out_dcpl_enc = tr->data_queue[0].dcpl_enc;
+        else
+            free(tr->data_queue[0].dcpl_enc);
+        if (out_dcpl_enc_len)
+            *out_dcpl_enc_len = tr->data_queue[0].dcpl_enc_len;
+        if (out_type_enc)
+            *out_type_enc = tr->data_queue[0].type_enc;
+        else
+            free(tr->data_queue[0].type_enc);
+        if (out_type_enc_len)
+            *out_type_enc_len = tr->data_queue[0].type_enc_len;
+        if (out_filter_mask)
+            *out_filter_mask = tr->data_queue[0].filter_mask;
         memmove(&tr->data_queue[0], &tr->data_queue[1], (tr->n_data - 1) * sizeof(*tr->data_queue));
         tr->n_data--;
         ret = 0;

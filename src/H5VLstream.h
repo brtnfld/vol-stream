@@ -135,12 +135,24 @@
  *              subscriber's requested range, sending only that slice.
  *              H5Fget_subscribed_data() reports the covered subrange via its
  *              elem_start/elem_count OUT params. Attribute paths ("@"-joined,
- *              H5VL__stream_attr_path()) are subscribable too. Still open:
- *              HDF5-storage-chunk-granularity routing (would need
+ *              H5VL__stream_attr_path()) are subscribable too.
+ *
+ *              Per-subscriber precision also landed: a subscription's DCPL
+ *              (H5Fsubscribe()'s plists, previously accepted and ignored) now
+ *              makes the writer re-filter that subscriber's slice through the
+ *              requested pipeline before sending -- two subscribers to one
+ *              object can get it at different precisions, and the object
+ *              itself need not be filtered at all. Reversal is transparent
+ *              (H5Fget_subscribed_data() always returns decoded values). See
+ *              H5VL__stream_refilter_for_subscriber() in src/H5VLstream.c and
+ *              vs_tr_refilter_fn in src/tr_mercury.h.
+ *
+ *              Still open: HDF5-storage-chunk-granularity routing (would need
  *              H5Sselect_intersect_block against a FilteredChunks payload
- *              form this codebase has never actually built, despite it
- *              being schema-defined since M2) and per-subscriber precision
- *              (the subscription's DCPL is accepted and still ignored).
+ *              form this codebase has never actually built, despite it being
+ *              schema-defined since M2). Re-filtering accordingly always uses
+ *              one chunk spanning the whole pushed subrange rather than
+ *              honoring a chunk shape the subscriber's DCPL requested.
  */
 
 #ifndef H5VLstream_H
@@ -364,13 +376,22 @@ H5VL_STREAM_API herr_t H5Fget_logical_steps(hid_t file_id, size_t *n_logical, ui
  * \param plists   DCPL IDs requesting a filter pipeline, or NULL
  * \return \herr_t
  *
- * \note M8, first increment: routes at whole-object granularity only --
- *       \p spaces and \p plists are validated (a selection that cannot be
- *       expressed still fails here, where the caller made the mistake) but
- *       not yet acted on. A subscribed path's *entire* payload is pushed for
- *       every step that writes it; the dataspace subvolume and per-subscriber
- *       precision (property-list re-filtering) dev-plan.md's M8 section
- *       describes are follow-up scope. Call H5Fget_subscribed_data() after
+ * \note M8.5: both \p spaces and \p plists are now acted on. \p spaces bounds
+ *       what is pushed to a 1-D element subrange (dimension 0 of
+ *       H5Sget_select_bounds()); \p plists, when given, makes the writer
+ *       re-filter that subrange through the requested pipeline before it goes
+ *       on the wire, so two subscribers to the same object can receive it at
+ *       different precisions. Reversal is transparent:
+ *       H5Fget_subscribed_data() always hands back decoded values, never raw
+ *       filtered bytes, so a caller never has to know whether a given push was
+ *       re-filtered. A \p plists entry must be a real DCPL (H5P_DEFAULT means
+ *       "no re-filtering", the original raw-bytes behavior).
+ *
+ * \note Still follow-up scope: the general N-D-selection case
+ *       (H5Sselect_intersect_block against HDF5 storage chunks) -- routing is
+ *       1-D element ranges, and re-filtering always uses a single chunk
+ *       spanning the whole pushed subrange rather than honoring a chunk shape
+ *       requested in \p plists. Call H5Fget_subscribed_data() after
  *       H5Fwait_step_ready() to retrieve what was pushed.
  */
 H5VL_STREAM_API herr_t H5Fsubscribe(hid_t file_id, size_t count, const char *const *paths, const hid_t *spaces,
