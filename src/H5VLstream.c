@@ -3480,6 +3480,150 @@ H5VL__stream_space_1d_bounds(hid_t space_id, uint64_t *start, uint64_t *count)
 } /* end H5VL__stream_space_1d_bounds() */
 
 /*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_space_flat_runs
+ *
+ * Purpose:     Decompose a dataspace selection into the maximal *contiguous
+ *              flat element runs* it covers, in the same row-major order
+ *              HDF5 packs the corresponding memory buffer.
+ *
+ *              Subscription pushes describe their payload as one flat range
+ *              [elem_start, elem_start + elem_count), with the payload's
+ *              bytes contiguous from elem_start. That description is only
+ *              truthful when the write's own selection is itself one
+ *              contiguous flat run. It is for a whole-dataset write, and
+ *              for a slab of leading dimensions -- but not, say, for a
+ *              column of a 2-D dataset, whose N elements are strided across
+ *              the extent. Pushing those N packed values labelled as
+ *              [first_element, first_element + N) tells the subscriber they
+ *              belong at consecutive flat indices, where all but the first
+ *              are simply somewhere else. Splitting into runs and pushing
+ *              each separately makes every push's claim true, and needs no
+ *              wire change: the receiving queue already delivers pushes one
+ *              at a time, each with its own range.
+ *
+ *              runs[i] = {flat_start, n_elements}, and consecutive runs'
+ *              element counts also give the offsets into the packed buffer
+ *              (run 0 starts at buffer element 0, run 1 at run 0's length,
+ *              and so on), which is what lets the caller slice the payload
+ *              without re-deriving the selection.
+ *
+ *              Handles the hyperslab and all-elements cases; a point or
+ *              irregular selection reports 0 runs, which the caller treats
+ *              as "cannot describe this truthfully" rather than guessing.
+ *
+ * Return:      Number of runs written to runs[] (<= max_runs), or -1 on
+ *              error or if the selection needs more than max_runs.
+ *-------------------------------------------------------------------------
+ */
+/* Cap on how many contiguous runs one write is split into for subscription
+ * pushes. A whole-dataset or slab write is 1 run; a strided write is one per
+ * row of the selection. The cap bounds a pathological selection turning a
+ * single write into an unbounded burst of RPCs -- beyond it the push is
+ * skipped entirely (the data is still durably written either way). */
+#define H5VL_STREAM_MAX_PUSH_RUNS 256
+
+typedef struct H5VL_stream_flat_run_t {
+    uint64_t start; /* flat element index of the run's first element */
+    uint64_t count; /* elements in the run                          */
+} H5VL_stream_flat_run_t;
+
+static int
+H5VL__stream_space_flat_runs(hid_t space_id, H5VL_stream_flat_run_t *runs, int max_runs)
+{
+    hsize_t  dims[H5S_MAX_RANK], stride[H5S_MAX_RANK];
+    hsize_t *blocks = NULL;
+    hssize_t nblocks;
+    int      rank, d, n_runs = 0;
+    H5S_sel_type sel;
+
+    if (!runs || max_runs <= 0)
+        return -1;
+    if (H5Sget_simple_extent_type(space_id) == H5S_SCALAR) {
+        runs[0].start = 0;
+        runs[0].count = 1;
+        return 1;
+    }
+    if ((rank = H5Sget_simple_extent_dims(space_id, dims, NULL)) <= 0)
+        return -1;
+
+    /* Row-major strides: last dimension varies fastest. */
+    stride[rank - 1] = 1;
+    for (d = rank - 2; d >= 0; d--)
+        stride[d] = stride[d + 1] * dims[d + 1];
+
+    sel = H5Sget_select_type(space_id);
+
+    if (sel == H5S_SEL_ALL) {
+        hssize_t npoints = H5Sget_select_npoints(space_id);
+
+        if (npoints < 0)
+            return -1;
+        runs[0].start = 0;
+        runs[0].count = (uint64_t)npoints;
+        return 1;
+    }
+    if (sel != H5S_SEL_HYPERSLABS)
+        return -1; /* points/irregular -- caller decides what to do */
+
+    if ((nblocks = H5Sget_select_hyper_nblocks(space_id)) <= 0)
+        return -1;
+    if (NULL == (blocks = (hsize_t *)malloc((size_t)nblocks * 2 * (size_t)rank * sizeof(hsize_t))))
+        return -1;
+    if (H5Sget_select_hyper_blocklist(space_id, 0, (hsize_t)nblocks, blocks) < 0) {
+        free(blocks);
+        return -1;
+    }
+
+    /* Each block is [start_coords..end_coords] inclusive. Within a block the
+     * last dimension is contiguous, so it contributes one run per
+     * combination of the leading coordinates. */
+    for (hssize_t b = 0; b < nblocks; b++) {
+        const hsize_t *bs = blocks + (size_t)b * 2 * (size_t)rank;
+        const hsize_t *be = bs + rank;
+        hsize_t        cur[H5S_MAX_RANK];
+        uint64_t       run_len = (uint64_t)(be[rank - 1] - bs[rank - 1] + 1);
+        int            carry;
+
+        for (d = 0; d < rank; d++)
+            cur[d] = bs[d];
+
+        for (;;) {
+            uint64_t flat = 0;
+
+            if (n_runs >= max_runs) {
+                free(blocks);
+                return -1;
+            }
+            for (d = 0; d < rank; d++)
+                flat += (uint64_t)cur[d] * (uint64_t)stride[d];
+
+            runs[n_runs].start = flat;
+            runs[n_runs].count = run_len;
+            n_runs++;
+
+            /* Advance the leading coordinates (all but the last, which the
+             * run itself spans), odometer-style. */
+            carry = 1;
+            for (d = rank - 2; d >= 0 && carry; d--) {
+                if (cur[d] < be[d]) {
+                    cur[d]++;
+                    carry = 0;
+                }
+                else
+                    cur[d] = bs[d];
+            }
+            if (carry) /* rolled over every leading dimension -- block done */
+                break;
+            if (rank == 1)
+                break;
+        }
+    }
+
+    free(blocks);
+    return n_runs;
+} /* end H5VL__stream_space_flat_runs() */
+
+/*-------------------------------------------------------------------------
  * Function:    H5VL__stream_replay_manifest
  *
  * Purpose:     The M2 core (M7: the second half of what was
@@ -3905,12 +4049,45 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                                 }
                             }
 
-                            vs_tr_writer_push_data(file_obj->file_state->transport, physical_step, path,
-                                                     payload_ptr, H5Tget_size(dtype), w_start,
-                                                     (uint64_t)n_elem, push_type_enc,
-                                                     (uint64_t)push_type_enc_len, native_dcpl_enc,
-                                                     (uint64_t)native_dcpl_enc_len,
-                                                     native_ctx.under_dset ? &native_ctx : NULL);
+                            /* One push per contiguous flat run. A whole-
+                             * dataset or leading-dimension-slab write is a
+                             * single run, so the common case is unchanged;
+                             * a strided write (a column, say) becomes
+                             * several pushes, each truthfully describing
+                             * where its own bytes belong. See
+                             * H5VL__stream_space_flat_runs() for why one
+                             * push cannot describe a strided write at all.
+                             *
+                             * If the selection cannot be decomposed (point
+                             * or irregular selections, or more runs than
+                             * the cap), nothing is pushed rather than
+                             * something mislabelled -- the data is still
+                             * durably in the file either way, and a
+                             * subscriber missing a push is recoverable
+                             * where silently wrong values are not. */
+                            {
+                                H5VL_stream_flat_run_t runs[H5VL_STREAM_MAX_PUSH_RUNS];
+                                int                    n_runs;
+                                uint64_t               buf_elem = 0;
+                                size_t                 esize    = H5Tget_size(dtype);
+                                int                    r;
+
+                                n_runs = H5VL__stream_space_flat_runs(dspace, runs,
+                                                                      H5VL_STREAM_MAX_PUSH_RUNS);
+                                for (r = 0; r < n_runs; r++) {
+                                    const void *run_ptr =
+                                        (const uint8_t *)payload_ptr + (size_t)buf_elem * esize;
+
+                                    vs_tr_writer_push_data(file_obj->file_state->transport, physical_step,
+                                                             path, run_ptr, esize, runs[r].start,
+                                                             runs[r].count, push_type_enc,
+                                                             (uint64_t)push_type_enc_len, native_dcpl_enc,
+                                                             (uint64_t)native_dcpl_enc_len,
+                                                             native_ctx.under_dset ? &native_ctx : NULL);
+                                    buf_elem += runs[r].count;
+                                }
+                                (void)w_count;
+                            }
 
                             /* native_dcpl_enc is deliberately not freed: it
                              * points into the manifest buffer, not to an

@@ -485,10 +485,28 @@ of elements received, since the values that did arrive were correct and a
 value-only check passes while most of the data goes missing.
 
 The linearized range is the smallest flat span *containing* the selection's
-bounding box, so a non-contiguous selection (a column, say) yields a
-superset of what was asked for. Deliberate: over-sending is inefficiency,
-under-sending is data loss. Narrowing it is what per-chunk/per-block routing
-would buy.
+bounding box, so a non-contiguous **subscription** yields a superset of what
+was asked for. Deliberate: over-sending is inefficiency, under-sending is
+data loss.
+
+**A second, worse instance of the same assumption, on the write side.** A
+push describes its payload as one flat range with the bytes contiguous from
+`elem_start` — truthful only when the *write's* own selection is a single
+contiguous flat run. It is for a whole-dataset write or a slab of leading
+dimensions, but not for a strided one: a write of column 0 of a 4x8 dataset
+was pushed as `elem_start=0 elem_count=4`, claiming flat elements 0..3 when
+three of those were never written and the column's real values belong at
+flat 0, 8, 16, 24. Unlike the subscription case that was *wrong values*, not
+missing ones. Fixed by `H5VL__stream_space_flat_runs()`, which decomposes a
+selection into maximal contiguous flat runs and pushes each separately —
+no wire change, since the receiving queue already delivers one push at a
+time with its own range. A whole-dataset or slab write stays a single push,
+so the common path is unchanged. Point/irregular selections, or selections
+exceeding the run cap, push nothing rather than something mislabelled: the
+data is durably in the file regardless, and a missing push is recoverable
+where silently wrong values are not. `test/t_strided_write.c` pins it by
+checking every pushed element against whether the writer actually wrote that
+flat index.
 
 1-D element-range intersection shipped: a subscription's `H5Sencode2` bounds
 (via `H5Sget_select_bounds()`, dimension 0) now thread through to the writer,
