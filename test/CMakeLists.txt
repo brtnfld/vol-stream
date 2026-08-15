@@ -113,7 +113,12 @@ endif()
 add_executable(t_h5stream_list t_h5stream_list.c)
 target_link_libraries(t_h5stream_list PRIVATE vol_stream)
 add_test(NAME h5stream_list COMMAND t_h5stream_list $<TARGET_FILE:h5stream>)
-set_tests_properties(h5stream_list PROPERTIES
+
+add_executable(t_h5stream_export t_h5stream_export.c)
+target_link_libraries(t_h5stream_export PRIVATE vol_stream)
+add_test(NAME h5stream_export COMMAND t_h5stream_export $<TARGET_FILE:h5stream>)
+
+set_tests_properties(h5stream_list h5stream_export PROPERTIES
   ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
   TIMEOUT 60
 )
