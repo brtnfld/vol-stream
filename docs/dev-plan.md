@@ -470,6 +470,26 @@ increment already accepts and validates but never acts on.
 single `end_step`, wire bytes measured (not just asserted less-than) to scale
 with subscribed volume — dev-plan.md's M8 exit gate, in full.
 
+**Correctness fix 2026-08-14 — N-D selections were silently truncated.**
+Routing is expressed in flat element indices, and the bounds helper used
+`H5Sget_select_bounds()`'s *dimension-0* low/high directly as element
+indices. For a 1-D dataspace that is the same thing, and every subscription
+test in the suite was 1-D, so it went unnoticed. For rank >= 2 dimension 0
+indexes rows, not elements: subscribing to row 0 of a ROWS x COLS dataset
+produced the range `[0, 1)` — one element instead of the COLS-wide row
+asked for — and the subscriber was served a fraction of its subscription
+with no error. That is data loss, not coarse routing. The bounds are now
+linearized against the dataspace's own extent (row-major, matching HDF5's
+element ordering); `test/t_subvolume_nd.c` pins it by checking the *count*
+of elements received, since the values that did arrive were correct and a
+value-only check passes while most of the data goes missing.
+
+The linearized range is the smallest flat span *containing* the selection's
+bounding box, so a non-contiguous selection (a column, say) yields a
+superset of what was asked for. Deliberate: over-sending is inefficiency,
+under-sending is data loss. Narrowing it is what per-chunk/per-block routing
+would buy.
+
 1-D element-range intersection shipped: a subscription's `H5Sencode2` bounds
 (via `H5Sget_select_bounds()`, dimension 0) now thread through to the writer,
 which intersects each subscriber's requested range against what it actually

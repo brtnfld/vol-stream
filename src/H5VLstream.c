@@ -3405,14 +3405,39 @@ done:
  * Purpose:     M8.5. The 1-D element range [*start, *start + *count) space_id
  *              covers, for subscription routing (H5Fsubscribe()'s handler
  *              and the DsetWrite/Attr push hooks in
- *              H5VL__stream_replay_manifest()). H5Sget_select_bounds()
- *              writes one array entry per dimension, so for a SCALAR
- *              dataspace (rank 0 -- H5S_SCALAR, the natural shape for an
- *              attribute) it writes nothing at all into low[0]/high[0],
- *              which would otherwise be read as uninitialized stack
- *              garbage (found by actually running the attribute-push test
- *              this function exists for -- see project_m8_status.md).
- *              Scalar is treated as exactly one element at index 0.
+ *              H5VL__stream_replay_manifest()). Routing is expressed in flat
+ *              element indices, so an N-D selection has to be *linearized*
+ *              against the dataspace's own extent -- row-major, matching
+ *              HDF5's own element ordering.
+ *
+ *              This originally used H5Sget_select_bounds()'s dimension-0
+ *              low/high directly as element indices. For a genuinely 1-D
+ *              dataspace that is the same thing (the stride below is 1) and
+ *              every subscription test in the suite was 1-D, so it went
+ *              unnoticed. For rank >= 2 it is simply wrong: dimension 0
+ *              indexes rows, not elements, so subscribing to row 0 of a
+ *              ROWS x COLS dataset produced the range [0, 1) -- one element
+ *              instead of the COLS-wide row actually asked for, and the
+ *              subscriber was silently served a fraction of its
+ *              subscription. Caught by test/t_subvolume_nd.c.
+ *
+ *              The range returned is the smallest flat span *containing*
+ *              the selection's bounding box. For a selection that is not
+ *              contiguous in row-major order (a column, say) that span is
+ *              wider than the selection itself, so a subscriber can receive
+ *              a superset of what it asked for. That is deliberate:
+ *              over-sending is a routing inefficiency, while under-sending
+ *              is data loss. Narrowing it needs per-chunk or per-block
+ *              routing -- see docs/dev-plan.md.
+ *
+ *              H5Sget_select_bounds() writes one array entry per dimension,
+ *              so for a SCALAR dataspace (rank 0 -- H5S_SCALAR, the natural
+ *              shape for an attribute) it writes nothing at all into
+ *              low[0]/high[0], which would otherwise be read as
+ *              uninitialized stack garbage (found by actually running the
+ *              attribute-push test this function exists for -- see
+ *              project_m8_status.md). Scalar is treated as exactly one
+ *              element at index 0.
  *
  * Return:      Success:    0
  *              Failure:    -1
@@ -3421,19 +3446,36 @@ done:
 static herr_t
 H5VL__stream_space_1d_bounds(hid_t space_id, uint64_t *start, uint64_t *count)
 {
+    hsize_t low[H5S_MAX_RANK], high[H5S_MAX_RANK], dims[H5S_MAX_RANK];
+    uint64_t flat_low = 0, flat_high = 0, stride = 1;
+    int      rank, d;
+
     if (H5Sget_simple_extent_type(space_id) == H5S_SCALAR) {
         *start = 0;
         *count = 1;
         return 0;
     }
-    {
-        hsize_t low[32], high[32];
 
-        if (H5Sget_select_bounds(space_id, low, high) < 0)
-            return -1;
-        *start = (uint64_t)low[0];
-        *count = (uint64_t)(high[0] - low[0] + 1);
+    if ((rank = H5Sget_simple_extent_dims(space_id, dims, NULL)) < 0)
+        return -1;
+    if (rank == 0) { /* extent-less but not H5S_SCALAR -- treat as one element */
+        *start = 0;
+        *count = 1;
+        return 0;
     }
+    if (H5Sget_select_bounds(space_id, low, high) < 0)
+        return -1;
+
+    /* Row-major: the fastest-varying dimension is the last, so accumulate
+     * strides from the back. */
+    for (d = rank - 1; d >= 0; d--) {
+        flat_low += (uint64_t)low[d] * stride;
+        flat_high += (uint64_t)high[d] * stride;
+        stride *= (uint64_t)dims[d];
+    }
+
+    *start = flat_low;
+    *count = flat_high - flat_low + 1;
     return 0;
 } /* end H5VL__stream_space_1d_bounds() */
 
