@@ -643,19 +643,38 @@ refused — the documented "earlier step" rule above). Capturing a dataset
 `H5VL__stream_type_unsafe_to_capture()` continues to reject reference-typed
 writes.
 
-The obstacle there is worth recording, because the obvious implementation
-does not work. Translating at capture by calling `H5Rget_obj_name()` inside
-the `dataset_write` callback crashes (`H5G_rootof: Assertion 'f->shared'
-failed`): resolving a reference makes HDF5 re-open the file named inside it,
-which re-enters this connector and builds then tears down a second file
-state over the same native file, invalidating the replay already in
-progress. Isolated with probe programs — the identical call at application
-level, followed by a create and an `end_step` replay, is fine; only the
-call from *within* a VOL callback breaks. The route that avoids re-entering
-HDF5 entirely: the connector already sees the target's logical path at
-`H5Rcreate_object()` time, as the name arriving in the `H5VL_OBJECT_LOOKUP`
-branch. Caching token → logical path there, and consulting that map at
-capture, needs no callback into the library at all.
+Two attempts have gone into the capture/replay half, and what each ruled out
+is worth recording so the next one starts further along.
+
+*Attempt 1 — translate at capture with `H5Rget_obj_name()`.* Crashes
+(`H5G_rootof: Assertion 'f->shared' failed`). Resolving a reference goes
+through the `hid_t` an `H5R_ref_t` caches internally, which is the
+application's own file id — i.e. this connector — so the call re-enters the
+library from inside a VOL callback. Isolated with probes: the identical call
+at application level, followed by a create and an `end_step` replay, is
+fine; only the call from within a callback breaks.
+
+*Attempt 2 — cache token → logical path, no HDF5 call at capture.* The
+connector already sees the target's logical path at `H5Rcreate_object()`
+time, as the name arriving in the `H5VL_OBJECT_LOOKUP` branch, and the token
+that lookup returns is what ends up inside the reference (an `H5R_ref_t`
+begins with its token, for every reference flavour). Capture becomes a pure
+table lookup. **This part works** — the manifest payload comes out holding
+the right logical names, and nothing else regresses. But `end_step()` still
+crashes at the same assertion, now at the very first `ensure_group()` of the
+replay, with the *native* file object already carrying a NULL `shared`.
+
+So the remaining fault is not the capture translation, and specifically not:
+re-entrancy from capture (removed), payload sizing (the manifest assembles
+from `payload_len` throughout, and a reference entry's payload is
+deliberately shorter than `n_elem × H5Tget_size()`), or `H5Rdestroy()`
+ordering in the application (tested both before and after `end_step()`).
+What is left, and what an attempt 3 should look at first: the only
+behavioural difference from the passing `t_ref_path.c` is that a
+`H5Dwrite()` of an `H5T_STD_REF` dataset is now *accepted* rather than
+rejected, against a dataset that is still a deferred placeholder with no
+underlying object. HDF5's own reference bookkeeping around a successful
+write is the next thing to rule in or out.
 
 **The dependency risk is quality, not quantity.** Criteria before adding
 anything: actively maintained, deployed at target facilities, Spack-installable,
