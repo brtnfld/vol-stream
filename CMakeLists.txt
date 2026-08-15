@@ -390,6 +390,8 @@ else()
   message(STATUS "                 when the HDF5 in use enforces signatures")
 endif()
 
+add_subdirectory(tools)
+
 if(VOL_STREAM_BUILD_TESTS)
   enable_testing()
   add_subdirectory(test)

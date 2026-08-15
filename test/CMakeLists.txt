@@ -106,6 +106,18 @@ if(MPI_C_FOUND AND MPIEXEC_EXECUTABLE)
   set_tests_properties(parallel_7x3 PROPERTIES TIMEOUT 180)
 endif()
 
+# M9: h5stream's `list`, checked by running the tool and parsing what a user
+# would actually see. Registered here rather than in tools/ so it sits with
+# the rest of the suite; it takes the tool's path as an argument because the
+# tool is a sibling target, not something on PATH.
+add_executable(t_h5stream_list t_h5stream_list.c)
+target_link_libraries(t_h5stream_list PRIVATE vol_stream)
+add_test(NAME h5stream_list COMMAND t_h5stream_list $<TARGET_FILE:h5stream>)
+set_tests_properties(h5stream_list PROPERTIES
+  ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
+  TIMEOUT 60
+)
+
 # VOL_STREAM_H5DIFF points t_replay (the M2 replay-invariant gate) at an
 # h5diff binary when it is not on PATH -- e.g. an uninstalled HDF5 build
 # tree, which is the normal setup when developing against the library
