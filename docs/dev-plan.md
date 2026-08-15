@@ -686,8 +686,31 @@ in the opening section says is the real adoption risk.
 | MPI | MPICH · OpenMPI | Intercommunicator and dynamic-process behaviour differ in practice |
 | Mercury NA plugin | `na+sm` · `ofi+tcp` · `ofi+verbs` | Where transport bugs live; shared-memory and TCP run on any CI box |
 | rank shapes | 3→2 · 7→3 (uneven) | Coprime counts are where M×N projection bugs surface |
-| encode round-trip | cross-endian pair | The manifest leans on HDF5's encoders; prove them across byte order |
+| encode round-trip | byte-order assertion (see note) | The manifest leans on HDF5's encoders; prove them across byte order |
 | Spack env | pinned lockfile · latest deps | Pinned is reproducible; floating detects upstream breakage early |
+
+**Cross-endian, without a big-endian machine (2026-08-15).** Reviewing the
+format against this row turned up a real portability bug rather than
+confirming one: the VL wire form's per-element length tag was `memcpy`'d from
+a `uint64_t`, i.e. stored in the *host's* byte order. A file written on a
+little-endian machine would have been unreadable on a big-endian one — every
+tag byte-swapped, so lengths nonsense and the data either failing its bounds
+check or decoding as garbage.
+
+It was the only field at risk, which is why it was worth looking: FlatBuffers
+is little-endian by specification, and the `H5Tencode`/`H5Sencode2`/
+`H5Pencode2` blobs are HDF5's own portable encodings, so the hand-rolled tag
+was the one place this project chose its own representation. It is now
+written and read as explicit little-endian.
+
+Note what this says about testing: the bug passed every round-trip check in
+the suite, and would have on any single machine, because writer and reader
+shared the host's byte order. `test/t_vl_roundtrip.c` therefore asserts the
+*stored bytes* directly — it reads `.payload` back and requires the tag to be
+little-endian — which fails on a regression regardless of the host it runs
+on. That is real coverage of this row's intent; running an actual big-endian
+leg (QEMU s390x) would additionally exercise HDF5's own encoders, and remains
+open.
 
 **HDF5 2.x is the only support target — this row is closed, not pending
 (2026-08-15).** The original row called for develop, latest release, and

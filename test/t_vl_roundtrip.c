@@ -292,6 +292,79 @@ main(void)
         H5Fclose(nfid);
     }
 
+    /* --- The wire form's length tag must be little-endian on every host,
+     * not the host's own byte order. A file written here has to be readable
+     * on a machine of the opposite endianness, and this is the one
+     * hand-rolled binary field in the manifest (FlatBuffers is LE by spec;
+     * the H5Tencode/H5Sencode2 blobs are HDF5's portable encodings). A raw
+     * memcpy of a uint64_t passes every round-trip check above -- it only
+     * fails across hosts -- so the byte order has to be asserted directly,
+     * by reading the stored payload back and inspecting it. --- */
+    {
+        hid_t    nfid, pds;
+        uint8_t *raw;
+        hsize_t  plen;
+        int      found_first_tag = 0;
+
+        if ((nfid = H5Fopen(FNAME, H5F_ACC_RDONLY, H5P_DEFAULT)) < 0) {
+            printf("  FAIL  reopen for payload byte-order check\n");
+            return 1;
+        }
+        if ((pds = H5Dopen2(nfid, "/step/0/.payload", H5P_DEFAULT)) < 0) {
+            printf("  FAIL  /step/0/.payload missing\n");
+            H5Fclose(nfid);
+            return 1;
+        }
+        plen = H5Dget_storage_size(pds);
+        {
+            hid_t sp = H5Dget_space(pds);
+            hssize_t n = H5Sget_select_npoints(sp);
+
+            H5Sclose(sp);
+            plen = (hsize_t)n; /* logical length: the payload is opaque bytes */
+        }
+        if (NULL == (raw = (uint8_t *)malloc((size_t)plen))) {
+            printf("  FAIL  malloc payload\n");
+            return 1;
+        }
+        {
+            hid_t otype = H5Dget_type(pds); /* opaque, and tagged -- use its own */
+
+            if (H5Dread(pds, otype, H5S_ALL, H5S_ALL, H5P_DEFAULT, raw) < 0) {
+                printf("  FAIL  reading .payload back\n");
+                nerrors++;
+            }
+            else {
+                /* The VL-sequence entry is first in the step, and its first
+                 * element is seq_lens[0] == 3 ints == 12 bytes, so the tag is
+                 * 13 (length + 1, the NULL-vs-empty bias). Little-endian that
+                 * is 0d 00 00 00 00 00 00 00; byte-swapped it would be
+                 * 00 ... 00 0d, which is what a native-endian memcpy would
+                 * write on a big-endian host. */
+                size_t i;
+
+                for (i = 0; i + 8 <= (size_t)plen; i++) {
+                    if (raw[i] == 0x0d && raw[i + 1] == 0 && raw[i + 2] == 0 && raw[i + 3] == 0 &&
+                        raw[i + 4] == 0 && raw[i + 5] == 0 && raw[i + 6] == 0 && raw[i + 7] == 0) {
+                        found_first_tag = 1;
+                        break;
+                    }
+                }
+                if (found_first_tag)
+                    printf("  ok    VL length tags are stored little-endian, not host-endian\n");
+                else {
+                    printf("  FAIL  no little-endian length tag found in .payload -- the VL wire form is "
+                           "host-endian and will not read on the opposite endianness\n");
+                    nerrors++;
+                }
+            }
+            H5Tclose(otype);
+        }
+        free(raw);
+        H5Dclose(pds);
+        H5Fclose(nfid);
+    }
+
     if (nerrors) {
         printf("\n%d failure(s)\n", nerrors);
         return 1;

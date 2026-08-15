@@ -1763,6 +1763,38 @@ H5VL__stream_type_vl_kind(hid_t type_id)
     return H5VL_STREAM_VL_NONE;
 } /* end H5VL__stream_type_vl_kind() */
 
+/* The VL wire form's length tag is written and read as explicit
+ * little-endian, byte at a time, rather than memcpy'd from a uint64_t.
+ *
+ * A raw memcpy stores the host's own byte order, which makes the payload
+ * unreadable on a host of the opposite endianness -- every tag comes back
+ * byte-swapped, so lengths are nonsense and the data either fails the bounds
+ * check or decodes as garbage. Nothing else in the manifest has that
+ * problem: FlatBuffers is little-endian by specification, and the
+ * H5Tencode/H5Sencode2/H5Pencode2 blobs are HDF5's own portable encodings.
+ * This tag was the one hand-rolled binary field, so it is the one that had
+ * to be pinned down. Little-endian is chosen to match FlatBuffers rather
+ * than for any property of its own. */
+static void
+H5VL__stream_put_u64le(uint8_t *dst, uint64_t v)
+{
+    int i;
+
+    for (i = 0; i < 8; i++)
+        dst[i] = (uint8_t)((v >> (8 * i)) & 0xff);
+}
+
+static uint64_t
+H5VL__stream_get_u64le(const uint8_t *src)
+{
+    uint64_t v = 0;
+    int      i;
+
+    for (i = 0; i < 8; i++)
+        v |= (uint64_t)src[i] << (8 * i);
+    return v;
+}
+
 /*-------------------------------------------------------------------------
  * Function:    H5VL__stream_vl_serialize
  *
@@ -1844,7 +1876,7 @@ H5VL__stream_vl_serialize(const void *buf, size_t count, hid_t type_id, int kind
             return -1;
         }
         acc = grown;
-        memcpy(acc + acc_len, &tag, sizeof(tag));
+        H5VL__stream_put_u64le(acc + acc_len, tag);
         acc_len += sizeof(tag);
         if (nbytes > 0) {
             memcpy(acc + acc_len, src, nbytes);
@@ -1912,7 +1944,7 @@ H5VL__stream_vl_deserialize(const uint8_t *bytes, size_t len, size_t count, hid_
 
         if ((size_t)(end - p) < sizeof(tag))
             goto error;
-        memcpy(&tag, p, sizeof(tag));
+        tag = H5VL__stream_get_u64le(p);
         p += sizeof(tag);
 
         if (tag == 0) /* NULL pointer -- calloc already left it that way */
