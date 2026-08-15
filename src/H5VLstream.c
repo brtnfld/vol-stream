@@ -4040,10 +4040,10 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                                         native_dcpl_enc     = (uint8_t *)create_dcpl_enc;
                                         native_dcpl_enc_len = create_dcpl_enc_len;
 
+                                        /* write_start/total_elems are filled
+                                         * in per run at the push below. */
                                         native_ctx.under_dset   = real;
                                         native_ctx.under_vol_id = file_obj->under_vol_id;
-                                        native_ctx.write_start  = w_start;
-                                        native_ctx.total_elems  = (uint64_t)n_elem;
                                     }
                                     H5Pclose(nat);
                                 }
@@ -4077,6 +4077,17 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                                 for (r = 0; r < n_runs; r++) {
                                     const void *run_ptr =
                                         (const uint8_t *)payload_ptr + (size_t)buf_elem * esize;
+
+                                    /* Describe the zero-copy context in terms
+                                     * of THIS run, not the whole write: the
+                                     * fast path serves the dataset's stored
+                                     * chunk, which is only the right answer
+                                     * when the run being pushed is the whole
+                                     * dataset. A multi-run (strided) write
+                                     * therefore declines it per run rather
+                                     * than by accident. */
+                                    native_ctx.write_start = runs[r].start;
+                                    native_ctx.total_elems = runs[r].count;
 
                                     vs_tr_writer_push_data(file_obj->file_state->transport, physical_step,
                                                              path, run_ptr, esize, runs[r].start,
