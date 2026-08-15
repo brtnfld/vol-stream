@@ -63,6 +63,43 @@
 /* Deterministic per-(step, writer-rank, local-index) value -- both write
  * and read sides compute this the same way, so a reader with an unrelated
  * decomposition can still check every element exactly. */
+/* Even-as-possible 1-D decomposition: with a remainder, the first
+ * (global % nranks) ranks each take one extra element. Used by both phases,
+ * so writers and readers can disagree about rank count without either having
+ * to divide evenly -- which is the realistic M x N case, and was previously
+ * refused outright ("global_size N not divisible by R ranks"). */
+static void
+slab_of(int global, int nranks, int r, int *start, int *count)
+{
+    int base = global / nranks;
+    int rem  = global % nranks;
+
+    *count = base + (r < rem ? 1 : 0);
+    *start = r * base + (r < rem ? r : rem);
+}
+
+/* Inverse of slab_of(): which rank owns global index g, and its local offset
+ * within that rank's slab. The reader needs this to know which writer
+ * produced a given element once the two decompositions no longer line up. */
+static void
+owner_of(int global, int nranks, int g, int *rank, int *local)
+{
+    int base     = global / nranks;
+    int rem      = global % nranks;
+    int boundary = rem * (base + 1); /* end of the ranks carrying an extra */
+
+    if (g < boundary) {
+        *rank  = g / (base + 1);
+        *local = g % (base + 1);
+    }
+    else {
+        int off = g - boundary;
+
+        *rank  = rem + off / base;
+        *local = off % base;
+    }
+}
+
 static int
 expected_value(int step, int writer_rank, int local_index)
 {
@@ -80,15 +117,22 @@ do_write(const char *fname, int global_size)
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
-    if (global_size % world_size != 0) {
+    /* Only a rank with nothing to write would be degenerate; an uneven split
+     * is fine and deliberately exercised. */
+    if (global_size < world_size) {
         if (world_rank == 0)
-            fprintf(stderr, "write: global_size %d not divisible by %d ranks\n", global_size, world_size);
+            fprintf(stderr, "write: global_size %d smaller than %d ranks\n", global_size, world_size);
         return 1;
     }
-    per_rank = global_size / world_size;
-    dims[0]  = (hsize_t)global_size;
-    start[0] = (hsize_t)(world_rank * per_rank);
-    count[0] = (hsize_t)per_rank;
+    {
+        int my_start, my_count;
+
+        slab_of(global_size, world_size, world_rank, &my_start, &my_count);
+        per_rank = my_count;
+        dims[0]  = (hsize_t)global_size;
+        start[0] = (hsize_t)my_start;
+        count[0] = (hsize_t)my_count;
+    }
 
     if ((vol_id = H5VL_stream_register()) < 0) {
         fprintf(stderr, "rank %d: FAIL register\n", world_rank);
@@ -201,15 +245,20 @@ do_read(const char *fname, int global_size, int writer_ranks)
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
-    if (global_size % world_size != 0) {
+    if (global_size < world_size) {
         if (world_rank == 0)
-            fprintf(stderr, "read: global_size %d not divisible by %d ranks\n", global_size, world_size);
+            fprintf(stderr, "read: global_size %d smaller than %d ranks\n", global_size, world_size);
         return 1;
     }
-    per_rank        = global_size / world_size;
-    writer_per_rank = global_size / writer_ranks;
-    start[0]        = (hsize_t)(world_rank * per_rank);
-    count[0]        = (hsize_t)per_rank;
+    {
+        int my_start, my_count;
+
+        slab_of(global_size, world_size, world_rank, &my_start, &my_count);
+        per_rank = my_count;
+        start[0] = (hsize_t)my_start;
+        count[0] = (hsize_t)my_count;
+    }
+    (void)writer_per_rank; /* superseded by owner_of() below */
 
     if ((vol_id = H5VL_stream_register()) < 0) {
         fprintf(stderr, "rank %d: FAIL register\n", world_rank);
@@ -258,10 +307,14 @@ do_read(const char *fname, int global_size, int writer_ranks)
         }
 
         for (i = 0; i < per_rank; i++) {
-            int global_idx        = world_rank * per_rank + i;
-            int origin_writer_rank = global_idx / writer_per_rank;
-            int local_i             = global_idx % writer_per_rank;
-            int expected            = expected_value(s, origin_writer_rank, local_i);
+            int global_idx = (int)start[0] + i;
+            int origin_writer_rank, local_i, expected;
+
+            /* The reader's slab and the writer's need not align at all, so
+             * resolve each element's producer explicitly rather than by
+             * dividing -- see owner_of(). */
+            owner_of(global_size, writer_ranks, global_idx, &origin_writer_rank, &local_i);
+            expected = expected_value(s, origin_writer_rank, local_i);
 
             if (buf[i] != expected) {
                 fprintf(stderr, "  FAIL  reader rank %d step %d global_idx %d: got %d expected %d\n",

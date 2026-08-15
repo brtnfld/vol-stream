@@ -685,7 +685,7 @@ in the opening section says is the real adoption risk.
 | HDF5 version | develop only (see note) | The documented failure mode; `H5VL_VERSION` is 3 and will move |
 | MPI | MPICH · OpenMPI | Intercommunicator and dynamic-process behaviour differ in practice |
 | Mercury NA plugin | `na+sm` · `ofi+tcp` · `ofi+verbs` | Where transport bugs live; shared-memory and TCP run on any CI box |
-| rank shapes | 1→1 · 7→3 · 64→5 | Coprime counts are where M×N projection bugs surface |
+| rank shapes | 3→2 · 7→3 (uneven) | Coprime counts are where M×N projection bugs surface |
 | encode round-trip | cross-endian pair | The manifest leans on HDF5's encoders; prove them across byte order |
 | Spack env | pinned lockfile · latest deps | Pinned is reproducible; floating detects upstream breakage early |
 

@@ -89,16 +89,12 @@ if(MPI_C_FOUND AND MPIEXEC_EXECUTABLE)
   # two readers, most remainder cases cannot arise at all. 7->3 is the next
   # shape the matrix names.
   #
-  # --per-rank 3 is required, not incidental. t_parallel splits the global
-  # extent evenly and refuses a decomposition that does not divide, so the
-  # default 4 elements/rank gives 7*4 = 28 across 3 readers and the read
-  # phase exits with "global_size 28 not divisible by 3 ranks" -- a limit of
-  # the harness, not of the connector. 3 elements/rank gives 21, which both 7
-  # and 3 divide.
-  #
-  # Genuinely uneven decompositions are the more realistic case and remain
-  # untested, since that needs t_parallel to handle a remainder -- a test
-  # change rather than a CI one.
+  # Left at the default 4 elements/rank on purpose: 7*4 = 28 across 3 readers
+  # does NOT divide, so the readers take 10/9/9 and neither decomposition
+  # lines up with the other. That uneven case is the realistic one and used
+  # to be impossible to run -- t_parallel refused it outright ("global_size
+  # 28 not divisible by 3 ranks") until slab_of()/owner_of() replaced the
+  # divide-and-hope arithmetic on both sides.
   add_test(NAME parallel_7x3
     COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/run_parallel_test.sh
             --mpirun       ${MPIEXEC_EXECUTABLE}
@@ -106,7 +102,6 @@ if(MPI_C_FOUND AND MPIEXEC_EXECUTABLE)
             --plugin-dir   $<TARGET_FILE_DIR:vol_stream>
             --writer-ranks 7
             --reader-ranks 3
-            --per-rank     3
   )
   set_tests_properties(parallel_7x3 PROPERTIES TIMEOUT 180)
 endif()
