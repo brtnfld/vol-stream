@@ -6876,6 +6876,147 @@ H5VL_stream_dataset_read(size_t count, void *dset[], hid_t mem_type_id[], hid_t 
 } /* end H5VL_stream_dataset_read() */
 
 /*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_dset_capture
+ *
+ * Purpose:     Does a write to this dataset belong to the open step, or is
+ *              it an ordinary pass-through?
+ *
+ *              Two cases capture. A *placeholder* is a dataset created in
+ *              the step now open, not yet materialized -- M2's original and
+ *              until 2026-08-15 only case. A *live* dataset written while a
+ *              step is open is the second: the object exists in the file
+ *              from an earlier step, and the application is writing this
+ *              step's version of it through the handle it already has.
+ *
+ *              That second case used to fall through to the under connector,
+ *              which is the most ordinary streaming pattern there is and was
+ *              silently losing data both ways -- the new step captured
+ *              nothing, and the write landed on the *earlier* step's copy,
+ *              rewriting history that had already committed. Nothing in the
+ *              suite covered it because every test either wrote a single
+ *              step or created a differently-named object per step; see
+ *              test/t_step_rewrite.c.
+ *
+ *              A write outside a step still passes straight through, which
+ *              is what keeps M1's byte-identity promise for unbracketed
+ *              writes.
+ *
+ * Return:      Non-zero to capture, 0 to pass through.
+ *-------------------------------------------------------------------------
+ */
+static int
+H5VL__stream_dset_capture(H5VL_stream_t *o)
+{
+    if (!o)
+        return 0;
+    if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER)
+        return 1;
+    if (o->obj_state != H5VL_STREAM_OBJ_LIVE)
+        return 0;
+    /* A path is what a manifest entry is keyed on; without one (BY_IDX/
+     * BY_TOKEN entry points, wrap_object) capture is skipped rather than
+     * guessed at, the same rule the rest of this connector follows. */
+    if (!o->file_state || !o->path || !o->under_object)
+        return 0;
+    if (o->file_state->is_reader)
+        return 0;
+    return o->file_state->step_state == H5F_STEP_IN_STEP;
+} /* end H5VL__stream_dset_capture() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_step_create_index
+ *
+ * Purpose:     Index of the pending DsetCreate entry a write to o belongs
+ *              to, creating one if this step has none.
+ *
+ *              A placeholder already knows its own. A live dataset being
+ *              rewritten does not, so one is synthesized from the object
+ *              itself -- its real datatype, extent and DCPL, read back
+ *              through the under connector rather than inferred from the
+ *              write, so the step's copy is created exactly as the original
+ *              was (same chunking, same filters) and carries the whole
+ *              extent even when the write covers part of it.
+ *
+ *              Synthesizing a create rather than teaching replay to reuse an
+ *              earlier step's object is deliberate: it is precisely what the
+ *              application would have produced by re-creating the dataset
+ *              each step, which is the pattern that already worked and the
+ *              one dev-plan.md decision #2 describes -- successive versions
+ *              of one named object, landing group-based at /step/<n>/.
+ *
+ * Return:      0 on success (*out_index set), -1 on failure.
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_step_create_index(H5VL_stream_t *o, size_t *out_index)
+{
+    H5VL_stream_file_state_t   *fs = o->file_state;
+    H5VL_stream_pending_entry_t ce;
+    H5VL_dataset_get_args_t     gargs;
+    size_t                      k, idx;
+
+    if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER) {
+        *out_index = o->pending_index;
+        return 0;
+    }
+
+    /* One synthesized create per path per step: a second write to the same
+     * live dataset in the same step joins the first one's entry, exactly as
+     * two writes to a placeholder do. */
+    for (k = 0; k < fs->n_pending; k++)
+        if (fs->pending[k].kind == vs_Kind_DsetCreate && fs->pending[k].path &&
+            strcmp(fs->pending[k].path, o->path) == 0) {
+            *out_index = k;
+            return 0;
+        }
+
+    memset(&ce, 0, sizeof(ce));
+    ce.kind    = vs_Kind_DsetCreate;
+    ce.type_id = H5I_INVALID_HID;
+    ce.space_id = H5I_INVALID_HID;
+    ce.dcpl_id = H5I_INVALID_HID;
+    ce.dapl_id = H5I_INVALID_HID;
+
+    memset(&gargs, 0, sizeof(gargs));
+    gargs.op_type = H5VL_DATASET_GET_TYPE;
+    if (H5VLdataset_get(o->under_object, o->under_vol_id, &gargs, H5P_DATASET_XFER_DEFAULT, NULL) < 0)
+        return -1;
+    ce.type_id = gargs.args.get_type.type_id;
+
+    memset(&gargs, 0, sizeof(gargs));
+    gargs.op_type = H5VL_DATASET_GET_SPACE;
+    if (H5VLdataset_get(o->under_object, o->under_vol_id, &gargs, H5P_DATASET_XFER_DEFAULT, NULL) < 0) {
+        H5VL__stream_pending_entry_clear(&ce);
+        return -1;
+    }
+    ce.space_id = gargs.args.get_space.space_id;
+
+    memset(&gargs, 0, sizeof(gargs));
+    gargs.op_type = H5VL_DATASET_GET_DCPL;
+    if (H5VLdataset_get(o->under_object, o->under_vol_id, &gargs, H5P_DATASET_XFER_DEFAULT, NULL) < 0) {
+        H5VL__stream_pending_entry_clear(&ce);
+        return -1;
+    }
+    ce.dcpl_id = gargs.args.get_dcpl.dcpl_id;
+
+    if (NULL == (ce.path = strdup(o->path))) {
+        H5VL__stream_pending_entry_clear(&ce);
+        return -1;
+    }
+
+    /* owner_wrapper stays NULL: o already owns a live under object, from the
+     * step that created it, and must keep pointing at it -- replay closes
+     * the copy it makes for this step instead of rewiring the handle. */
+    if ((idx = H5VL__stream_pending_append(fs, &ce)) == (size_t)-1) {
+        H5VL__stream_pending_entry_clear(&ce);
+        return -1;
+    }
+
+    *out_index = idx;
+    return 0;
+} /* end H5VL__stream_step_create_index() */
+
+/*-------------------------------------------------------------------------
  * Function:    H5VL_stream_dataset_write
  *
  * Purpose:     Writes data elements from a buffer into a dataset.
@@ -6892,7 +7033,7 @@ H5VL_stream_dataset_write(size_t count, void *dset[], hid_t mem_type_id[], hid_t
     void  *obj_local;        /* Local buffer for obj */
     void **obj = &obj_local; /* Array of object pointers */
     size_t i;                /* Local index variable */
-    size_t n_placeholder = 0;
+    size_t n_capture = 0;
     herr_t ret_value;
 
 #ifdef ENABLE_STREAM_LOGGING
@@ -6900,17 +7041,17 @@ H5VL_stream_dataset_write(size_t count, void *dset[], hid_t mem_type_id[], hid_t
 #endif
 
     for (i = 0; i < count; i++)
-        if (((H5VL_stream_t *)dset[i])->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER)
-            n_placeholder++;
+        if (H5VL__stream_dset_capture((H5VL_stream_t *)dset[i]))
+            n_capture++;
 
-    /* M2: an H5Dwrite_multi() batch mixing placeholder (deferred-into-step)
-     * and live datasets is not supported -- a combination the exit-gate
-     * matrix does not exercise. Either every dataset in the batch is
-     * captured, or none are. */
-    if (n_placeholder > 0 && n_placeholder < count)
+    /* M2: an H5Dwrite_multi() batch mixing captured and pass-through
+     * datasets is not supported -- a combination the exit-gate matrix does
+     * not exercise. Either every dataset in the batch is captured, or none
+     * are. */
+    if (n_capture > 0 && n_capture < count)
         return -1;
 
-    if (n_placeholder == count) {
+    if (n_capture == count) {
         /* Every write in this call targets a dataset deferred into the
          * current step: capture each as its own DsetWrite entry (one entry
          * per H5Dwrite call, carrying its own selection -- what makes
@@ -6934,12 +7075,23 @@ H5VL_stream_dataset_write(size_t count, void *dset[], hid_t mem_type_id[], hid_t
          * idiom above instead.
          */
         for (i = 0; i < count; i++) {
-            H5VL_stream_t                *o             = (H5VL_stream_t *)dset[i];
-            H5VL_stream_pending_entry_t  *create_entry  = &o->file_state->pending[o->pending_index];
-            hid_t                         resolved_fspace = H5VL__stream_resolve_space(file_space_id[i], create_entry->space_id);
+            H5VL_stream_t                *o = (H5VL_stream_t *)dset[i];
+            size_t                        create_index;
+            hid_t                         resolved_fspace;
             hssize_t                      n_elem;
             H5VL_stream_pending_entry_t   write_entry;
             int                           vl_kind;
+
+            /* Which pending DsetCreate this write belongs to. For a
+             * placeholder that is the one its own H5Dcreate() left behind;
+             * for a live dataset being rewritten in a later step, the step
+             * gets a synthesized one (see H5VL__stream_step_create_index()).
+             * Resolved to an index rather than a pointer because appending
+             * may reallocate the pending array. */
+            if (H5VL__stream_step_create_index(o, &create_index) < 0)
+                return -1;
+            resolved_fspace = H5VL__stream_resolve_space(file_space_id[i],
+                                                          o->file_state->pending[create_index].space_id);
 
             if ((n_elem = H5Sget_select_npoints(resolved_fspace)) < 0)
                 return -1;

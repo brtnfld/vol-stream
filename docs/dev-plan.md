@@ -667,6 +667,37 @@ into a static file that `h5dump` reads without complaint.
 *Progress: `list`, `export` and `tail` have all landed and are tested. The
 exit gate above is met.*
 
+**A capture gap found by building it, unrelated to predicates and worse than
+they were (2026-08-15).** M9's test needed a variable that *changes* step to
+step — the first thing in this suite to write one dataset across several
+steps through the handle it was created with. It wrote nothing. Capture
+keyed strictly on a dataset wrapper still being a placeholder, i.e. created
+in the step currently open and not yet materialized; once `end_step()`
+replayed it, the wrapper went live and every later `H5Dwrite` through it
+fell through to the under connector. Two silent consequences, both data
+loss:
+
+- the new step captured nothing, so no manifest entry, no push to any
+  subscriber, and `/step/<n>/` was created empty (a 0-byte `.payload`);
+- the write landed directly on the *earlier* step's copy of the object, so
+  step history was not merely incomplete but retroactively wrong —
+  `/step/0/temp` held whatever the last step wrote.
+
+This is the most ordinary streaming pattern there is, and nothing covered it
+because every existing test either wrote a single step or created a
+differently-named object per step. Fixed by capturing a write to a live
+dataset inside a step and synthesizing that step's own `DsetCreate` from the
+object itself — its real datatype, extent and DCPL read back through the
+under connector, so the step's copy is created exactly as the original was
+and carries the whole extent even when the write covers part of it. That is
+precisely what re-creating the dataset each step already produced, which is
+the pattern that worked and the one decision #2 describes. Writes *outside*
+a step still pass straight through, so M1's byte-identity promise is
+untouched. `test/t_step_rewrite.c` pins both halves — each step holding its
+own values, and a partial write landing at its own indices — checked through
+the native connector, so it measures what is in the file rather than what
+the connector believes.
+
 #### Tool-compatibility matrix
 
 Measured 2026-08-15 against HDF5 2.3's own tools, in all three states a
