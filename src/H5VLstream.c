@@ -6348,12 +6348,12 @@ H5VL_stream_attr_write(void *attr, hid_t mem_type_id, const void *buf, hid_t dxp
      * placeholder attribute has exactly one Attr entry -- fill in (or
      * replace) its payload in place rather than appending a new entry.
      *
-     * The payload is sized and copied against the entry's already-captured
-     * file type, not mem_type_id: an attribute write whose memory type needs
-     * real conversion to the file type is not captured correctly in M2 (the
-     * exit-gate matrix's attribute scenarios use matching native types, so
-     * this does not affect them; byte-order conversion is exercised on
-     * datasets instead, via DsetWrite's own mem-type capture).
+     * The payload is stored in the entry's already-captured *file* type,
+     * which is what replay writes it back with. A memory type that differs
+     * is converted explicitly below -- it used to be memcpy'd verbatim,
+     * reinterpreting one representation as another and silently storing
+     * garbage. Nothing in the suite caught it because every attribute
+     * scenario used matching native types; see test/t_attr_convert.c.
      */
     if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER) {
         H5VL_stream_pending_entry_t *e = &o->file_state->pending[o->pending_index];
@@ -6386,10 +6386,51 @@ H5VL_stream_attr_write(void *attr, hid_t mem_type_id, const void *buf, hid_t dxp
                 return -1;
         }
         else if (nbytes > 0) {
-            if (NULL == (e->payload = (uint8_t *)malloc(nbytes)))
+            /* The payload is stored in the attribute's *file* type, which is
+             * what replay writes it back with. When the caller's memory type
+             * differs, the bytes in buf are not that -- copying them
+             * verbatim reinterprets one type's representation as another's
+             * and silently stores garbage (an int written to a double
+             * attribute came back as 4.7e-313). Convert explicitly.
+             *
+             * H5Tconvert() works in place and needs room for the wider of
+             * the two types, so the scratch buffer is sized on that, while
+             * only the file type's own bytes are kept as the payload.
+             * H5Tequal() short-circuits the common matching-type case, so
+             * that path stays a plain memcpy exactly as before. */
+            htri_t same = H5Tequal(mem_type_id, e->type_id);
+
+            if (same < 0)
                 return -1;
-            memcpy(e->payload, buf, nbytes);
-            e->payload_len = nbytes;
+            if (same > 0) {
+                if (NULL == (e->payload = (uint8_t *)malloc(nbytes)))
+                    return -1;
+                memcpy(e->payload, buf, nbytes);
+                e->payload_len = nbytes;
+            }
+            else {
+                size_t   msize = H5Tget_size(mem_type_id);
+                size_t   fsize = H5Tget_size(e->type_id);
+                size_t   wide  = (msize > fsize) ? msize : fsize;
+                uint8_t *scratch;
+
+                if (msize == 0 || fsize == 0)
+                    return -1;
+                if (NULL == (scratch = (uint8_t *)malloc((size_t)n_elem * wide)))
+                    return -1;
+                memcpy(scratch, buf, (size_t)n_elem * msize);
+                if (H5Tconvert(mem_type_id, e->type_id, (size_t)n_elem, scratch, NULL, H5P_DEFAULT) < 0) {
+                    free(scratch);
+                    return -1;
+                }
+                if (NULL == (e->payload = (uint8_t *)malloc(nbytes))) {
+                    free(scratch);
+                    return -1;
+                }
+                memcpy(e->payload, scratch, nbytes);
+                e->payload_len = nbytes;
+                free(scratch);
+            }
         }
 
         /* M4: same durability-tracking request as the dataset-write deferred

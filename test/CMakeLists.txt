@@ -1,5 +1,5 @@
 foreach(t t_smoke t_step t_replay t_reader t_deferred t_vl_reject t_manifest_cache t_ref_path t_ref_roundtrip
-           t_vl_roundtrip)
+           t_vl_roundtrip t_attr_convert)
   add_executable(${t} ${t}.c)
   target_link_libraries(${t} PRIVATE vol_stream)
 endforeach()
@@ -14,6 +14,7 @@ add_test(NAME manifest_cache COMMAND t_manifest_cache)
 add_test(NAME ref_path COMMAND t_ref_path)
 add_test(NAME ref_roundtrip COMMAND t_ref_roundtrip)
 add_test(NAME vl_roundtrip COMMAND t_vl_roundtrip)
+add_test(NAME attr_convert COMMAND t_attr_convert)
 
 # M4 exit gate: the two-process Mercury round trip. M5 exit gate: SSG
 # rendezvous, late joiners, and a departing reader that does not stall the
