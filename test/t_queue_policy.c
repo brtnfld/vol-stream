@@ -326,7 +326,11 @@ run_scenario(hid_t vol_id, H5VL_stream_queue_policy_t policy, const char *policy
     unlink(ACK0_SENTINEL);
     unlink(ACK1_SENTINEL);
 
-    setenv("VOL_STREAM_NA", "na+sm", 1);
+    /* A default, not a requirement: the CI matrix runs this suite over more
+     * than one Mercury NA plugin, so an externally-set VOL_STREAM_NA wins
+     * (overwrite = 0). Shared memory stays the default because it needs no
+     * network setup on a bare runner. */
+    setenv("VOL_STREAM_NA", "na+sm", 0);
 
     fflush(NULL); /* the child inherits a copy of any unflushed stdio buffer -- avoid duplicated output */
     if ((pid = fork()) < 0) {
@@ -446,7 +450,11 @@ main(void)
         return 1;
     }
 
-    setenv("VOL_STREAM_NA", "na+sm", 1);
+    /* A default, not a requirement: the CI matrix runs this suite over more
+     * than one Mercury NA plugin, so an externally-set VOL_STREAM_NA wins
+     * (overwrite = 0). Shared memory stays the default because it needs no
+     * network setup on a bare runner. */
+    setenv("VOL_STREAM_NA", "na+sm", 0);
 
     nerrors += run_scenario(vol_id, H5VL_STREAM_QUEUE_BLOCK, "block");
     nerrors += run_scenario(vol_id, H5VL_STREAM_QUEUE_DISCARD, "discard");

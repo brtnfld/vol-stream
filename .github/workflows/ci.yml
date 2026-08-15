@@ -161,9 +161,9 @@ jobs:
   # cmake_minimum_required() predating what CMake 4 accepts -- the same
   # env-var escape hatch ../CMakeLists.txt uses for the vendored flatcc build.
   #
-  # Only na+sm is exercised here (shared memory, needs no network setup);
-  # ofi+tcp is part of the CI matrix table in dev-plan.md but not yet wired
-  # up here.
+  # Both na+sm (shared memory, needs no network setup) and ofi+tcp are
+  # exercised, from one build -- see the two test steps at the end of this
+  # job. na+sm gates; ofi+tcp reports.
   # ---------------------------------------------------------------------------
   m4-m7-transport:
     name: M4/M5/M7/M8 transport, rendezvous, queue policy, and subscription (na+sm)
@@ -307,6 +307,29 @@ jobs:
 
       - name: Test (Mercury round trip, SSG rendezvous, M7 queue policy, and M8 subscription, each as two processes)
         run: |
+          LD_LIBRARY_PATH=$HOME/mochi-install/lib:$HOME/mochi-install/lib64:$LD_LIBRARY_PATH \
+            ctest --test-dir build --output-on-failure
+
+      # Second pass over the same build with a real network transport instead
+      # of shared memory -- dev-plan.md's CI matrix calls for both, and na+sm
+      # never exercises libfabric at all, so a whole transport's worth of
+      # behavior was going untested.
+      #
+      # Deliberately non-blocking. Every one of these tests passes over
+      # ofi+tcp individually (verified 12/12 standalone for the one that
+      # flakes), but running them back to back trips the same libfabric
+      # teardown residual documented in test/t_precision_dual.c: an unbounded
+      # connect() to an already-departed peer can stall a subsequent test's
+      # rendezvous. Roughly one run in three saw a single test time out.
+      #
+      # Gating on that would import a known third-party flake into every PR.
+      # Reporting it does not: a regression that broke ofi+tcp outright would
+      # still be plainly visible in the log, which is the coverage actually
+      # wanted here. Revisit if the residual is ever fixed upstream.
+      - name: Test over ofi+tcp (non-blocking -- see comment)
+        continue-on-error: true
+        run: |
+          VOL_STREAM_NA=ofi+tcp \
           LD_LIBRARY_PATH=$HOME/mochi-install/lib:$HOME/mochi-install/lib64:$LD_LIBRARY_PATH \
             ctest --test-dir build --output-on-failure
 

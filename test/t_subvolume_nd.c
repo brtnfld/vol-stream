@@ -246,7 +246,11 @@ main(void)
 
     printf("vol-stream: N-D subvolume subscription routing (na+sm)\n");
 
-    setenv("VOL_STREAM_NA", "na+sm", 1);
+    /* A default, not a requirement: the CI matrix runs this suite over more
+     * than one Mercury NA plugin, so an externally-set VOL_STREAM_NA wins
+     * (overwrite = 0). Shared memory stays the default because it needs no
+     * network setup on a bare runner. */
+    setenv("VOL_STREAM_NA", "na+sm", 0);
     unlink(READY_SENTINEL);
     unlink(READER_DONE_SENTINEL);
 
