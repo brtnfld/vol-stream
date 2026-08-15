@@ -667,6 +667,46 @@ into a static file that `h5dump` reads without complaint.
 *Progress: `list`, `export` and `tail` have all landed and are tested. The
 exit gate above is met.*
 
+#### Tool-compatibility matrix
+
+Measured 2026-08-15 against HDF5 2.3's own tools, in all three states a
+stream can be in. This is the "document it honestly, `h5dump` included" item,
+and the honest answer has two halves rather than one.
+
+| State | `h5ls` | `h5dump` | `h5stat` | Usable? |
+|---|---|---|---|---|
+| **Live** (writer holds it open) | `**NOT FOUND**` | error | error | **No** — use `h5stream tail` |
+| **Finished** stream | opens | opens | opens | Yes, but see below |
+| **Exported** (`h5stream export`) | opens | opens | opens | **Yes, fully** |
+
+**Live streams: the tools do not work, and cannot.** All three fail, and this
+is not a shortcoming of the tools or something a future release fixes: while
+a writer holds an HDF5 file open, a second process cannot read it. `h5ls`
+reports `**NOT FOUND**` on a file that is plainly on disk with content in it.
+This is the constraint named at the top of this document, confirmed by
+measurement rather than argument, and it is precisely why the connector
+carries a transport — `h5stream tail` follows a live stream over
+`H5Fwait_step_ready()` because no file-reading tool can.
+
+**Finished streams: the tools open, but show the layout, not the data.** They
+work in the sense that nothing errors — and are still not what a user wants.
+A dataset the application wrote as `/temperature` appears as
+`/step/0/temperature`, once per step that touched it, alongside `.manifest`
+and `.payload` bookkeeping datasets. `h5ls -r` on a two-object, three-step
+stream lists eleven entries. Everything is present and correct; finding the
+current value of one variable means knowing which step last wrote it.
+
+**Exported files: ordinary HDF5, no caveats.** `h5stream export` collapses a
+stream to each object at its logical path, newest version, with no `/step`
+groups and no bookkeeping. All three tools work normally, and so will
+anything else that reads HDF5 — this is the answer for handing a stream to a
+plotting script, an existing analysis pipeline, or a colleague.
+
+The practical guidance, then: `h5stream tail` while it is running,
+`h5stream export` once it is not, and the standard tools on the result.
+Pointing `h5dump` at a stream directly is the one path that disappoints, and
+it disappoints in both states for different reasons.
+
 **Measured 2026-08-15 — `tail` cannot be built by polling the file.** The
 obvious implementation, re-opening the file and watching for new `/step/<n>/`
 groups, works against a finished stream and reports nothing at all against a
