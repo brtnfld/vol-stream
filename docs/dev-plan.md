@@ -667,6 +667,84 @@ into a static file that `h5dump` reads without complaint.
 *Progress: `list`, `export` and `tail` have all landed and are tested. The
 exit gate above is met.*
 
+#### Onion-backed addressable step history — shipped 2026-08-15
+
+`h5stream history FILE OUT` writes an onion-VFD archive in which every step
+is a numbered, re-openable revision holding the stream as of that step, at
+ordinary logical paths. This is design-plan.md's "stream and archive as one
+object" (#2): ADIOS2 makes you choose an engine, BP5 to a file or SST to a
+stream, and a step that is both a live stream element and a nameable
+revision collapses the choice.
+
+The load-bearing property, which neither a finished stream nor `export` can
+provide: **an older revision hides what later steps did.** A finished stream
+shows every step at once and an export shows only the newest; only a
+revision history answers "what did this file look like at step 1?".
+`test/t_onion_history.c` turns on exactly that — an object written in the
+last step is absent from earlier revisions — and reads everything back with
+plain HDF5 and an onion fapl, no connector involved, because being readable
+without this project is the point of writing an archive.
+
+**Why this is a tool and not something `end_step()` does live.** Measured,
+not assumed: the onion VFD commits a revision when the file is *closed*, and
+exposes no "commit a revision now" call. One revision per step would
+therefore mean closing and reopening the underlying file inside every
+`end_step()`, invalidating every under-object the connector and the
+application still hold — including the dataset handle an application
+legitimately keeps open across steps, which is exactly what the capture fix
+below just made work. Paying that in the live writer to gain what a
+post-hoc pass produces for free is a bad trade.
+
+**Three onion-VFD findings, each reproduced in a standalone HDF5 program
+with no vol-stream code in it.** They are recorded here because they shaped
+the tool, and because HDF5's own onion tests use page sizes 4 and 32 only
+(`test/onion.c`), so all three sit outside that suite's coverage:
+
+1. *Revisions are silently lost when the archive is small and the page size
+   is large.* At `page_size >= 512` with a few-KB file, a three-session
+   history reads back with the first revision empty and the third identical
+   to the second. At 32/64/128/256 the same program is correct, and once the
+   file comfortably exceeds one page every size tested is correct, 4096
+   included. `H5Ocopy` is not implicated — direct `H5Dcreate`/`H5Dwrite`
+   behaves identically at every page size.
+2. *A reader must pass the page size the history was written with.*
+   `H5FDonion.h` documents 0 as "whatever the file already uses", but a
+   revision opened with 0 comes back apparently empty — the datasets are
+   simply not found.
+3. *A reader that passes the wrong non-zero page size aborts the process*
+   rather than getting an error: `H5FD__onion_read: Assertion
+   '0 == bytes_to_read' failed`.
+
+The tool's response is to verify rather than trust: it writes the history at
+the efficient 4096, reads every revision back, and rewrites at 32 if that
+does not verify — cheap precisely in the small-archive case where the
+problem occurs. Whichever size won is stored as an attribute in the
+*canonical* file, which stays an ordinary plainly-openable HDF5 file since
+every amendment lives in the `.onion`; `h5dump -a` reads it. Given finding 2
+and finding 3, a reader that had to guess would either see an empty file or
+crash, so self-description here is not a nicety. `test/t_onion_history.c`
+asserts both branches: a tiny archive falls back to 32 and says so, and an
+archive with real bulk data verifies at 4096 on the first pass, so no real
+archive pays the small-page index cost.
+
+**A connector bug this surfaced: vol-stream could only be registered once
+per process.** Building a second stream in one test process failed at
+`H5VL_stream_register()`, several frames away from the cause —
+`H5VLregister_opt_operation(): operation name already exists`. HDF5's
+dynamic-operation registry is global and outlives any one registration,
+while the connector's init callback runs on *every* registration, so the
+second collided with the first's names and the whole
+`H5VLregister_connector()` failed. Register/close/register did not work, and
+neither would two independent components in one program each registering the
+connector. Nothing documented it and nothing caught it, because every test
+until now registered exactly once. Fixed by making init idempotent —
+`H5VL__stream_register_op()` recovers the already-assigned value with
+`H5VLfind_opt_operation()`. Unregistering in `term()` instead would have
+fixed the sequential case and broken the concurrent one, where the first
+close would pull the operations out from under a live registration;
+`test/t_reregister.c` pins both, including that a re-registered connector's
+recovered operation values still drive a real step.
+
 **A capture gap found by building it, unrelated to predicates and worse than
 they were (2026-08-15).** M9's test needed a variable that *changes* step to
 step — the first thing in this suite to write one dataset across several

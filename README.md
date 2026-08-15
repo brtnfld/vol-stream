@@ -107,6 +107,11 @@ VOL, which also ships `H5F*` calls from an out-of-tree connector.
 | `H5Fstep_status(fid, &st)` | Query step state (`NOT_IN_STEP`, `IN_STEP`, `COMMITTING`, `EOS`) |
 | `H5Fsubscribe(fid, n, paths, spaces, plists)` | Reader declares interest |
 
+`h5stream` inspects a stream from outside: `list` (steps and their contents),
+`tail` (follow a live writer, needs the transport), `export` (collapse to one
+ordinary HDF5 file), and `history` (an onion-VFD archive where every step is a
+re-openable revision).
+
 The logical ids are deliberately separate from the connector's monotone physical
 step counter. Restarting from a checkpoint replays ids already seen — openPMD hit
 this against ADIOS2 in production, where resuming at iteration 500 after writing

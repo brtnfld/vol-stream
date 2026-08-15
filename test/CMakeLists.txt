@@ -1,5 +1,5 @@
 foreach(t t_smoke t_step t_replay t_reader t_deferred t_vl_reject t_manifest_cache t_ref_path t_ref_roundtrip
-           t_vl_roundtrip t_attr_convert t_payload_compress t_step_rewrite)
+           t_vl_roundtrip t_attr_convert t_payload_compress t_step_rewrite t_reregister)
   add_executable(${t} ${t}.c)
   target_link_libraries(${t} PRIVATE vol_stream)
 endforeach()
@@ -17,6 +17,7 @@ add_test(NAME vl_roundtrip COMMAND t_vl_roundtrip)
 add_test(NAME attr_convert COMMAND t_attr_convert)
 add_test(NAME payload_compress COMMAND t_payload_compress)
 add_test(NAME step_rewrite COMMAND t_step_rewrite)
+add_test(NAME reregister COMMAND t_reregister)
 
 # M4 exit gate: the two-process Mercury round trip. M5 exit gate: SSG
 # rendezvous, late joiners, and a departing reader that does not stall the
@@ -131,7 +132,14 @@ add_executable(t_h5stream_export t_h5stream_export.c)
 target_link_libraries(t_h5stream_export PRIVATE vol_stream)
 add_test(NAME h5stream_export COMMAND t_h5stream_export $<TARGET_FILE:h5stream>)
 
-set_tests_properties(h5stream_list h5stream_export PROPERTIES
+# M9's last item: `h5stream history` turns each step into an addressable
+# onion-VFD revision. Reads back with plain HDF5 and an onion fapl, no
+# connector, since being readable without this project is the point.
+add_executable(t_onion_history t_onion_history.c)
+target_link_libraries(t_onion_history PRIVATE vol_stream)
+add_test(NAME onion_history COMMAND t_onion_history $<TARGET_FILE:h5stream>)
+
+set_tests_properties(h5stream_list h5stream_export onion_history PROPERTIES
   ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
   TIMEOUT 60
 )

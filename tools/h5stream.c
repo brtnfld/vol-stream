@@ -42,6 +42,7 @@
 #include <unistd.h>
 
 #include "hdf5.h"
+#include "H5FDonion.h" /* M9: addressable step history, see cmd_history() */
 #include "H5VLstream.h"
 
 static void
@@ -49,10 +50,14 @@ usage(void)
 {
     fprintf(stderr, "usage: h5stream list FILE\n"
                     "       h5stream export FILE OUT\n"
+                    "       h5stream history FILE OUT\n"
                     "       h5stream tail FILE [--max-steps N] [--timeout-ms T]   (needs VOL_STREAM_NA)\n"
                     "\n"
                     "  list     Steps in FILE: physical step, logical ids, objects written.\n"
                     "  export   Write OUT: each object at its logical path, newest version.\n"
+                    "  history  Write OUT as an onion-VFD archive: one revision per step, each\n"
+                    "           holding the stream as of that step at logical paths. Open a past\n"
+                    "           step with H5Pset_fapl_onion(revision_num = step + 1).\n"
                     "  tail     Follow a live stream, reporting each step as it commits.\n"
                     "           Requires the transport (VOL_STREAM_NA) -- a live writer's file\n"
                     "           cannot be read by another process.\n");
@@ -380,6 +385,463 @@ done:
 }
 
 /*
+ * history: write an onion-backed archive in which every step is an
+ * addressable revision.
+ *
+ * dev-plan.md/design-plan.md's "stream and archive as one object": ADIOS2
+ * makes you choose an engine, BP5 to a file or SST to a stream, and the onion
+ * VFD already models an append-only numbered revision history. A step that is
+ * both a live stream element and a nameable, re-openable revision collapses
+ * that choice.
+ *
+ * Why this is a *tool* and not something end_step() does live, measured
+ * rather than assumed: the onion VFD commits a revision when the file is
+ * closed, and there is no "commit a revision now" call. One revision per step
+ * would therefore mean closing and reopening the underlying file inside every
+ * end_step() -- which would invalidate every under-object the connector and
+ * the application still hold, including the dataset handle an application
+ * legitimately keeps open across steps (see test/t_step_rewrite.c). Paying
+ * that in the live writer to gain something a post-hoc pass produces for free
+ * is a bad trade, so the history is built from a finished stream.
+ *
+ * The layout inside each revision is `export`'s, not the stream's: objects
+ * live at their logical paths, with no /step groups. Revision N is therefore
+ * "the file as a user would have seen it, as of step N-1" -- readable by any
+ * HDF5 program, no vol-stream connector involved.
+ *
+ * Revision numbering is inherited from the VFD and is off by one: revision 0
+ * is the empty canonical file that must exist before any revision can be
+ * written, so step N lands in revision N+1. Rather than leave a caller to
+ * rediscover that, each revision records its own step in a root attribute
+ * ("vol_stream_step"), which is self-describing and needs no onion metadata
+ * API to read back.
+ */
+/* Page size for the history: why it is chosen at runtime, and why the
+ * archive records which one was used.
+ *
+ * Three things about the onion VFD, all measured 2026-08-15 with standalone
+ * HDF5 programs containing no vol-stream code at all:
+ *
+ *   1. With a small archive (a few KB) and page_size >= 512, revisions are
+ *      silently lost -- a three-session history reads back with the first
+ *      revision empty and the third identical to the second. At 32/64/128/
+ *      256 the same program is correct, and once the file comfortably
+ *      exceeds one page every size tested is correct, 4096 included.
+ *   2. A reader MUST pass the page size the history was written with.
+ *      H5FDonion.h documents 0 as "whatever the file already uses", but a
+ *      revision opened with 0 comes back apparently empty -- the datasets
+ *      are simply not found.
+ *   3. A reader that passes the *wrong* non-zero page size does not get an
+ *      error, it gets an abort: `H5FD__onion_read: Assertion
+ *      '0 == bytes_to_read' failed`.
+ *
+ * H5Ocopy is not implicated in any of it: direct H5Dcreate/H5Dwrite and
+ * H5Ocopy behave identically at every page size tried. And HDF5's own onion
+ * tests only ever use page sizes 4 and 32 (test/onion.c), so the failing
+ * regime sits outside their coverage rather than being a misuse of the API.
+ *
+ * Consequences for this tool. The large page size is the default, because
+ * the small one costs an index entry per 32 bytes amended and a real archive
+ * cannot afford that; the history is then read back and, if it does not
+ * verify, rewritten at the small size, which is cheap precisely in the
+ * small-archive case where the problem appears. Whichever size wins is
+ * stored as an attribute in the *canonical* file -- which stays an ordinary,
+ * plainly-openable HDF5 file, since every amendment lives in the .onion --
+ * so a reader can discover it without having to guess, and guessing here
+ * either shows an empty file or aborts the process. */
+#define H5STREAM_ONION_PAGE_SIZE      4096 /* must be a power of two */
+#define H5STREAM_ONION_PAGE_SIZE_SAFE 32
+#define H5STREAM_ONION_PAGE_ATTR      "vol_stream_onion_page_size"
+
+/* Build a fapl selecting one onion revision. backing_fapl is created once by
+ * the caller and outlives every fapl made here -- H5Pset_fapl_onion() keeps
+ * the id rather than a copy, which is why HDF5's own tests close it only
+ * after the last open. page_size 0 means "whatever the file already uses",
+ * which is what every read path here wants. */
+static hid_t
+onion_fapl(hid_t backing_fapl, uint64_t revision, uint32_t page_size, const char *comment)
+{
+    H5FD_onion_fapl_info_t info;
+    hid_t                  fapl;
+
+    memset(&info, 0, sizeof(info));
+    info.version         = H5FD_ONION_FAPL_INFO_VERSION_CURR;
+    info.backing_fapl_id = backing_fapl;
+    info.page_size       = page_size;
+    info.store_target    = H5FD_ONION_STORE_TARGET_ONION;
+    info.revision_num    = revision;
+    if (comment)
+        snprintf(info.comment, sizeof(info.comment), "%s", comment);
+
+    if ((fapl = H5Pcreate(H5P_FILE_ACCESS)) < 0)
+        return H5I_INVALID_HID;
+    if (H5Pset_fapl_onion(fapl, &info) < 0) {
+        H5Pclose(fapl);
+        return H5I_INVALID_HID;
+    }
+    return fapl;
+}
+
+/* Names written by one step, in the order H5Literate2 reports them. */
+struct step_names {
+    char **names;
+    size_t n;
+    size_t cap;
+};
+
+static herr_t
+collect_member(hid_t group, const char *name, const H5L_info2_t *info, void *op_data)
+{
+    struct step_names *sn = (struct step_names *)op_data;
+
+    (void)group;
+    (void)info;
+
+    if (name[0] == '.') /* .manifest / .payload -- bookkeeping, not content */
+        return 0;
+
+    if (sn->n == sn->cap) {
+        size_t ncap   = sn->cap ? sn->cap * 2 : 16;
+        char **grown = (char **)realloc(sn->names, ncap * sizeof(*grown));
+
+        if (!grown)
+            return -1;
+        sn->names = grown;
+        sn->cap   = ncap;
+    }
+    if (NULL == (sn->names[sn->n] = strdup(name)))
+        return -1;
+    sn->n++;
+    return 0;
+}
+
+/* Stamp this revision with the physical step it represents, so a reader can
+ * confirm the off-by-one mapping from the file itself. */
+static int
+write_step_attr(hid_t fid, unsigned long long step)
+{
+    hid_t sp = H5I_INVALID_HID, at = H5I_INVALID_HID;
+    int   rc = -1;
+
+    H5E_BEGIN_TRY
+    {
+        H5Adelete(fid, "vol_stream_step");
+    }
+    H5E_END_TRY
+
+    if ((sp = H5Screate(H5S_SCALAR)) < 0)
+        goto done;
+    if ((at = H5Acreate2(fid, "vol_stream_step", H5T_NATIVE_ULLONG, sp, H5P_DEFAULT, H5P_DEFAULT)) < 0)
+        goto done;
+    if (H5Awrite(at, H5T_NATIVE_ULLONG, &step) < 0)
+        goto done;
+    rc = 0;
+
+done:
+    if (at >= 0)
+        H5Aclose(at);
+    if (sp >= 0)
+        H5Sclose(sp);
+    return rc;
+}
+
+/* Read every revision back and check it is the step it claims to be. The
+ * onion VFD can drop revisions silently (see the page-size note above), and
+ * an archive that lost half its history looks exactly like one that never
+ * had it -- so the tool checks rather than reports success on faith.
+ * Revisions are opened with the same page size the pass wrote, since 0 does
+ * not work on the read side (see the page-size note above). */
+static int
+history_verify(const char *outname, hsize_t n_steps, uint32_t page_size)
+{
+    hid_t   backing = H5I_INVALID_HID;
+    hsize_t i;
+    int     rc = -1;
+
+    if ((backing = H5Pcreate(H5P_FILE_ACCESS)) < 0)
+        return -1;
+
+    for (i = 0; i < n_steps; i++) {
+        hid_t              rfapl = onion_fapl(backing, (uint64_t)(i + 1), page_size, NULL);
+        hid_t              rfid  = H5I_INVALID_HID;
+        hid_t              at    = H5I_INVALID_HID;
+        unsigned long long stamp = (unsigned long long)-1;
+
+        if (rfapl < 0)
+            goto done;
+
+        H5E_BEGIN_TRY
+        {
+            rfid = H5Fopen(outname, H5F_ACC_RDONLY, rfapl);
+            if (rfid >= 0) {
+                if ((at = H5Aopen(rfid, "vol_stream_step", H5P_DEFAULT)) >= 0) {
+                    if (H5Aread(at, H5T_NATIVE_ULLONG, &stamp) < 0)
+                        stamp = (unsigned long long)-1;
+                    H5Aclose(at);
+                }
+            }
+        }
+        H5E_END_TRY
+
+        if (rfid >= 0)
+            H5Fclose(rfid);
+        H5Pclose(rfapl);
+
+        if (stamp != (unsigned long long)i)
+            goto done;
+    }
+    rc = 0;
+
+done:
+    H5Pclose(backing);
+    return rc;
+}
+
+/* One full write pass at a given page size. Everything it touches is
+ * recreated from scratch, so a failed pass can simply be repeated with a
+ * different page size. */
+static int
+history_write_pass(const char *fname, hid_t nfid, hsize_t n_steps, const char *outname,
+                   const char *onion_name, const char *recovery_name, uint32_t page_size,
+                   size_t *n_written)
+{
+    hid_t             backing = H5I_INVALID_HID;
+    hsize_t           i;
+    size_t            k;
+    struct step_names sn = {NULL, 0, 0};
+    int               rc = -1;
+
+    (void)fname;
+    *n_written = 0;
+
+    /* A stale history alongside a reused output name would be appended to,
+     * silently mixing two streams' revisions into one numbering. */
+    unlink(outname);
+    unlink(onion_name);
+    unlink(recovery_name);
+
+    /* Revision 0: the canonical file, which must exist before the onion VFD
+     * will open anything read-write. Created plainly, exactly as HDF5's own
+     * H5F-level onion tests do -- and stamped, while it is still an ordinary
+     * file, with the page size a reader has to pass back. */
+    {
+        hid_t ofid = H5Fcreate(outname, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+        hid_t sp = H5I_INVALID_HID, at = H5I_INVALID_HID;
+        int   ok = 0;
+
+        if (ofid < 0) {
+            fprintf(stderr, "h5stream: cannot create '%s'\n", outname);
+            return -1;
+        }
+        if ((sp = H5Screate(H5S_SCALAR)) >= 0 &&
+            (at = H5Acreate2(ofid, H5STREAM_ONION_PAGE_ATTR, H5T_NATIVE_UINT32, sp, H5P_DEFAULT,
+                             H5P_DEFAULT)) >= 0 &&
+            H5Awrite(at, H5T_NATIVE_UINT32, &page_size) >= 0)
+            ok = 1;
+        if (at >= 0)
+            H5Aclose(at);
+        if (sp >= 0)
+            H5Sclose(sp);
+        H5Fclose(ofid);
+
+        if (!ok) {
+            fprintf(stderr, "h5stream: cannot record the page size in '%s'\n", outname);
+            return -1;
+        }
+    }
+
+    /* A real fapl, not H5P_DEFAULT: the onion VFD hands this to its own
+     * recovery-file open, which rejects H5P_DEFAULT with "not a file access
+     * property list" -- and HDF5's own H5F-level tests pass a real one. */
+    if ((backing = H5Pcreate(H5P_FILE_ACCESS)) < 0)
+        return -1;
+
+    for (i = 0; i < n_steps; i++) {
+        char  step_path[64], comment[32];
+        hid_t g = H5I_INVALID_HID, ofid = H5I_INVALID_HID, rev_fapl = H5I_INVALID_HID;
+        int   step_rc = 1;
+
+        snprintf(step_path, sizeof(step_path), "/step/%llu", (unsigned long long)i);
+        H5E_BEGIN_TRY
+        {
+            g = H5Gopen2(nfid, step_path, H5P_DEFAULT);
+        }
+        H5E_END_TRY
+        if (g < 0)
+            continue;
+
+        for (k = 0; k < sn.n; k++)
+            free(sn.names[k]);
+        sn.n = 0;
+        if (H5Literate2(g, H5_INDEX_NAME, H5_ITER_INC, NULL, collect_member, &sn) < 0) {
+            H5Gclose(g);
+            fprintf(stderr, "h5stream: out of memory scanning step %llu\n", (unsigned long long)i);
+            goto done;
+        }
+        H5Gclose(g);
+
+        snprintf(comment, sizeof(comment), "step %llu", (unsigned long long)i);
+        if ((rev_fapl = onion_fapl(backing, H5FD_ONION_FAPL_INFO_REVISION_ID_LATEST, page_size, comment)) <
+            0)
+            goto done;
+
+        /* One open/close cycle is one revision -- the whole mechanism. */
+        if ((ofid = H5Fopen(outname, H5F_ACC_RDWR, rev_fapl)) < 0) {
+            fprintf(stderr, "h5stream: cannot open '%s' for revision %llu\n", outname,
+                    (unsigned long long)(i + 1));
+            H5Pclose(rev_fapl);
+            goto done;
+        }
+
+        for (k = 0; k < sn.n; k++) {
+            /* A step that rewrites an object replaces the previous
+             * revision's copy of it, which is what makes revision N the
+             * state *as of* step N-1 rather than a pile of every version. */
+            H5E_BEGIN_TRY
+            {
+                if (H5Lexists(ofid, sn.names[k], H5P_DEFAULT) > 0)
+                    H5Ldelete(ofid, sn.names[k], H5P_DEFAULT);
+            }
+            H5E_END_TRY
+
+            {
+                char src[192];
+
+                snprintf(src, sizeof(src), "%s/%s", step_path, sn.names[k]);
+                if (H5Ocopy(nfid, src, ofid, sn.names[k], H5P_DEFAULT, H5P_DEFAULT) < 0) {
+                    fprintf(stderr, "h5stream: cannot copy %s\n", src);
+                    goto step_done;
+                }
+            }
+        }
+
+        if (write_step_attr(ofid, (unsigned long long)i) < 0) {
+            fprintf(stderr, "h5stream: cannot stamp revision %llu\n", (unsigned long long)(i + 1));
+            goto step_done;
+        }
+        step_rc = 0;
+
+step_done:
+        H5Fclose(ofid);
+        H5Pclose(rev_fapl);
+        if (step_rc != 0)
+            goto done;
+        (*n_written)++;
+    }
+    rc = 0;
+
+done:
+    for (k = 0; k < sn.n; k++)
+        free(sn.names[k]);
+    free(sn.names);
+    if (backing >= 0)
+        H5Pclose(backing);
+    return rc;
+}
+
+static int
+cmd_history(const char *fname, const char *outname)
+{
+    hid_t    nfid = H5I_INVALID_HID, steps_grp = H5I_INVALID_HID, fapl = H5I_INVALID_HID;
+    hsize_t  n_steps = 0;
+    size_t   n_written = 0;
+    char    *onion_name = NULL, *recovery_name = NULL;
+    uint32_t pages[2] = {H5STREAM_ONION_PAGE_SIZE, H5STREAM_ONION_PAGE_SIZE_SAFE};
+    uint32_t used     = 0;
+    size_t   p;
+    int      rc = 1;
+
+    if ((fapl = H5Pcreate(H5P_FILE_ACCESS)) >= 0)
+        H5Pset_file_locking(fapl, false, true);
+
+    if ((nfid = H5Fopen(fname, H5F_ACC_RDONLY, fapl >= 0 ? fapl : H5P_DEFAULT)) < 0) {
+        fprintf(stderr, "h5stream: cannot open '%s'\n", fname);
+        goto done;
+    }
+    H5E_BEGIN_TRY
+    {
+        steps_grp = H5Gopen2(nfid, "/step", H5P_DEFAULT);
+    }
+    H5E_END_TRY
+    if (steps_grp < 0) {
+        fprintf(stderr, "h5stream: '%s' has no steps\n", fname);
+        goto done;
+    }
+    if (H5Gget_num_objs(steps_grp, &n_steps) < 0)
+        goto done;
+
+    {
+        size_t len = strlen(outname) + 20;
+
+        if (NULL == (onion_name = (char *)malloc(len)) || NULL == (recovery_name = (char *)malloc(len)))
+            goto done;
+        snprintf(onion_name, len, "%s.onion", outname);
+        snprintf(recovery_name, len, "%s.onion.recovery", outname);
+    }
+
+    for (p = 0; p < sizeof(pages) / sizeof(pages[0]); p++) {
+        if (history_write_pass(fname, nfid, n_steps, outname, onion_name, recovery_name, pages[p],
+                               &n_written) < 0)
+            goto done;
+        if (history_verify(outname, n_steps, pages[p]) == 0) {
+            used = pages[p];
+            break;
+        }
+        if (p + 1 < sizeof(pages) / sizeof(pages[0]))
+            fprintf(stderr,
+                    "h5stream: the history did not read back correctly at page size %u -- retrying at %u "
+                    "(see cmd_history()'s page-size note)\n",
+                    pages[p], pages[p + 1]);
+    }
+
+    if (used == 0) {
+        fprintf(stderr, "h5stream: could not write a verifiable revision history for '%s'\n", fname);
+        goto done;
+    }
+
+    /* Report the count the VFD itself reports, not the one the loop believes
+     * it wrote -- the two disagreeing is exactly the failure verified above. */
+    {
+        hid_t   backing   = H5Pcreate(H5P_FILE_ACCESS);
+        hid_t   cfapl     = (backing >= 0) ? onion_fapl(backing, H5FD_ONION_FAPL_INFO_REVISION_ID_LATEST,
+                                                        used, NULL)
+                                            : H5I_INVALID_HID;
+        hsize_t revisions = 0;
+
+        /* H5FDonion_get_revision_count() insists on an onion fapl, not the
+         * plain backing one -- "not a Onion VFL driver" otherwise. */
+        if (cfapl < 0 || H5FDonion_get_revision_count(outname, cfapl, &revisions) < 0)
+            revisions = 0;
+
+        printf("%s: wrote %zu revision(s) to %s (VFD reports %llu), verified\n", fname, n_written,
+               outname, (unsigned long long)revisions);
+        printf("  step N is revision N+1; each revision carries its own step in the root attribute "
+               "\"vol_stream_step\"\n");
+        printf("  open one with H5Pset_fapl_onion(): revision_num = step + 1, page_size = %u\n", used);
+        printf("  the page size is also in '%s' itself, attribute \"%s\" -- read it plainly, without the "
+               "onion VFD\n",
+               outname, H5STREAM_ONION_PAGE_ATTR);
+
+        if (cfapl >= 0)
+            H5Pclose(cfapl);
+        if (backing >= 0)
+            H5Pclose(backing);
+    }
+    rc = 0;
+
+done:
+    free(onion_name);
+    free(recovery_name);
+    if (steps_grp >= 0)
+        H5Gclose(steps_grp);
+    if (nfid >= 0)
+        H5Fclose(nfid);
+    if (fapl >= 0)
+        H5Pclose(fapl);
+    return rc;
+}
+
+/*
  * tail: follow a live stream, reporting each step as it commits.
  *
  * Uses the connector's own reader path -- H5Fwait_step_ready() -- and not
@@ -501,6 +963,13 @@ main(int argc, char **argv)
             return 2;
         }
         return cmd_export(argv[2], argv[3]);
+    }
+    if (strcmp(argv[1], "history") == 0) {
+        if (argc < 4) {
+            usage();
+            return 2;
+        }
+        return cmd_history(argv[2], argv[3]);
     }
 
     fprintf(stderr, "h5stream: unknown subcommand '%s'\n", argv[1]);

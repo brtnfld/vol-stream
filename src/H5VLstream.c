@@ -5772,6 +5772,51 @@ H5VL__stream_apply_queue_policy(H5VL_stream_t *file_obj)
  *
  *-------------------------------------------------------------------------
  */
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_register_op
+ *
+ * Purpose:     Register one namespaced optional operation, tolerating the
+ *              case where it is already registered.
+ *
+ *              HDF5's dynamic-operation registry is global to the process
+ *              and outlives any one registration of a connector, while this
+ *              init callback runs on *every* registration. So a program that
+ *              registers vol-stream, closes it, and registers it again --
+ *              two independent components each doing the obvious thing, or
+ *              simply one test exercising two scenarios in a row -- got
+ *              "operation name already exists" from
+ *              H5VLregister_opt_operation() and, through it, a failed
+ *              H5VLregister_connector(). The connector was effectively
+ *              single-use per process, which nothing documented and nothing
+ *              caught, because every test until now registered exactly once.
+ *
+ *              Recovering the already-assigned value with
+ *              H5VLfind_opt_operation() makes init idempotent, which is what
+ *              a plugin's init has to be. Unregistering in term() instead
+ *              would fix the sequential case but break the concurrent one --
+ *              the first close would pull the operations out from under a
+ *              registration still using them.
+ *
+ * Return:      0 on success, -1 on failure.
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_register_op(const char *name, int *op_val)
+{
+    herr_t ret;
+
+    H5E_BEGIN_TRY
+    {
+        ret = H5VLregister_opt_operation(H5VL_SUBCLS_FILE, name, op_val);
+    }
+    H5E_END_TRY
+
+    if (ret >= 0)
+        return 0;
+
+    return (H5VLfind_opt_operation(H5VL_SUBCLS_FILE, name, op_val) < 0) ? -1 : 0;
+} /* end H5VL__stream_register_op() */
+
 static herr_t
 H5VL_stream_init(hid_t vipl_id)
 {
@@ -5787,28 +5832,24 @@ H5VL_stream_init(hid_t vipl_id)
      * The op values land in file-scope statics that the H5F* wrappers below and
      * the 'optional' callback both consult.
      */
-    if (H5VLregister_opt_operation(H5VL_SUBCLS_FILE, H5VL_STREAM_OP_BEGIN_STEP, &H5VL_stream_op_begin_step) < 0)
+    if (H5VL__stream_register_op(H5VL_STREAM_OP_BEGIN_STEP, &H5VL_stream_op_begin_step) < 0)
         return -1;
-    if (H5VLregister_opt_operation(H5VL_SUBCLS_FILE, H5VL_STREAM_OP_END_STEP, &H5VL_stream_op_end_step) < 0)
+    if (H5VL__stream_register_op(H5VL_STREAM_OP_END_STEP, &H5VL_stream_op_end_step) < 0)
         return -1;
-    if (H5VLregister_opt_operation(H5VL_SUBCLS_FILE, H5VL_STREAM_OP_STEP_STATUS, &H5VL_stream_op_step_status) < 0)
+    if (H5VL__stream_register_op(H5VL_STREAM_OP_STEP_STATUS, &H5VL_stream_op_step_status) < 0)
         return -1;
-    if (H5VLregister_opt_operation(H5VL_SUBCLS_FILE, H5VL_STREAM_OP_SUBSCRIBE, &H5VL_stream_op_subscribe) < 0)
+    if (H5VL__stream_register_op(H5VL_STREAM_OP_SUBSCRIBE, &H5VL_stream_op_subscribe) < 0)
         return -1;
-    if (H5VLregister_opt_operation(H5VL_SUBCLS_FILE, H5VL_STREAM_OP_BEGIN_LOGICAL_STEP,
-                                    &H5VL_stream_op_begin_logical_step) < 0)
+    if (H5VL__stream_register_op(H5VL_STREAM_OP_BEGIN_LOGICAL_STEP, &H5VL_stream_op_begin_logical_step) < 0)
         return -1;
-    if (H5VLregister_opt_operation(H5VL_SUBCLS_FILE, H5VL_STREAM_OP_GET_LOGICAL_STEPS,
-                                    &H5VL_stream_op_get_logical_steps) < 0)
+    if (H5VL__stream_register_op(H5VL_STREAM_OP_GET_LOGICAL_STEPS, &H5VL_stream_op_get_logical_steps) < 0)
         return -1;
-    if (H5VLregister_opt_operation(H5VL_SUBCLS_FILE, H5VL_STREAM_OP_WAIT_STEP_READY,
-                                    &H5VL_stream_op_wait_step_ready) < 0)
+    if (H5VL__stream_register_op(H5VL_STREAM_OP_WAIT_STEP_READY, &H5VL_stream_op_wait_step_ready) < 0)
         return -1;
-    if (H5VLregister_opt_operation(H5VL_SUBCLS_FILE, H5VL_STREAM_OP_SET_QUEUE_POLICY,
-                                    &H5VL_stream_op_set_queue_policy) < 0)
+    if (H5VL__stream_register_op(H5VL_STREAM_OP_SET_QUEUE_POLICY, &H5VL_stream_op_set_queue_policy) < 0)
         return -1;
-    if (H5VLregister_opt_operation(H5VL_SUBCLS_FILE, H5VL_STREAM_OP_GET_SUBSCRIBED_DATA,
-                                    &H5VL_stream_op_get_subscribed_data) < 0)
+    if (H5VL__stream_register_op(H5VL_STREAM_OP_GET_SUBSCRIBED_DATA, &H5VL_stream_op_get_subscribed_data) <
+        0)
         return -1;
 
     return 0;
