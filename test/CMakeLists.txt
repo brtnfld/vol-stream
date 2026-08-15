@@ -83,6 +83,32 @@ if(MPI_C_FOUND AND MPIEXEC_EXECUTABLE)
             --plugin-dir $<TARGET_FILE_DIR:vol_stream>
   )
   set_tests_properties(parallel PROPERTIES TIMEOUT 120)
+
+  # dev-plan.md's CI matrix asks for coprime rank shapes because that is where
+  # M×N projection bugs surface, and 3->2 alone is a thin sample: with only
+  # two readers, most remainder cases cannot arise at all. 7->3 is the next
+  # shape the matrix names.
+  #
+  # --per-rank 3 is required, not incidental. t_parallel splits the global
+  # extent evenly and refuses a decomposition that does not divide, so the
+  # default 4 elements/rank gives 7*4 = 28 across 3 readers and the read
+  # phase exits with "global_size 28 not divisible by 3 ranks" -- a limit of
+  # the harness, not of the connector. 3 elements/rank gives 21, which both 7
+  # and 3 divide.
+  #
+  # Genuinely uneven decompositions are the more realistic case and remain
+  # untested, since that needs t_parallel to handle a remainder -- a test
+  # change rather than a CI one.
+  add_test(NAME parallel_7x3
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/run_parallel_test.sh
+            --mpirun       ${MPIEXEC_EXECUTABLE}
+            --bin          $<TARGET_FILE:t_parallel>
+            --plugin-dir   $<TARGET_FILE_DIR:vol_stream>
+            --writer-ranks 7
+            --reader-ranks 3
+            --per-rank     3
+  )
+  set_tests_properties(parallel_7x3 PROPERTIES TIMEOUT 180)
 endif()
 
 # VOL_STREAM_H5DIFF points t_replay (the M2 replay-invariant gate) at an

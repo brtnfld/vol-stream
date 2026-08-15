@@ -212,6 +212,11 @@ the right layer.
 
 ### Filtered-chunk passthrough
 
+> **Status: not being built.** This section is retained as design rationale —
+> the conflict rule below is live code — but `FilteredChunks` as a manifest
+> payload form was decided against in M8.5.1; see that section for the
+> evidence.
+
 `H5Dread_chunk2`, `H5Dwrite_chunk`, `H5Dchunk_iter` and `H5Dget_chunk_info` are
 public, so when a dataset is chunked and filtered and a write covers whole
 chunks, the connector can move **already-compressed chunks** without
@@ -295,10 +300,30 @@ it was meant to attack is now largely gone, and what remains of its value is
 the CPU saved by not re-filtering at replay — which the M8.5.1 zero-copy path
 already captures for the transport side.
 
-Still not built: `FilteredChunks` as an actual payload form in the manifest,
-and chunk-grid-aware routing of a subscriber's N-D selection (subscription
-routing remains 1-D element-range intersection). Both remain M2-scale, and
-neither is needed for the case above.
+**`FilteredChunks` as a manifest payload form: decided against.** Not
+deferred — dropped, on evidence. It was motivated by two costs, and both
+have since been addressed more cheaply:
+
+- *Payload duplication.* The staging copy really was the dominant cost
+  (167x the real data), but compressing `.payload` fixed that generically,
+  for every step rather than only filtered datasets, in a few lines and with
+  no format change.
+- *Re-filtering CPU at replay.* M8.5.1's zero-copy fast path already avoids
+  it wherever a subscriber's pipeline matches the dataset's, which is the
+  case `FilteredChunks` was aimed at.
+
+What remains of its value is a narrow slice — avoiding a re-filter for a
+subscriber whose pipeline matches but whose write did not cover a whole
+single chunk — bought at the price of a new payload form, a `filter_mask`
+schema field, capture-side filtering, and a replay path that injects chunks
+via `H5Dwrite_chunk()`. That is an M2-scale change for a case neither
+measured nor reported. Revisit only if profiling shows re-filtering as a
+real cost; the design above stands ready if so.
+
+Still open (not dropped): chunk-grid-aware routing of a subscriber's N-D
+selection. Subscription routing linearizes the selection's bounding box, so
+a non-contiguous subscription receives a superset of what it asked for —
+correct, but coarser than it could be.
 
 ### Connector state machine
 
@@ -635,12 +660,28 @@ writer, subscribing to a subvolume, with no user-written C glue.
 
 | Axis | Values | Why |
 |---|---|---|
-| HDF5 version | develop · latest release · oldest supported | The documented failure mode; `H5VL_VERSION` is 3 and will move |
+| HDF5 version | develop only (see note) | The documented failure mode; `H5VL_VERSION` is 3 and will move |
 | MPI | MPICH · OpenMPI | Intercommunicator and dynamic-process behaviour differ in practice |
 | Mercury NA plugin | `na+sm` · `ofi+tcp` · `ofi+verbs` | Where transport bugs live; shared-memory and TCP run on any CI box |
 | rank shapes | 1→1 · 7→3 · 64→5 | Coprime counts are where M×N projection bugs surface |
 | encode round-trip | cross-endian pair | The manifest leans on HDF5's encoders; prove them across byte order |
 | Spack env | pinned lockfile · latest deps | Pinned is reproducible; floating detects upstream breakage early |
+
+**HDF5 2.x is the only support target — this row is closed, not pending
+(2026-08-15).** The original row called for develop, latest release, and
+oldest supported, which read like unfinished work. It is not: 2.x is the
+deliberate scope.
+
+The code already reflects that and cannot easily do otherwise. The connector
+uses `H5Tdecode2()` at 8 call sites — including the core manifest decode path
+every replay runs through — and `H5Dread_chunk2()` at 5. Neither exists in
+1.14.6, the latest release, checked against that tag's own headers rather
+than inferred. A 1.14 job would not fail on some compatibility detail; it
+would not compile.
+
+So the row now says develop, matching the `build` job's own comment. Nothing
+here is blocked on CI work; supporting 1.14 would mean writing a
+compatibility layer for those APIs *and* changing what the project targets.
 | sanitizers | ASan · UBSan · TSan | A progress thread plus a queue is the classic place for races |
 
 ## Residual risks
