@@ -5038,6 +5038,17 @@ H5VL__stream_send_write_entry_to_concentrator(const H5VL_stream_pending_entry_t 
     }
 
     {
+        /* Native byte order is deliberate here, unlike the VL wire form's
+         * length tag (see H5VL__stream_put_u64le()), which had to be pinned
+         * to little-endian. The difference is where the bytes go: this
+         * message is a transient MPI_Send between ranks of one job, decoded
+         * by the matching receive below, so both ends are the same build on
+         * the same architecture. The VL tag lands in a *file*, which can be
+         * read years later on a machine of the opposite endianness.
+         *
+         * If heterogeneous-endianness MPI jobs ever become a target, this
+         * needs the same treatment -- but MPI_BYTE performs no conversion,
+         * so that would be a deliberate change rather than an oversight. */
         uint64_t v;
 
         v = (uint64_t)path_len;
