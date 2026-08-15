@@ -433,6 +433,7 @@ static herr_t H5VL__stream_reader_build_index(H5VL_stream_file_state_t *fs);
 static herr_t H5VL__stream_reader_advance(H5VL_stream_file_state_t *fs, int has_target, uint64_t target_step);
 static herr_t H5VL__stream_path_index_resolve(H5VL_stream_file_state_t *fs, const char *path,
                              uint64_t current_step, uint64_t *resolved_step);
+static char  *H5VL__stream_resolve_physical_path(H5VL_stream_file_state_t *fs, const char *logical_path);
 static void  *H5VL__stream_reader_open_dataset(H5VL_stream_t *o, const char *name, hid_t dapl_id,
                              hid_t dxpl_id, void **req);
 static void  *H5VL__stream_reader_open_attr(H5VL_stream_t *o, const char *name, hid_t aapl_id,
@@ -2272,6 +2273,53 @@ H5VL__stream_path_index_resolve(H5VL_stream_file_state_t *fs, const char *path, 
 } /* end H5VL__stream_path_index_resolve() */
 
 /*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_resolve_physical_path
+ *
+ * Purpose:     Map an application-facing logical path ("/target") to where
+ *              the object actually lives in the underlying file
+ *              ("/step/<k>/target"), for the largest committed step <= the
+ *              file's current one. The two namespaces differ because steps
+ *              land group-based, so anything that hands a path to the
+ *              *under* VOL by name -- rather than through an already-opened
+ *              object -- has to translate first.
+ *
+ *              Used by the H5R path (H5VL_stream_object_specific()'s
+ *              lookup): H5Rcreate_object(fid, "/target") resolves the name
+ *              through the under connector, which knows nothing about
+ *              logical paths and would report "object doesn't exist".
+ *
+ *              Only resolves objects from *already committed* steps. An
+ *              object created in the currently-open step is deliberately
+ *              not found: it does not exist in the underlying file until
+ *              end_step() replays the manifest, so there is nothing to make
+ *              a reference to yet. That is a real property of deferred
+ *              writes, not a lookup bug -- see docs/dev-plan.md's
+ *              reference-support findings.
+ *
+ * Return:      Success:    malloc'd resolved path (caller frees)
+ *              Failure:    NULL (no such object as of this step)
+ *-------------------------------------------------------------------------
+ */
+static char *
+H5VL__stream_resolve_physical_path(H5VL_stream_file_state_t *fs, const char *logical_path)
+{
+    uint64_t step;
+    char    *resolved;
+    size_t   len;
+
+    if (!fs || !logical_path || logical_path[0] != '/')
+        return NULL;
+    if (H5VL__stream_path_index_resolve(fs, logical_path, fs->current_step, &step) < 0)
+        return NULL;
+
+    len = strlen("/step/") + 20 /* digits */ + strlen(logical_path) + 1;
+    if (NULL == (resolved = (char *)malloc(len)))
+        return NULL;
+    snprintf(resolved, len, "/step/%llu%s", (unsigned long long)step, logical_path);
+    return resolved;
+} /* end H5VL__stream_resolve_physical_path() */
+
+/*-------------------------------------------------------------------------
  * Function:    H5VL__stream_reader_index_one_step
  *
  * Purpose:     Decode one step's .manifest, folding it into fs's indexes.
@@ -3033,6 +3081,19 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                     ret_value = -1;
                     goto done;
                 }
+            }
+
+            /* Record where this object physically landed, the same way
+             * H5VL__stream_reader_index_one_step() does for a reader. A
+             * writer needs the identical logical -> "/step/<k>/..." mapping
+             * to resolve an H5R reference target: the application names
+             * "/target", but the object only ever exists at
+             * "/step/<k>/target", and only from the step that created it
+             * onward. See H5VL__stream_resolve_physical_path(). */
+            if ((kind == vs_Kind_DsetCreate || kind == vs_Kind_Attr) && path &&
+                H5VL__stream_path_index_add(fs, path, physical_step) < 0) {
+                ret_value = -1;
+                goto done;
             }
 
             if ((dtype = H5Tdecode2(type_enc_ptr, type_enc_actual_len)) < 0 ||
@@ -7722,6 +7783,36 @@ H5VL_stream_object_specific(void *obj, const H5VL_loc_params_t *loc_params,
      * 'refresh' operation destroying the current object
      */
     under_vol_id = o->under_vol_id;
+
+    /* H5Rcreate_object()/H5Rcreate_region() reach the connector as a LOOKUP
+     * by name. The name is the application's logical path, which is not
+     * where the object physically lives (steps land under "/step/<k>/"), so
+     * passing it straight through makes the under connector report "object
+     * doesn't exist". Translate, then look up against the file root -- the
+     * resolved path is absolute, so it must not be resolved relative to o.
+     * Falls through untranslated whenever translation does not apply, which
+     * keeps every non-H5R caller of object_specific byte-identical. */
+    if (args && args->op_type == H5VL_OBJECT_LOOKUP && loc_params &&
+        loc_params->type == H5VL_OBJECT_BY_NAME && loc_params->loc_data.loc_by_name.name &&
+        o->file_state) {
+        char *resolved =
+            H5VL__stream_resolve_physical_path(o->file_state, loc_params->loc_data.loc_by_name.name);
+
+        if (resolved) {
+            H5VL_loc_params_t resolved_params = *loc_params;
+
+            resolved_params.obj_type                   = H5I_FILE;
+            resolved_params.loc_data.loc_by_name.name  = resolved;
+
+            ret_value = H5VLobject_specific(o->file_state->file_under_object, &resolved_params,
+                                            o->file_state->file_under_vol_id, args, dxpl_id, req);
+            free(resolved);
+
+            if (req && *req)
+                *req = H5VL_stream_new_obj(*req, under_vol_id);
+            return ret_value;
+        }
+    }
 
     ret_value = H5VLobject_specific(o->under_object, loc_params, o->under_vol_id, args, dxpl_id, req);
 

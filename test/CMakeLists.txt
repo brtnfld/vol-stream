@@ -1,4 +1,4 @@
-foreach(t t_smoke t_step t_replay t_reader t_deferred t_vl_reject t_manifest_cache)
+foreach(t t_smoke t_step t_replay t_reader t_deferred t_vl_reject t_manifest_cache t_ref_path)
   add_executable(${t} ${t}.c)
   target_link_libraries(${t} PRIVATE vol_stream)
 endforeach()
@@ -10,6 +10,7 @@ add_test(NAME reader COMMAND t_reader)
 add_test(NAME deferred COMMAND t_deferred)
 add_test(NAME vl_reject COMMAND t_vl_reject)
 add_test(NAME manifest_cache COMMAND t_manifest_cache)
+add_test(NAME ref_path COMMAND t_ref_path)
 
 # M4 exit gate: the two-process Mercury round trip. M5 exit gate: SSG
 # rendezvous, late joiners, and a departing reader that does not stall the
@@ -81,7 +82,7 @@ endif()
 # itself (see the HDF5-discovery note at the top of ../CMakeLists.txt).
 set(VOL_STREAM_H5DIFF "" CACHE FILEPATH "h5diff binary used by the t_replay test (default: PATH lookup)")
 
-set_tests_properties(smoke step replay reader deferred vl_reject manifest_cache PROPERTIES
+set_tests_properties(smoke step replay reader deferred vl_reject manifest_cache ref_path PROPERTIES
   ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>;VOL_STREAM_H5DIFF=${VOL_STREAM_H5DIFF}"
 )
 
