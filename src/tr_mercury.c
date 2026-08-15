@@ -91,10 +91,23 @@ hg_proc_vs_blob_t(hg_proc_t proc, void *data)
  * header comment. dcpl_enc (M8.5 precision) is the subscriber's own
  * H5Pencode2() bytes for the filter pipeline it wants pushed data
  * re-filtered through; a 0-length blob means none requested, the original
- * raw-bytes behavior. */
+ * raw-bytes behavior.
+ *
+ * M9: flags/pred_enc carry a predicate. VS_SUB_FLAG_PRED_ONLY means "amend
+ * the predicate of the subscription this member already has for path, and
+ * touch nothing else" -- it reuses this RPC rather than adding a second one
+ * so that vs_tr_reader_subscribe_predicate() inherits the same find-the-
+ * writer probing (see vs_tr_reader_subscribe()). matched, in the reply,
+ * distinguishes "I am the writer and I found/created that subscription"
+ * from "I am the writer but you never subscribed to that path": status
+ * alone cannot, since status is also what identifies the writer during
+ * probing, so answering non-zero would make the prober keep hunting for a
+ * writer that had in fact already answered. */
+#define VS_SUB_FLAG_PRED_ONLY 0x1u
 MERCURY_GEN_PROC(vs_subscribe_in_t, ((uint64_t)(member_id))((hg_string_t)(path))((uint64_t)(sel_start))(
-                                          (uint64_t)(sel_count))((vs_blob_t)(dcpl_enc)))
-MERCURY_GEN_PROC(vs_subscribe_out_t, ((int32_t)(status)))
+                                          (uint64_t)(sel_count))((vs_blob_t)(dcpl_enc))((uint32_t)(flags))(
+                                          (vs_blob_t)(pred_enc))((vs_blob_t)(space_enc)))
+MERCURY_GEN_PROC(vs_subscribe_out_t, ((int32_t)(status))((int32_t)(matched)))
 /* M8: writer -> reader, one entry's actual bytes. M8.5: elem_start/
  * elem_count identify which element range of the subscribed object payload
  * covers -- the overlap between what was written and what was requested,
@@ -128,7 +141,12 @@ typedef struct vs_tr_lag_entry_t {
  * M8.5: sel_start/sel_count is the subscriber's own requested 1-D element
  * range; [0, UINT64_MAX) means "whole object". dcpl_enc/dcpl_enc_len (M8.5
  * precision) is this subscriber's requested filter pipeline, NULL/0 for
- * none. */
+ * none. M9: pred_enc/pred_enc_len is this subscriber's predicate, NULL/0
+ * for none -- set by a follow-up VS_SUB_FLAG_PRED_ONLY subscribe, and
+ * cleared by a plain re-subscribe (a fresh subscription starts with no
+ * predicate; see vs_subscribe_ult()). space_enc/space_enc_len is the
+ * subscriber's own H5Sencode2() selection -- what sel_start/sel_count is
+ * only the bounding span of -- NULL/0 when the subscriber sent none. */
 typedef struct vs_tr_sub_entry_t {
     ssg_member_id_t member_id;
     char            *path;
@@ -136,6 +154,10 @@ typedef struct vs_tr_sub_entry_t {
     uint64_t          sel_count;
     uint8_t          *dcpl_enc;
     uint64_t          dcpl_enc_len;
+    uint8_t          *pred_enc;
+    uint64_t          pred_enc_len;
+    uint8_t          *space_enc;
+    uint64_t          space_enc_len;
 } vs_tr_sub_entry_t;
 
 /* M8, reader side: one pushed data item queued for vs_tr_reader_wait_data().
@@ -233,6 +255,18 @@ struct vs_tr_t {
      * vs_tr_set_refilter_cb() is called -- every push is raw bytes, the
      * original M8/M8.5 behavior, until then. */
     vs_tr_refilter_fn refilter_fn;
+
+    /* M9, writer side: predicate-evaluation callback, see vs_tr_predicate_
+     * fn's comment in tr_mercury.h. NULL until vs_tr_set_predicate_cb() is
+     * called -- a predicate is then still carried and stored, just never
+     * consulted, so every push goes out whole. */
+    vs_tr_predicate_fn predicate_fn;
+
+    /* M8.5 follow-up, writer side: selection-refinement callback, see
+     * vs_tr_selection_fn's comment in tr_mercury.h. NULL until
+     * vs_tr_set_selection_cb() is called -- routing then stays on the flat
+     * bounding span a subscription's bounds describe. */
+    vs_tr_selection_fn selection_fn;
 };
 
 /*-------------------------------------------------------------------------
@@ -498,7 +532,14 @@ vs_blob_dup(const vs_blob_t *b, uint8_t **out_buf, uint64_t *out_len)
  * range rather than adding a second entry -- one (member, path) always
  * means exactly one requested range in this increment (M8.5 does not
  * support a single reader subscribing to several disjoint subranges of the
- * same object). */
+ * same object).
+ *
+ * M9: with VS_SUB_FLAG_PRED_ONLY the request amends only the predicate of
+ * an existing entry, and creates nothing if there is none -- out.matched
+ * reports which happened. Without the flag it is an ordinary subscribe,
+ * which *clears* any predicate: re-subscribing describes a subscription
+ * afresh, and silently keeping a stale predicate would under-send, the one
+ * failure mode this protocol treats as unacceptable. */
 static void
 vs_subscribe_ult(hg_handle_t handle)
 {
@@ -508,7 +549,8 @@ vs_subscribe_ult(hg_handle_t handle)
     vs_subscribe_in_t    in;
     vs_subscribe_out_t   out;
 
-    out.status = -1;
+    out.status  = -1;
+    out.matched = 0;
 
     /* Only the writer may accept a subscription. Every process in the group
      * registers this handler (Margo registers the full RPC set on both
@@ -530,28 +572,59 @@ vs_subscribe_ult(hg_handle_t handle)
 
     if (tr && HG_SUCCESS == margo_get_input(handle, &in) && in.path) {
         size_t i;
-        int    found = 0;
+        int    found     = 0;
+        int    pred_only = (in.flags & VS_SUB_FLAG_PRED_ONLY) != 0;
 
         pthread_mutex_lock(&tr->sub_lock);
 
         for (i = 0; i < tr->n_sub; i++)
             if (tr->sub_table[i].member_id == (ssg_member_id_t)in.member_id &&
                 strcmp(tr->sub_table[i].path, in.path) == 0) {
-                uint8_t *dcpl_copy;
-                uint64_t dcpl_copy_len;
+                uint8_t *blob_copy;
+                uint64_t blob_copy_len;
 
-                if (vs_blob_dup(&in.dcpl_enc, &dcpl_copy, &dcpl_copy_len) == 0) {
+                if (pred_only) {
+                    /* A 0-length blob clears the predicate -- vs_blob_dup()
+                     * yields NULL/0 for it, which is exactly "none". */
+                    if (vs_blob_dup(&in.pred_enc, &blob_copy, &blob_copy_len) == 0) {
+                        free(tr->sub_table[i].pred_enc);
+                        tr->sub_table[i].pred_enc     = blob_copy;
+                        tr->sub_table[i].pred_enc_len = blob_copy_len;
+                        found                          = 1;
+                    }
+                    break;
+                }
+
+                if (vs_blob_dup(&in.dcpl_enc, &blob_copy, &blob_copy_len) == 0) {
                     free(tr->sub_table[i].dcpl_enc);
-                    tr->sub_table[i].dcpl_enc     = dcpl_copy;
-                    tr->sub_table[i].dcpl_enc_len = dcpl_copy_len;
+                    tr->sub_table[i].dcpl_enc     = blob_copy;
+                    tr->sub_table[i].dcpl_enc_len = blob_copy_len;
                 }
                 tr->sub_table[i].sel_start = in.sel_start;
                 tr->sub_table[i].sel_count = in.sel_count;
+                {
+                    uint8_t *space_copy;
+                    uint64_t space_copy_len;
+
+                    if (vs_blob_dup(&in.space_enc, &space_copy, &space_copy_len) == 0) {
+                        free(tr->sub_table[i].space_enc);
+                        tr->sub_table[i].space_enc     = space_copy;
+                        tr->sub_table[i].space_enc_len = space_copy_len;
+                    }
+                }
+                /* See this function's header comment: a plain re-subscribe
+                 * starts from no predicate rather than inheriting one. */
+                free(tr->sub_table[i].pred_enc);
+                tr->sub_table[i].pred_enc     = NULL;
+                tr->sub_table[i].pred_enc_len = 0;
                 found = 1;
                 break;
             }
 
-        if (!found) {
+        /* PRED_ONLY never creates a subscription: a predicate narrows one
+         * that already exists. Reporting !matched lets the caller fail
+         * loudly instead of quietly over-sending forever. */
+        if (!found && !pred_only) {
             if (tr->n_sub == tr->cap_sub) {
                 size_t               new_cap = tr->cap_sub ? tr->cap_sub * 2 : 8;
                 vs_tr_sub_entry_t *grown   = (vs_tr_sub_entry_t *)realloc(tr->sub_table,
@@ -566,24 +639,36 @@ vs_subscribe_ult(hg_handle_t handle)
                 char    *path_copy = strdup(in.path);
                 uint8_t *dcpl_copy = NULL;
                 uint64_t dcpl_copy_len = 0;
+                uint8_t *space_copy = NULL;
+                uint64_t space_copy_len = 0;
 
-                if (path_copy && vs_blob_dup(&in.dcpl_enc, &dcpl_copy, &dcpl_copy_len) == 0) {
+                if (path_copy && vs_blob_dup(&in.dcpl_enc, &dcpl_copy, &dcpl_copy_len) == 0 &&
+                    vs_blob_dup(&in.space_enc, &space_copy, &space_copy_len) == 0) {
                     tr->sub_table[tr->n_sub].member_id     = (ssg_member_id_t)in.member_id;
                     tr->sub_table[tr->n_sub].path          = path_copy;
                     tr->sub_table[tr->n_sub].sel_start     = in.sel_start;
                     tr->sub_table[tr->n_sub].sel_count     = in.sel_count;
                     tr->sub_table[tr->n_sub].dcpl_enc      = dcpl_copy;
                     tr->sub_table[tr->n_sub].dcpl_enc_len  = dcpl_copy_len;
+                    tr->sub_table[tr->n_sub].pred_enc      = NULL;
+                    tr->sub_table[tr->n_sub].pred_enc_len  = 0;
+                    tr->sub_table[tr->n_sub].space_enc     = space_copy;
+                    tr->sub_table[tr->n_sub].space_enc_len = space_copy_len;
                     tr->n_sub++;
+                    found = 1;
                 }
-                else
+                else {
                     free(path_copy);
+                    free(dcpl_copy);
+                    free(space_copy);
+                }
             }
         }
 
         pthread_mutex_unlock(&tr->sub_lock);
 
-        out.status = 0;
+        out.status  = 0;
+        out.matched = found;
         margo_free_input(handle, &in);
     }
 
@@ -701,6 +786,20 @@ vs_tr_set_refilter_cb(vs_tr_t *tr, vs_tr_refilter_fn fn)
 }
 
 void
+vs_tr_set_predicate_cb(vs_tr_t *tr, vs_tr_predicate_fn fn)
+{
+    if (tr)
+        tr->predicate_fn = fn;
+}
+
+void
+vs_tr_set_selection_cb(vs_tr_t *tr, vs_tr_selection_fn fn)
+{
+    if (tr)
+        tr->selection_fn = fn;
+}
+
+void
 vs_tr_stop(vs_tr_t *tr)
 {
     if (!tr)
@@ -760,6 +859,8 @@ vs_tr_stop(vs_tr_t *tr)
         for (i = 0; i < tr->n_sub; i++) {
             free(tr->sub_table[i].path);
             free(tr->sub_table[i].dcpl_enc);
+            free(tr->sub_table[i].pred_enc);
+            free(tr->sub_table[i].space_enc);
         }
         free(tr->sub_table);
         for (i = 0; i < tr->n_data; i++) {
@@ -1152,42 +1253,37 @@ vs_tr_writer_min_acked_step(vs_tr_t *tr, uint64_t *min_acked_step)
     return found;
 }
 
-int
-vs_tr_reader_subscribe(vs_tr_t *tr, const char *path, uint64_t sel_start, uint64_t sel_count,
-                        const uint8_t *dcpl_enc, uint64_t dcpl_enc_len)
+/* Forwards a fully-filled subscribe request to the writer, finding it the
+ * same target-the-cached-writer-then-fall-back-to-probing way
+ * vs_tr_reader_ack_step() does -- see that function's comment. Returns 0 if
+ * a writer answered at all, setting *out_matched to whether it acted on the
+ * request (M9: a PRED_ONLY request naming a path this member never
+ * subscribed to is answered, but matches nothing). Split out of
+ * vs_tr_reader_subscribe() so the predicate path inherits the probing
+ * rather than duplicating it. */
+static int
+vs_send_subscribe(vs_tr_t *tr, ssg_member_id_t self_id, vs_subscribe_in_t *in, int *out_matched)
 {
-    ssg_member_id_t     self_id;
-    vs_subscribe_in_t in;
-    int                  ret = -1;
+    int ret = -1;
 
-    if (!tr || !path || tr->group_id == SSG_GROUP_ID_INVALID)
-        return -1;
-    if (SSG_SUCCESS != ssg_get_self_id(tr->mid, &self_id))
-        return -1;
+    if (out_matched)
+        *out_matched = 0;
 
-    in.member_id = (uint64_t)self_id;
-    in.path       = (hg_string_t)path;
-    in.sel_start  = sel_start;
-    in.sel_count  = sel_count;
-    /* HG_ENCODE only reads this -- see hg_proc_vs_blob_t() -- so pointing
-     * directly at the caller's own buffer needs no copy here. */
-    in.dcpl_enc.buf  = (void *)(uintptr_t)dcpl_enc;
-    in.dcpl_enc.size = dcpl_enc_len;
-
-    /* Same target-the-cached-writer-then-fall-back-to-probing approach as
-     * vs_tr_reader_ack_step() -- see that function's comment. */
     if (tr->has_writer_member_id) {
         hg_addr_t  addr;
         hg_handle_t handle;
 
         if (SSG_SUCCESS == ssg_get_group_member_addr(tr->group_id, tr->writer_member_id, &addr)) {
             if (HG_SUCCESS == margo_create(tr->mid, addr, tr->subscribe_rpc_id, &handle)) {
-                if (HG_SUCCESS == margo_forward_timed(handle, &in, 1000.0)) {
+                if (HG_SUCCESS == margo_forward_timed(handle, in, 1000.0)) {
                     vs_subscribe_out_t out;
 
                     if (HG_SUCCESS == margo_get_output(handle, &out)) {
-                        if (out.status == 0)
+                        if (out.status == 0) {
                             ret = 0;
+                            if (out_matched)
+                                *out_matched = out.matched;
+                        }
                         margo_free_output(handle, &out);
                     }
                 }
@@ -1216,7 +1312,7 @@ vs_tr_reader_subscribe(vs_tr_t *tr, const char *path, uint64_t sel_start, uint64
                 continue;
 
             if (HG_SUCCESS == margo_create(tr->mid, addr, tr->subscribe_rpc_id, &handle)) {
-                if (HG_SUCCESS == margo_forward_timed(handle, &in, 1000.0)) {
+                if (HG_SUCCESS == margo_forward_timed(handle, in, 1000.0)) {
                     vs_subscribe_out_t out;
 
                     if (HG_SUCCESS == margo_get_output(handle, &out)) {
@@ -1224,6 +1320,8 @@ vs_tr_reader_subscribe(vs_tr_t *tr, const char *path, uint64_t sel_start, uint64
                             tr->writer_member_id     = member_id;
                             tr->has_writer_member_id = 1;
                             ret                       = 0;
+                            if (out_matched)
+                                *out_matched = out.matched;
                         }
                         margo_free_output(handle, &out);
                     }
@@ -1238,10 +1336,75 @@ vs_tr_reader_subscribe(vs_tr_t *tr, const char *path, uint64_t sel_start, uint64
 }
 
 int
+vs_tr_reader_subscribe(vs_tr_t *tr, const char *path, uint64_t sel_start, uint64_t sel_count,
+                        const uint8_t *dcpl_enc, uint64_t dcpl_enc_len, const uint8_t *space_enc,
+                        uint64_t space_enc_len)
+{
+    ssg_member_id_t     self_id;
+    vs_subscribe_in_t in;
+
+    if (!tr || !path || tr->group_id == SSG_GROUP_ID_INVALID)
+        return -1;
+    if (SSG_SUCCESS != ssg_get_self_id(tr->mid, &self_id))
+        return -1;
+
+    in.member_id = (uint64_t)self_id;
+    in.path       = (hg_string_t)path;
+    in.sel_start  = sel_start;
+    in.sel_count  = sel_count;
+    /* HG_ENCODE only reads this -- see hg_proc_vs_blob_t() -- so pointing
+     * directly at the caller's own buffer needs no copy here. */
+    in.dcpl_enc.buf  = (void *)(uintptr_t)dcpl_enc;
+    in.dcpl_enc.size = dcpl_enc_len;
+    in.flags         = 0;
+    in.pred_enc.buf  = NULL;
+    in.pred_enc.size = 0;
+    in.space_enc.buf  = (void *)(uintptr_t)space_enc;
+    in.space_enc.size = space_enc_len;
+
+    return vs_send_subscribe(tr, self_id, &in, NULL);
+}
+
+int
+vs_tr_reader_subscribe_predicate(vs_tr_t *tr, const char *path, const uint8_t *pred_enc,
+                                   uint64_t pred_enc_len)
+{
+    ssg_member_id_t     self_id;
+    vs_subscribe_in_t in;
+    int                  matched = 0;
+
+    if (!tr || !path || tr->group_id == SSG_GROUP_ID_INVALID)
+        return -1;
+    if (SSG_SUCCESS != ssg_get_self_id(tr->mid, &self_id))
+        return -1;
+
+    in.member_id = (uint64_t)self_id;
+    in.path       = (hg_string_t)path;
+    /* Ignored under PRED_ONLY -- the stored range is left exactly as the
+     * original subscribe set it. */
+    in.sel_start     = 0;
+    in.sel_count     = UINT64_MAX;
+    in.dcpl_enc.buf  = NULL;
+    in.dcpl_enc.size = 0;
+    in.flags         = VS_SUB_FLAG_PRED_ONLY;
+    in.pred_enc.buf  = (void *)(uintptr_t)pred_enc;
+    in.pred_enc.size = pred_enc_len;
+    /* Ignored under PRED_ONLY, like sel_start/sel_count above -- the stored
+     * selection is left exactly as the original subscribe set it. */
+    in.space_enc.buf  = NULL;
+    in.space_enc.size = 0;
+
+    if (vs_send_subscribe(tr, self_id, &in, &matched) != 0)
+        return -1;
+    return matched ? 0 : -1;
+}
+
+int
 vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, const void *buf,
                         uint64_t elem_size, uint64_t write_start, uint64_t write_count,
                         const uint8_t *type_enc, uint64_t type_enc_len,
-                        const uint8_t *native_dcpl_enc, uint64_t native_dcpl_enc_len, void *native_ctx)
+                        const uint8_t *native_dcpl_enc, uint64_t native_dcpl_enc_len, void *native_ctx,
+                        const uint8_t *space_enc, uint64_t space_enc_len)
 {
     ssg_member_id_t   self_id;
     int                 group_size, i;
@@ -1267,11 +1430,13 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
         uint64_t           sub_start = 0, sub_end = 0, overlap_start, overlap_end, overlap_count;
         uint8_t           *sub_dcpl_enc = NULL;
         uint64_t           sub_dcpl_enc_len = 0;
-        void              *filtered_buf = NULL;
-        uint64_t           filtered_len = 0;
-        uint32_t           filter_mask = 0;
-        int                did_refilter = 0;
-        vs_data_push_in_t in;
+        uint8_t           *sub_pred_enc = NULL;
+        uint64_t           sub_pred_enc_len = 0;
+        uint8_t           *sub_space_enc = NULL;
+        uint64_t           sub_space_enc_len = 0;
+        vs_tr_run_t        sel_runs[VS_TR_MAX_PRED_RUNS];
+        vs_tr_run_t        runs[VS_TR_MAX_PRED_RUNS];
+        int                n_sel = 1, n_runs = 1, sr, r;
 
         if (SSG_SUCCESS != ssg_get_group_member_id_from_rank(tr->group_id, i, &member_id))
             continue;
@@ -1297,6 +1462,19 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
                     memcpy(sub_dcpl_enc, tr->sub_table[j].dcpl_enc, tr->sub_table[j].dcpl_enc_len);
                     sub_dcpl_enc_len = tr->sub_table[j].dcpl_enc_len;
                 }
+                /* M9: copied for the same reason as dcpl_enc above -- the
+                 * predicate call below is real work (decoding types,
+                 * scanning every element) done outside sub_lock. */
+                if (tr->sub_table[j].pred_enc_len > 0 &&
+                    NULL != (sub_pred_enc = (uint8_t *)malloc(tr->sub_table[j].pred_enc_len))) {
+                    memcpy(sub_pred_enc, tr->sub_table[j].pred_enc, tr->sub_table[j].pred_enc_len);
+                    sub_pred_enc_len = tr->sub_table[j].pred_enc_len;
+                }
+                if (tr->sub_table[j].space_enc_len > 0 &&
+                    NULL != (sub_space_enc = (uint8_t *)malloc(tr->sub_table[j].space_enc_len))) {
+                    memcpy(sub_space_enc, tr->sub_table[j].space_enc, tr->sub_table[j].space_enc_len);
+                    sub_space_enc_len = tr->sub_table[j].space_enc_len;
+                }
                 subscribed = 1;
                 break;
             }
@@ -1314,35 +1492,120 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
         overlap_end   = (sub_end < write_end) ? sub_end : write_end;
         if (overlap_start >= overlap_end) {
             free(sub_dcpl_enc);
+            free(sub_pred_enc);
+            free(sub_space_enc);
             continue;
         }
         overlap_count = overlap_end - overlap_start;
 
-        {
+        /* Two refinements of the overlap, applied in order, each optional
+         * and each falling back to "send it all" when it cannot be applied.
+         *
+         * First the subscriber's actual selection: overlap_start/count is
+         * only the flat span *containing* what was asked for, so a
+         * non-contiguous selection (a column of a 2-D dataset) would
+         * otherwise be served its whole bounding span.
+         *
+         * Then, within each of those runs, the subscriber's predicate.
+         * Nesting rather than combining keeps each callback's contract
+         * simple -- "given this flat range, which parts do you want" -- and
+         * means either can decline independently. */
+        sel_runs[0].start = 0;
+        sel_runs[0].count = overlap_count;
+        if (sub_space_enc_len > 0 && tr->selection_fn) {
+            int n = tr->selection_fn(sub_space_enc, sub_space_enc_len, space_enc, space_enc_len,
+                                       overlap_start, overlap_count, sel_runs, VS_TR_MAX_PRED_RUNS);
+
+            if (n >= 0)
+                n_sel = n;
+            else {
+                /* Declined -- restore, since the callback may have written
+                 * into sel_runs before giving up. */
+                sel_runs[0].start = 0;
+                sel_runs[0].count = overlap_count;
+            }
+        }
+        free(sub_space_enc);
+        sub_space_enc = NULL;
+
+        if (n_sel == 0) {
+            /* The selection does not touch this write at all. */
+            free(sub_dcpl_enc);
+            free(sub_pred_enc);
+            continue;
+        }
+
+        if (SSG_SUCCESS != ssg_get_group_member_addr(tr->group_id, member_id, &addr)) {
+            free(sub_dcpl_enc);
+            free(sub_pred_enc);
+            continue;
+        }
+
+        for (sr = 0; sr < n_sel; sr++) {
+            uint64_t sel_start_abs = overlap_start + sel_runs[sr].start;
+            uint64_t sel_count_abs = sel_runs[sr].count;
+
+        /* M9 predicate pushdown: narrow this run to the elements the
+         * subscriber's predicate actually matches. With no predicate (or
+         * none the callback can evaluate) that is the whole run, i.e.
+         * exactly M8.5's behavior. */
+        runs[0].start = 0;
+        runs[0].count = sel_count_abs;
+        n_runs        = 1;
+        if (sub_pred_enc_len > 0 && tr->predicate_fn) {
+            int n = tr->predicate_fn((const uint8_t *)buf + (sel_start_abs - write_start) * elem_size,
+                                       elem_size, sel_count_abs, sub_pred_enc, sub_pred_enc_len, type_enc,
+                                       type_enc_len, runs, VS_TR_MAX_PRED_RUNS);
+
+            if (n >= 0)
+                n_runs = n;
+            else {
+                runs[0].start = 0;
+                runs[0].count = sel_count_abs;
+            }
+        }
+
+        /* Nothing matched: this subscriber gets no RPC at all for this run.
+         * The whole point of the predicate -- every other reduction in this
+         * protocol still sends something. */
+        for (r = 0; r < n_runs; r++) {
+            uint64_t          run_start = sel_start_abs + runs[r].start;
+            uint64_t          run_count = runs[r].count;
+            void             *filtered_buf = NULL;
+            uint64_t          filtered_len = 0;
+            uint32_t          filter_mask  = 0;
+            int               did_refilter = 0;
+            vs_data_push_in_t in;
+
             /* HG_ENCODE only reads this -- see hg_proc_vs_blob_t(). Slicing
              * by byte offset into buf: buf's own first element is
-             * write_start, so the overlap begins (overlap_start -
-             * write_start) elements in. */
-            const void *overlap_ptr =
-                (const uint8_t *)buf + (overlap_start - write_start) * elem_size;
+             * write_start, so this run begins (run_start - write_start)
+             * elements in. */
+            const void *run_ptr = (const uint8_t *)buf + (run_start - write_start) * elem_size;
 
             /* M8.5 precision: this subscriber asked for a specific filter
-             * pipeline -- run the overlap slice through it via the
-             * registered callback (see vs_tr_refilter_fn's comment) instead
-             * of sending raw bytes. A declined/failed refilter (no callback
-             * registered, or the callback itself fails) is not an error --
-             * fall back to the exact raw-bytes behavior this subscriber
-             * would have gotten without a dcpl_enc at all. */
+             * pipeline -- run the slice through it via the registered
+             * callback (see vs_tr_refilter_fn's comment) instead of sending
+             * raw bytes. A declined/failed refilter (no callback registered,
+             * or the callback itself fails) is not an error -- fall back to
+             * the exact raw-bytes behavior this subscriber would have gotten
+             * without a dcpl_enc at all.
+             *
+             * M9: native_ctx describes the whole write, so a predicate that
+             * split it declines the zero-copy fast path automatically --
+             * that path requires the push to cover the dataset exactly
+             * (ctx->total_elems != count), which a partial run never does.
+             * Correct by construction rather than by a check here. */
             if (sub_dcpl_enc_len > 0 && tr->refilter_fn &&
-                0 == tr->refilter_fn(overlap_ptr, elem_size, overlap_count, sub_dcpl_enc, sub_dcpl_enc_len,
+                0 == tr->refilter_fn(run_ptr, elem_size, run_count, sub_dcpl_enc, sub_dcpl_enc_len,
                                        type_enc, type_enc_len, native_dcpl_enc, native_dcpl_enc_len,
                                        native_ctx, &filtered_buf, &filtered_len, &filter_mask))
                 did_refilter = 1;
 
             in.physical_step = physical_step;
             in.path             = (hg_string_t)path;
-            in.elem_start       = overlap_start;
-            in.elem_count       = overlap_count;
+            in.elem_start       = run_start;
+            in.elem_count       = run_count;
             in.filter_mask      = filter_mask;
 
             if (did_refilter) {
@@ -1354,35 +1617,31 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
                 in.type_enc.size   = type_enc_len;
             }
             else {
-                in.payload.buf   = (void *)(uintptr_t)overlap_ptr;
-                in.payload.size  = overlap_count * elem_size;
+                in.payload.buf   = (void *)(uintptr_t)run_ptr;
+                in.payload.size  = run_count * elem_size;
                 in.dcpl_enc.buf  = NULL;
                 in.dcpl_enc.size = 0;
                 in.type_enc.buf  = NULL;
                 in.type_enc.size = 0;
             }
-        }
 
-        if (SSG_SUCCESS != ssg_get_group_member_addr(tr->group_id, member_id, &addr)) {
-            free(sub_dcpl_enc);
-            free(filtered_buf);
-            continue;
-        }
+            /* Same bounded, best-effort forward as vs_tr_writer_broadcast_step_ready() --
+             * a stalled or gone subscriber must not stall the writer. */
+            if (HG_SUCCESS == margo_create(tr->mid, addr, tr->data_push_rpc_id, &handle)) {
+                if (HG_SUCCESS == margo_forward_timed(handle, &in, 1000.0)) {
+                    vs_data_push_out_t out;
 
-        /* Same bounded, best-effort forward as vs_tr_writer_broadcast_step_ready() --
-         * a stalled or gone subscriber must not stall the writer. */
-        if (HG_SUCCESS == margo_create(tr->mid, addr, tr->data_push_rpc_id, &handle)) {
-            if (HG_SUCCESS == margo_forward_timed(handle, &in, 1000.0)) {
-                vs_data_push_out_t out;
-
-                if (HG_SUCCESS == margo_get_output(handle, &out))
-                    margo_free_output(handle, &out);
+                    if (HG_SUCCESS == margo_get_output(handle, &out))
+                        margo_free_output(handle, &out);
+                }
+                margo_destroy(handle);
             }
-            margo_destroy(handle);
+            free(filtered_buf);
         }
+        } /* end per-selection-run loop */
         margo_addr_free(tr->mid, addr);
         free(sub_dcpl_enc);
-        free(filtered_buf);
+        free(sub_pred_enc);
     }
 
     return 0;

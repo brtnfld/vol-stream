@@ -106,6 +106,7 @@ VOL, which also ships `H5F*` calls from an out-of-tree connector.
 | `H5Fend_step(fid)` | Commit it atomically |
 | `H5Fstep_status(fid, &st)` | Query step state (`NOT_IN_STEP`, `IN_STEP`, `COMMITTING`, `EOS`) |
 | `H5Fsubscribe(fid, n, paths, spaces, plists)` | Reader declares interest |
+| `H5Fsubscribe_predicate(fid, path, op, type, value)` | Narrow a subscription to elements passing a value test, evaluated writer-side |
 
 `h5stream` inspects a stream from outside: `list` (steps and their contents),
 `tail` (follow a live writer, needs the transport), `export` (collapse to one

@@ -24,12 +24,14 @@ add_test(NAME reregister COMMAND t_reregister)
 # writer. M7 exit gate: Block/Discard/Spill under a deliberately slow
 # reader. M8 exit gate (first increment): the writer marshals only what is
 # subscribed. M8.5: per-subscriber precision -- the subscription's own DCPL
-# actually re-filters what goes on the wire. All need the transport, so all
-# are only built/run when VOL_STREAM_HAVE_MERCURY is on (see
-# ../CMakeLists.txt's VOL_STREAM_ENABLE_MERCURY option).
+# actually re-filters what goes on the wire. M9: predicate pushdown -- the
+# writer evaluates a subscriber's value test and sends only what matches, or
+# nothing. All need the transport, so all are only built/run when
+# VOL_STREAM_HAVE_MERCURY is on (see ../CMakeLists.txt's
+# VOL_STREAM_ENABLE_MERCURY option).
 if(VOL_STREAM_HAVE_MERCURY)
   foreach(t t_transport t_rendezvous t_queue_policy t_subscribe t_precision t_precision_dual
-           t_chunk_zerocopy t_subvolume_nd t_strided_write)
+           t_chunk_zerocopy t_subvolume_nd t_strided_write t_predicate t_subvolume_strided)
     add_executable(${t} ${t}.c)
     target_link_libraries(${t} PRIVATE vol_stream)
   endforeach()
@@ -41,7 +43,9 @@ if(VOL_STREAM_HAVE_MERCURY)
   add_test(NAME chunk_zerocopy COMMAND t_chunk_zerocopy)
   add_test(NAME subvolume_nd COMMAND t_subvolume_nd)
   add_test(NAME strided_write COMMAND t_strided_write)
-  set_tests_properties(transport rendezvous queue_policy subscribe precision chunk_zerocopy subvolume_nd strided_write PROPERTIES
+  add_test(NAME predicate COMMAND t_predicate)
+  add_test(NAME subvolume_strided COMMAND t_subvolume_strided)
+  set_tests_properties(transport rendezvous queue_policy subscribe precision chunk_zerocopy subvolume_nd strided_write predicate subvolume_strided PROPERTIES
     ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
     TIMEOUT 60
   )

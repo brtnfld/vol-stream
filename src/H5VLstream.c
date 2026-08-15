@@ -499,6 +499,32 @@ static int H5VL__stream_unfilter_pushed_data(const void *filtered_buf, uint64_t 
                              const uint8_t *dcpl_enc, uint64_t dcpl_enc_len, const uint8_t *type_enc,
                              uint64_t type_enc_len, uint64_t count, uint32_t filter_mask, void **out_buf,
                              size_t *out_len);
+/* M9 predicate pushdown: vs_tr_predicate_fn's implementation -- see
+ * H5VL__stream_eval_predicate()'s comment. */
+static int H5VL__stream_eval_predicate(const void *raw_buf, uint64_t elem_size, uint64_t count,
+                             const uint8_t *pred_enc, uint64_t pred_enc_len, const uint8_t *type_enc,
+                             uint64_t type_enc_len, vs_tr_run_t *runs, int max_runs);
+static herr_t H5VL__stream_encode_predicate(H5VL_stream_pred_op_t op, hid_t type_id, const void *value,
+                             uint8_t **buf, size_t *len);
+/* Flat-run decomposition of a selection. Declared up here rather than beside
+ * its definition because both the write path (which splits a write into
+ * truthfully-labelled pushes) and the subscription path (which narrows a
+ * push to a subscriber's own selection) need it, and they sit on opposite
+ * sides of this file. */
+#define H5VL_STREAM_MAX_PUSH_RUNS 256
+
+typedef struct H5VL_stream_flat_run_t {
+    uint64_t start; /* flat element index of the run's first element */
+    uint64_t count; /* elements in the run                          */
+} H5VL_stream_flat_run_t;
+
+static int H5VL__stream_space_flat_runs(hid_t space_id, H5VL_stream_flat_run_t *runs, int max_runs);
+
+/* M8.5 follow-up: vs_tr_selection_fn's implementation -- see
+ * H5VL__stream_selection_runs()'s comment. */
+static int H5VL__stream_selection_runs(const uint8_t *sub_space_enc, uint64_t sub_space_enc_len,
+                             const uint8_t *write_space_enc, uint64_t write_space_enc_len,
+                             uint64_t range_start, uint64_t range_count, vs_tr_run_t *runs, int max_runs);
 #endif
 #ifdef H5_HAVE_PARALLEL
 static void H5VL__stream_detect_mpi_comm(H5VL_stream_file_state_t *fs, hid_t fapl_id);
@@ -680,6 +706,7 @@ static int H5VL_stream_op_get_logical_steps  = -1;
 static int H5VL_stream_op_wait_step_ready    = -1;
 static int H5VL_stream_op_set_queue_policy   = -1;
 static int H5VL_stream_op_get_subscribed_data = -1;
+static int H5VL_stream_op_subscribe_predicate = -1;
 
 /* Argument structs for the step operations. */
 typedef struct H5VL_stream_args_begin_step_t {
@@ -698,6 +725,14 @@ typedef struct H5VL_stream_args_subscribe_t {
     const hid_t        *spaces;
     const hid_t        *plists;
 } H5VL_stream_args_subscribe_t;
+
+/* M9 */
+typedef struct H5VL_stream_args_subscribe_predicate_t {
+    const char           *path;
+    H5VL_stream_pred_op_t op;
+    hid_t                 type_id;
+    const void           *value;
+} H5VL_stream_args_subscribe_predicate_t;
 
 /* M3 */
 typedef struct H5VL_stream_args_begin_logical_step_t {
@@ -1321,9 +1356,12 @@ H5VL__stream_transport_start_writer(H5VL_stream_file_state_t *fs, const char *na
     if (NULL == (fs->transport = vs_tr_start(na_str)))
         return;
 
-    /* M8.5 precision: register once, right after start -- see vs_tr_
-     * set_refilter_cb()'s comment. */
+    /* M8.5 precision, and M9 predicate pushdown: register once, right after
+     * start -- see vs_tr_set_refilter_cb()'s comment. Both are writer-side
+     * callbacks, so this is the only place either needs to be set. */
     vs_tr_set_refilter_cb(fs->transport, H5VL__stream_refilter_for_subscriber);
+    vs_tr_set_predicate_cb(fs->transport, H5VL__stream_eval_predicate);
+    vs_tr_set_selection_cb(fs->transport, H5VL__stream_selection_runs);
 
     {
         H5VL_file_specific_args_t flush_args;
@@ -2366,6 +2404,420 @@ done:
         H5Pclose(dcpl);
     return ret_value;
 } /* end H5VL__stream_refilter_for_subscriber() */
+
+/*-------------------------------------------------------------------------
+ * M9, predicate pushdown.
+ *
+ * The wire form is this project's second hand-rolled encoding, after the VL
+ * length tag -- so it follows that one's hard-won rule and writes its own
+ * scalars explicitly little-endian rather than memcpy'ing host integers (see
+ * dev-plan.md's cross-endian section for the bug that taught it). Everything
+ * with an HDF5 encoder keeps using it: the constant's datatype travels as
+ * H5Tencode() bytes, which is what lets a writer of different endianness or
+ * word size convert the constant correctly instead of trusting the
+ * subscriber's representation.
+ *
+ *   offset 0  u8      version (1)
+ *   offset 1  u8      op (H5VL_stream_pred_op_t)
+ *   offset 2  u16 LE  reserved, zero
+ *   offset 4  u32 LE  type_enc length
+ *   offset 8  u32 LE  value length
+ *   offset 12          type_enc bytes, then value bytes
+ *-------------------------------------------------------------------------
+ */
+#define H5VL_STREAM_PRED_VERSION 1
+#define H5VL_STREAM_PRED_HDR     12
+
+static void
+H5VL__stream_put_u16le(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)(v & 0xff);
+    p[1] = (uint8_t)((v >> 8) & 0xff);
+} /* end H5VL__stream_put_u16le() */
+
+static void
+H5VL__stream_put_u32le(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v & 0xff);
+    p[1] = (uint8_t)((v >> 8) & 0xff);
+    p[2] = (uint8_t)((v >> 16) & 0xff);
+    p[3] = (uint8_t)((v >> 24) & 0xff);
+} /* end H5VL__stream_put_u32le() */
+
+static uint32_t
+H5VL__stream_get_u32le(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+} /* end H5VL__stream_get_u32le() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_encode_predicate
+ *
+ * Purpose:     M9: pack (op, type, value) into the blob above, for
+ *              H5Fsubscribe_predicate() to ship to the writer. Caller frees
+ *              *buf.
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_encode_predicate(H5VL_stream_pred_op_t op, hid_t type_id, const void *value, uint8_t **buf,
+                              size_t *len)
+{
+    uint8_t *type_enc = NULL;
+    size_t   type_len = 0;
+    size_t   val_len;
+    size_t   total;
+
+    if (!buf || !len || !value)
+        return -1;
+    if (H5VL__stream_encode_type(type_id, &type_enc, &type_len) < 0)
+        return -1;
+    if (0 == (val_len = H5Tget_size(type_id))) {
+        free(type_enc);
+        return -1;
+    }
+
+    total = H5VL_STREAM_PRED_HDR + type_len + val_len;
+    if (NULL == (*buf = (uint8_t *)malloc(total))) {
+        free(type_enc);
+        return -1;
+    }
+
+    (*buf)[0] = (uint8_t)H5VL_STREAM_PRED_VERSION;
+    (*buf)[1] = (uint8_t)op;
+    H5VL__stream_put_u16le(*buf + 2, 0);
+    H5VL__stream_put_u32le(*buf + 4, (uint32_t)type_len);
+    H5VL__stream_put_u32le(*buf + 8, (uint32_t)val_len);
+    memcpy(*buf + H5VL_STREAM_PRED_HDR, type_enc, type_len);
+    memcpy(*buf + H5VL_STREAM_PRED_HDR + type_len, value, val_len);
+    *len = total;
+
+    free(type_enc);
+    return 0;
+} /* end H5VL__stream_encode_predicate() */
+
+static int
+H5VL__stream_pred_match_ll(long long v, long long c, unsigned op)
+{
+    switch (op) {
+        case H5VL_STREAM_PRED_LT:
+            return v < c;
+        case H5VL_STREAM_PRED_LE:
+            return v <= c;
+        case H5VL_STREAM_PRED_GT:
+            return v > c;
+        case H5VL_STREAM_PRED_GE:
+            return v >= c;
+        case H5VL_STREAM_PRED_EQ:
+            return v == c;
+        case H5VL_STREAM_PRED_NE:
+            return v != c;
+        default:
+            return 0;
+    }
+} /* end H5VL__stream_pred_match_ll() */
+
+static int
+H5VL__stream_pred_match_d(double v, double c, unsigned op)
+{
+    switch (op) {
+        case H5VL_STREAM_PRED_LT:
+            return v < c;
+        case H5VL_STREAM_PRED_LE:
+            return v <= c;
+        case H5VL_STREAM_PRED_GT:
+            return v > c;
+        case H5VL_STREAM_PRED_GE:
+            return v >= c;
+        case H5VL_STREAM_PRED_EQ:
+            return v == c;
+        case H5VL_STREAM_PRED_NE:
+            return v != c;
+        default:
+            return 0;
+    }
+} /* end H5VL__stream_pred_match_d() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_eval_predicate
+ *
+ * Purpose:     M9: the vs_tr_predicate_fn the writer's push path calls (see
+ *              tr_mercury.h). Decide, for a slice of raw_buf about to be
+ *              sent to one subscriber, which elements satisfy that
+ *              subscriber's predicate, and hand back the maximal contiguous
+ *              runs of them.
+ *
+ *              Both sides of the comparison are moved into one canonical
+ *              type with H5Tconvert() rather than compared byte-wise: that
+ *              is what makes a big-endian writer, a 16-bit-int subscriber and
+ *              a float constant against integer data all behave, and it is
+ *              the same "borrow HDF5's own engine" reasoning decision #3
+ *              applies to precision. Canonical type is chosen from the
+ *              *data's* class -- long long for integers, double for floats --
+ *              so the comparison never loses information the data itself
+ *              carries.
+ *
+ *              Declines (-1, meaning "send the whole overlap as if no
+ *              predicate existed") rather than guessing whenever it cannot
+ *              be sure: a class it does not handle, an unsigned 64-bit type
+ *              whose values may exceed LLONG_MAX, a float wider than double,
+ *              an element size disagreeing with the decoded type, or any
+ *              failed HDF5 call. Under-sending would be data loss; over-
+ *              sending is only inefficiency.
+ *
+ * Return:      Number of runs written (>= 0), or -1 to decline.
+ *-------------------------------------------------------------------------
+ */
+static int
+H5VL__stream_eval_predicate(const void *raw_buf, uint64_t elem_size, uint64_t count,
+                            const uint8_t *pred_enc, uint64_t pred_enc_len, const uint8_t *type_enc,
+                            uint64_t type_enc_len, vs_tr_run_t *runs, int max_runs)
+{
+    hid_t       dtype = H5I_INVALID_HID, ptype = H5I_INVALID_HID, canon = H5I_INVALID_HID;
+    H5T_class_t cls;
+    size_t      canon_size, type_len, val_len;
+    uint8_t    *work = NULL, *cval = NULL;
+    unsigned    op;
+    uint64_t    i;
+    uint64_t    first_match = 0, last_match = 0;
+    int         n_runs = 0, any = 0, overflow = 0;
+    int         ret_value = -1;
+
+    if (!raw_buf || !runs || max_runs <= 0 || count == 0 || elem_size == 0)
+        return -1;
+    if (!pred_enc || pred_enc_len < H5VL_STREAM_PRED_HDR || !type_enc || type_enc_len == 0)
+        return -1;
+    if (pred_enc[0] != H5VL_STREAM_PRED_VERSION)
+        return -1;
+
+    op       = pred_enc[1];
+    type_len = (size_t)H5VL__stream_get_u32le(pred_enc + 4);
+    val_len  = (size_t)H5VL__stream_get_u32le(pred_enc + 8);
+    if ((uint64_t)H5VL_STREAM_PRED_HDR + type_len + val_len != pred_enc_len)
+        return -1;
+
+    /* The data's own type, and the constant's. */
+    if ((dtype = H5Tdecode2(type_enc, (size_t)type_enc_len)) < 0)
+        goto done;
+    if ((ptype = H5Tdecode2(pred_enc + H5VL_STREAM_PRED_HDR, type_len)) < 0)
+        goto done;
+    if (H5Tget_size(dtype) != (size_t)elem_size)
+        goto done;
+
+    cls = H5Tget_class(dtype);
+    if (cls == H5T_INTEGER) {
+        /* An unsigned 64-bit value can exceed what long long represents, and
+         * silently wrapping it would answer the predicate wrongly rather than
+         * declining to answer. */
+        if (H5Tget_sign(dtype) == H5T_SGN_NONE && H5Tget_size(dtype) >= sizeof(long long))
+            goto done;
+        canon = H5T_NATIVE_LLONG;
+    }
+    else if (cls == H5T_FLOAT) {
+        if (H5Tget_size(dtype) > sizeof(double))
+            goto done;
+        canon = H5T_NATIVE_DOUBLE;
+    }
+    else
+        goto done; /* compound, string, reference, ... -- not a value test */
+
+    canon_size = H5Tget_size(canon);
+
+    /* H5Tconvert() works in place and needs room for the wider of the two
+     * representations, for the constant and for the data alike. */
+    if (NULL == (cval = (uint8_t *)calloc(1, (val_len > canon_size ? val_len : canon_size))))
+        goto done;
+    memcpy(cval, pred_enc + H5VL_STREAM_PRED_HDR + type_len, val_len);
+    if (H5Tconvert(ptype, canon, 1, cval, NULL, H5P_DEFAULT) < 0)
+        goto done;
+
+    {
+        /* H5Tconvert() converts in place: elements arrive packed at the
+         * source size and leave packed at the destination size, so the buffer
+         * has to be big enough for the wider of the two. One call for the
+         * whole slice -- batching is the reason to use the engine at all. */
+        size_t stride = (size_t)elem_size > canon_size ? (size_t)elem_size : canon_size;
+
+        if (NULL == (work = (uint8_t *)malloc((size_t)count * stride)))
+            goto done;
+        memcpy(work, raw_buf, (size_t)count * (size_t)elem_size);
+        if (H5Tconvert(dtype, canon, (size_t)count, work, NULL, H5P_DEFAULT) < 0)
+            goto done;
+    }
+
+    for (i = 0; i < count; i++) {
+        int match;
+
+        if (cls == H5T_INTEGER) {
+            long long v, c;
+
+            memcpy(&v, work + (size_t)i * canon_size, sizeof(v));
+            memcpy(&c, cval, sizeof(c));
+            match = H5VL__stream_pred_match_ll(v, c, op);
+        }
+        else {
+            double v, c;
+
+            memcpy(&v, work + (size_t)i * canon_size, sizeof(v));
+            memcpy(&c, cval, sizeof(c));
+            match = H5VL__stream_pred_match_d(v, c, op);
+        }
+
+        if (!match)
+            continue;
+
+        if (!any) {
+            first_match = i;
+            any          = 1;
+        }
+        last_match = i;
+
+        if (n_runs > 0 && runs[n_runs - 1].start + runs[n_runs - 1].count == i)
+            runs[n_runs - 1].count++;
+        else if (n_runs < max_runs) {
+            runs[n_runs].start = i;
+            runs[n_runs].count = 1;
+            n_runs++;
+        }
+        else
+            overflow = 1;
+    }
+
+    /* Too fragmented to describe run by run: send the span containing every
+     * match instead. A superset, never a truncation -- see vs_tr_predicate_fn
+     * and VS_TR_MAX_PRED_RUNS. */
+    if (overflow) {
+        runs[0].start = first_match;
+        runs[0].count = last_match - first_match + 1;
+        n_runs        = 1;
+    }
+
+    /* Nothing else can observe that the writer did this work -- a subscriber
+     * sees only what arrives, and "fewer bytes" is indistinguishable from
+     * "the writer wrote less" -- so a test needs this to tell the two apart.
+     * Same reasoning as VOL_STREAM_DEBUG_REFILTER above. */
+    if (getenv("VOL_STREAM_DEBUG_PREDICATE")) {
+        uint64_t matched = 0;
+        int      r;
+
+        for (r = 0; r < n_runs; r++)
+            matched += runs[r].count;
+        fprintf(stderr, "  predicate scanned=%llu matched=%llu runs=%d%s\n", (unsigned long long)count,
+                (unsigned long long)matched, n_runs, overflow ? " (coalesced)" : "");
+    }
+
+    ret_value = n_runs;
+
+done:
+    free(work);
+    free(cval);
+    if (dtype >= 0)
+        H5Tclose(dtype);
+    if (ptype >= 0)
+        H5Tclose(ptype);
+    return ret_value;
+} /* end H5VL__stream_eval_predicate() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_selection_runs
+ *
+ * Purpose:     M8.5 follow-up: the vs_tr_selection_fn the writer's push path
+ *              calls (see tr_mercury.h). Report which parts of a flat
+ *              element range a subscriber's *selection* actually covers,
+ *              rather than serving the whole span its bounds describe.
+ *
+ *              Routing has always reduced a subscription to
+ *              H5Sget_select_bounds()'s span, linearized. For a selection
+ *              contiguous in flat order -- a whole object, a leading-
+ *              dimension slab, a 1-D subrange -- the span *is* the
+ *              selection and nothing here changes. For one that is not, the
+ *              span is a strict superset: column 3 of a 6x8 dataset is 6
+ *              elements at flat 3, 11, 19, 27, 35, 43, whose span covers 41
+ *              of the 48 elements -- and all 41 were being sent.
+ *
+ *              The selection's own flat runs are exactly what
+ *              H5VL__stream_space_flat_runs() already computes for the write
+ *              side, so this is that decomposition clipped to the range
+ *              being pushed.
+ *
+ *              Both dataspaces are decoded and their *extents* compared
+ *              first. A flat index only means the same thing in two spaces
+ *              of the same shape, and getting that wrong is precisely the
+ *              bug that produced silent data loss twice here already (N-D
+ *              subscriptions truncated to one element, strided writes
+ *              pushed at wrong indices). Disagreeing extents decline rather
+ *              than guess.
+ *
+ * Return:      Number of runs written (>= 0), or -1 to decline -- on which
+ *              the caller sends the whole range, the behavior this refines.
+ *-------------------------------------------------------------------------
+ */
+static int
+H5VL__stream_selection_runs(const uint8_t *sub_space_enc, uint64_t sub_space_enc_len,
+                            const uint8_t *write_space_enc, uint64_t write_space_enc_len,
+                            uint64_t range_start, uint64_t range_count, vs_tr_run_t *runs, int max_runs)
+{
+    hid_t                  sub = H5I_INVALID_HID, wsp = H5I_INVALID_HID;
+    H5VL_stream_flat_run_t sel_runs[H5VL_STREAM_MAX_PUSH_RUNS];
+    int                    n_sel, i, out = 0;
+    int                    ret_value = -1;
+
+    if (!sub_space_enc || sub_space_enc_len == 0 || !runs || max_runs <= 0 || range_count == 0)
+        return -1;
+    /* Without the write's own space there is nothing to check the
+     * subscriber's flat indices against, so decline rather than trust them. */
+    if (!write_space_enc || write_space_enc_len == 0)
+        return -1;
+
+    if ((sub = H5Sdecode(sub_space_enc)) < 0)
+        goto done;
+    if ((wsp = H5Sdecode(write_space_enc)) < 0)
+        goto done;
+
+    {
+        hsize_t sdims[H5S_MAX_RANK], wdims[H5S_MAX_RANK];
+        int     srank, wrank, d;
+
+        if ((srank = H5Sget_simple_extent_dims(sub, sdims, NULL)) < 0)
+            goto done;
+        if ((wrank = H5Sget_simple_extent_dims(wsp, wdims, NULL)) < 0)
+            goto done;
+        if (srank != wrank)
+            goto done;
+        for (d = 0; d < srank; d++)
+            if (sdims[d] != wdims[d])
+                goto done;
+    }
+
+    if ((n_sel = H5VL__stream_space_flat_runs(sub, sel_runs, H5VL_STREAM_MAX_PUSH_RUNS)) < 0)
+        goto done;
+
+    for (i = 0; i < n_sel; i++) {
+        uint64_t s  = sel_runs[i].start;
+        uint64_t e  = s + sel_runs[i].count;
+        uint64_t rs = range_start;
+        uint64_t re = range_start + range_count;
+        uint64_t cs = (s > rs) ? s : rs;
+        uint64_t ce = (e < re) ? e : re;
+
+        if (cs >= ce)
+            continue; /* this run lies outside the range being pushed */
+        if (out == max_runs)
+            goto done; /* too fragmented to describe -- decline, never truncate */
+
+        runs[out].start = cs - range_start;
+        runs[out].count = ce - cs;
+        out++;
+    }
+
+    ret_value = out;
+
+done:
+    if (sub >= 0)
+        H5Sclose(sub);
+    if (wsp >= 0)
+        H5Sclose(wsp);
+    return ret_value;
+} /* end H5VL__stream_selection_runs() */
 
 /*-------------------------------------------------------------------------
  * Function:    H5VL__stream_unfilter_pushed_data
@@ -3552,12 +4004,6 @@ H5VL__stream_space_1d_bounds(hid_t space_id, uint64_t *start, uint64_t *count)
  * row of the selection. The cap bounds a pathological selection turning a
  * single write into an unbounded burst of RPCs -- beyond it the push is
  * skipped entirely (the data is still durably written either way). */
-#define H5VL_STREAM_MAX_PUSH_RUNS 256
-
-typedef struct H5VL_stream_flat_run_t {
-    uint64_t start; /* flat element index of the run's first element */
-    uint64_t count; /* elements in the run                          */
-} H5VL_stream_flat_run_t;
 
 static int
 H5VL__stream_space_flat_runs(hid_t space_id, H5VL_stream_flat_run_t *runs, int max_runs)
@@ -4033,6 +4479,8 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                         if (H5VL__stream_space_1d_bounds(dspace, &w_start, &w_count) >= 0) {
                             uint8_t *push_type_enc     = NULL;
                             size_t   push_type_enc_len = 0;
+                            uint8_t *push_space_enc     = NULL;
+                            size_t   push_space_enc_len = 0;
                             uint8_t *native_dcpl_enc     = NULL;
                             size_t   native_dcpl_enc_len = 0;
 
@@ -4047,6 +4495,16 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                              * per-subscriber decision, not something this
                              * call site can know in advance. */
                             H5VL__stream_encode_type(dtype, &push_type_enc, &push_type_enc_len);
+
+                            /* M8.5 follow-up: the write's own dataspace, so
+                             * the selection callback can confirm a
+                             * subscriber's encoded selection describes the
+                             * same extent before its flat indices are
+                             * trusted -- see H5VL__stream_selection_runs().
+                             * Best-effort like push_type_enc above: a failed
+                             * encode just leaves routing on the bounding
+                             * span. */
+                            H5VL__stream_encode_space(dspace, &push_space_enc, &push_space_enc_len);
 
                             /* M8.5.1: offer the chunk-level zero-copy fast
                              * path what it needs -- the DCPL this write
@@ -4126,7 +4584,9 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                                                              runs[r].count, push_type_enc,
                                                              (uint64_t)push_type_enc_len, native_dcpl_enc,
                                                              (uint64_t)native_dcpl_enc_len,
-                                                             native_ctx.under_dset ? &native_ctx : NULL);
+                                                             native_ctx.under_dset ? &native_ctx : NULL,
+                                                             push_space_enc,
+                                                             (uint64_t)push_space_enc_len);
                                     buf_elem += runs[r].count;
                                 }
                                 (void)w_count;
@@ -4137,6 +4597,7 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                              * allocation of this call's own. Nothing in
                              * native_ctx is owned here either. */
                             free(push_type_enc);
+                            free(push_space_enc);
                         }
                     }
 #endif
@@ -4292,10 +4753,22 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                         uint64_t a_start, a_count;
 
                         if (H5VL__stream_space_1d_bounds(dspace, &a_start, &a_count) >= 0) {
-                            uint8_t *push_type_enc     = NULL;
-                            size_t   push_type_enc_len = 0;
+                            uint8_t *push_type_enc      = NULL;
+                            size_t   push_type_enc_len  = 0;
+                            uint8_t *push_space_enc     = NULL;
+                            size_t   push_space_enc_len = 0;
 
                             H5VL__stream_encode_type(dtype, &push_type_enc, &push_type_enc_len);
+
+                            /* M8.5 follow-up: the attribute's own dataspace,
+                             * so the selection callback can confirm a
+                             * subscriber's encoded selection describes the
+                             * same extent before its flat indices are
+                             * trusted -- see H5VL__stream_selection_runs().
+                             * Best-effort like push_type_enc above: a failed
+                             * encode just leaves routing on the bounding
+                             * span. */
+                            H5VL__stream_encode_space(dspace, &push_space_enc, &push_space_enc_len);
                             /* No native chunk context: an attribute has no
                              * chunked/filtered storage to serve bytes from,
                              * so the zero-copy fast path never applies here
@@ -4304,8 +4777,9 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                             vs_tr_writer_push_data(file_obj->file_state->transport, physical_step, path,
                                                      payload_ptr, H5Tget_size(dtype), a_start, a_count,
                                                      push_type_enc, (uint64_t)push_type_enc_len, NULL, 0,
-                                                     NULL);
+                                                     NULL, push_space_enc, (uint64_t)push_space_enc_len);
                             free(push_type_enc);
+                            free(push_space_enc);
                         }
                     }
 #endif
@@ -5849,6 +6323,9 @@ H5VL_stream_init(hid_t vipl_id)
     if (H5VL__stream_register_op(H5VL_STREAM_OP_SET_QUEUE_POLICY, &H5VL_stream_op_set_queue_policy) < 0)
         return -1;
     if (H5VL__stream_register_op(H5VL_STREAM_OP_GET_SUBSCRIBED_DATA, &H5VL_stream_op_get_subscribed_data) <
+        0)
+        return -1;
+    if (H5VL__stream_register_op(H5VL_STREAM_OP_SUBSCRIBE_PREDICATE, &H5VL_stream_op_subscribe_predicate) <
         0)
         return -1;
 
@@ -8160,16 +8637,68 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
                 uint8_t *dcpl_enc = NULL;
                 size_t   dcpl_enc_len = 0;
 
+                uint8_t *space_enc     = NULL;
+                size_t   space_enc_len = 0;
+
                 H5VL__stream_space_1d_bounds(sargs->spaces[i], &sel_start, &sel_count);
                 if (plist_id != H5P_DEFAULT)
                     H5VL__stream_encode_dcpl(plist_id, &dcpl_enc, &dcpl_enc_len);
+                /* Decision #3's H5Sencode2 blob, which until now was reduced
+                 * to its bounding span before it ever left the reader. The
+                 * span still travels (it is the coarse filter and the
+                 * fallback); this carries the selection itself so the writer
+                 * can honor a non-contiguous one exactly. Best-effort: a
+                 * failed encode simply leaves routing on the span. */
+                H5VL__stream_encode_space(sargs->spaces[i], &space_enc, &space_enc_len);
                 vs_tr_reader_subscribe(o->file_state->transport, sargs->paths[i], sel_start, sel_count,
-                                         dcpl_enc, (uint64_t)dcpl_enc_len);
+                                         dcpl_enc, (uint64_t)dcpl_enc_len, space_enc,
+                                         (uint64_t)space_enc_len);
                 free(dcpl_enc);
+                free(space_enc);
             }
         }
 #endif
         return 0;
+    }
+    else if (args->op_type == H5VL_stream_op_subscribe_predicate) {
+        H5VL_stream_args_subscribe_predicate_t *sargs =
+            (H5VL_stream_args_subscribe_predicate_t *)args->args;
+
+        if (!sargs || !sargs->path || sargs->path[0] == '\0' || !sargs->value)
+            return -1;
+        if (sargs->op > H5VL_STREAM_PRED_NE)
+            return -1;
+        /* A predicate compares against one scalar of a real datatype. That
+         * the *data* turns out to be something the comparison cannot apply
+         * to is discovered at push time by the writer, which then sends the
+         * whole overlap (see H5VL__stream_eval_predicate()); what is
+         * checkable here is only the constant the caller handed over. */
+        if (H5Tget_class(sargs->type_id) == H5T_NO_CLASS)
+            return -1;
+
+#ifdef VOL_STREAM_HAVE_MERCURY
+        if (o->file_state && o->file_state->transport) {
+            uint8_t *pred_enc     = NULL;
+            size_t   pred_enc_len = 0;
+            int      rc;
+
+            if (H5VL__stream_encode_predicate(sargs->op, sargs->type_id, sargs->value, &pred_enc,
+                                               &pred_enc_len) < 0)
+                return -1;
+            /* Unlike H5Fsubscribe(), a failure here is reported: the writer
+             * answering "you never subscribed to that path" means this
+             * predicate will never be applied, and silently over-sending
+             * forever is worse than a visible error. */
+            rc = vs_tr_reader_subscribe_predicate(o->file_state->transport, sargs->path, pred_enc,
+                                                    (uint64_t)pred_enc_len);
+            free(pred_enc);
+            return rc == 0 ? 0 : -1;
+        }
+        /* No transport -- nothing to send a predicate to. */
+        return -1;
+#else
+        return -1;
+#endif
     }
     else if (args->op_type == H5VL_stream_op_begin_logical_step) {
         H5VL_stream_args_begin_logical_step_t *sargs = (H5VL_stream_args_begin_logical_step_t *)args->args;
@@ -9181,6 +9710,12 @@ H5VL_stream_introspect_opt_query(void *obj, H5VL_subclass_t cls, int opt_type, u
         *flags = H5VL_OPT_QUERY_SUPPORTED | H5VL_OPT_QUERY_MODIFY_METADATA;
         return 0;
     }
+    else if (cls == H5VL_SUBCLS_FILE && opt_type == H5VL_stream_op_subscribe_predicate) {
+        /* M9: same shape as subscribe -- reader-side, per-process, and it
+         * changes what the writer will send rather than reading anything. */
+        *flags = H5VL_OPT_QUERY_SUPPORTED | H5VL_OPT_QUERY_MODIFY_METADATA;
+        return 0;
+    }
     else if (cls == H5VL_SUBCLS_FILE && opt_type == H5VL_stream_op_begin_logical_step) {
         /* Collective for forward-consistency with begin_step/end_step, in
          * anticipation of a parallel reader -- not itself exercised by M3's
@@ -9823,6 +10358,23 @@ H5Fsubscribe(hid_t file_id, size_t count, const char *const *paths, const hid_t 
 
     return H5VL__stream_file_op(file_id, H5VL_stream_op_subscribe, &op_args);
 } /* end H5Fsubscribe() */
+
+herr_t
+H5Fsubscribe_predicate(hid_t file_id, const char *path, H5VL_stream_pred_op_t op, hid_t type_id,
+                       const void *value)
+{
+    H5VL_stream_args_subscribe_predicate_t op_args;
+
+    if (!path || !value)
+        return -1;
+
+    op_args.path    = path;
+    op_args.op      = op;
+    op_args.type_id = type_id;
+    op_args.value   = value;
+
+    return H5VL__stream_file_op(file_id, H5VL_stream_op_subscribe_predicate, &op_args);
+} /* end H5Fsubscribe_predicate() */
 
 herr_t
 H5Fwait_step_ready(hid_t file_id, uint64_t timeout_ms, uint64_t *physical_step, uint64_t *wall_time_ns)

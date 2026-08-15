@@ -320,10 +320,27 @@ via `H5Dwrite_chunk()`. That is an M2-scale change for a case neither
 measured nor reported. Revisit only if profiling shows re-filtering as a
 real cost; the design above stands ready if so.
 
-Still open (not dropped): chunk-grid-aware routing of a subscriber's N-D
-selection. Subscription routing linearizes the selection's bounding box, so
-a non-contiguous subscription receives a superset of what it asked for —
-correct, but coarser than it could be.
+**Closed 2026-08-15, and without the chunk grid.** This was the last routing
+gap: subscription routing linearized the selection's *bounding box*, so a
+non-contiguous subscription received a superset — correct, but coarser than
+it could be. It was framed as needing chunk-granularity routing
+(`H5Sselect_intersect_block` against `FilteredChunks`), which is why it
+outlived the payload form it depended on.
+
+It needed neither. The subscription's `H5Sencode2` blob — decision #3's, and
+until now reduced to its bounds before it ever left the reader — now travels
+to the writer, which intersects the selection with each write and pushes one
+RPC per contiguous run of the real intersection. That is
+`H5VL__stream_space_flat_runs()`, the same decomposition the strided-write
+fix already used on the other side, applied to the subscriber's selection
+instead of the writer's. No chunk grid, no new payload form, no wire change.
+
+Measured in `test/t_subvolume_strided.c`, subscribing to column 3 of a 6×8
+dataset — 6 elements whose bounding box spans 41 of the 48:
+**41 elements (164 bytes) before, 6 (24 bytes) after.** The extents of the
+two dataspaces are compared before any flat index from one is trusted in the
+other, and a mismatch declines to the old behavior; getting that wrong is
+exactly what caused silent data loss twice here already.
 
 ### Connector state machine
 
@@ -553,9 +570,12 @@ of elements received, since the values that did arrive were correct and a
 value-only check passes while most of the data goes missing.
 
 The linearized range is the smallest flat span *containing* the selection's
-bounding box, so a non-contiguous **subscription** yields a superset of what
-was asked for. Deliberate: over-sending is inefficiency, under-sending is
-data loss.
+bounding box, so a non-contiguous **subscription** yielded a superset of what
+was asked for. Deliberate at the time: over-sending is inefficiency,
+under-sending is data loss. **Since closed** — the span is now only the
+coarse filter and the fallback, with the subscription's own encoded
+selection carried through and intersected exactly; see the filtered-chunk
+section above for the measurement.
 
 **A second, worse instance of the same assumption, on the write side.** A
 push describes its payload as one flat range with the bytes contiguous from
@@ -640,11 +660,20 @@ the fix above, only occasionally stalls process teardown past a normal test
 timeout. The real fix belongs in libfabric/Mercury's own connection
 handling, well outside this project.
 
-Also still open: chunk-storage-granularity routing (`H5Sselect_intersect_
-block` against `FilteredChunks`, which this connector has never actually
-built despite being in the schema since M2). Because of that, re-filtering
-always uses a single chunk spanning the whole pushed subrange rather than
-honoring a chunk shape the subscriber's DCPL requested.
+**Update: selection-exact routing shipped 2026-08-15**, closing what this
+paragraph called chunk-storage-granularity routing — and closing it without
+chunks. A subscription's `H5Sencode2` selection now reaches the writer and is
+intersected with each write directly, so a non-contiguous subscription gets
+exactly its own elements rather than its bounding span (41 elements → 6 in
+`test/t_subvolume_strided.c`). `H5Sselect_intersect_block` against
+`FilteredChunks` was never the only way to get there; it was the way that
+depended on a payload form M8.5.1 then dropped.
+
+What remains genuinely tied to chunks is narrower than this paragraph
+implied: re-filtering still builds a single chunk spanning the pushed run
+rather than honoring a chunk *shape* a subscriber's DCPL asks for. That
+affects how a re-filtered push is stored on the way across, not which
+elements are chosen.
 
 ### M9 — Tools and the long tail · M
 
@@ -658,14 +687,84 @@ In scope:
   wording ("promoted from test scaffolding") overstated the starting point,
   as there is no such scaffolding.
 - The tool-compatibility matrix, documented honestly, `h5dump` included.
-- Then predicate pushdown and onion-backed addressable step history.
+- Then predicate pushdown and onion-backed addressable step history. Both
+  shipped; see the two sections below.
 
 **Exit gate.** `h5stream` follows a live writer end to end: lists steps as
 they commit, tails new ones as they arrive, and reorganizes a running stream
 into a static file that `h5dump` reads without complaint.
 
-*Progress: `list`, `export` and `tail` have all landed and are tested. The
-exit gate above is met.*
+*Progress: `list`, `export`, `tail`, predicate pushdown and onion-backed
+addressable step history have all landed and are tested. The exit gate above
+is met and M9's scope is complete.*
+
+#### Predicate pushdown — shipped 2026-08-15, and cheaper than designed
+
+`H5Fsubscribe_predicate(file_id, path, op, type_id, value)` attaches a value
+test to an existing subscription; the writer evaluates it against the bytes
+it is about to marshal and sends only the elements that satisfy it. Measured
+in `test/t_predicate.c`: **1256 of 16000 bytes (7.8%)** across four steps of
+a 1000-element dataset, one of those steps sending **nothing at all** — and
+that 7.8% is inflated on purpose, since one of the four steps is the
+deliberately worst case where the match set is too fragmented to describe
+run by run and coalesces to a superset. The three ordinary steps send 460 of
+12000 (3.8%).
+
+That last part is what makes a predicate categorically different from the
+narrowings already in the protocol. Subvolume routing (M8.5) and
+per-subscriber precision both still put *something* on the wire for every
+write overlapping a subscription; a predicate is the only one that can take
+a write to zero bytes, which is exactly the monitoring case — a reader
+watching for an exceedance that occurs in one step out of hundreds.
+
+**`design-plan.md` calls this "the expensive one … needs per-chunk stats
+added to the format." That is true of a different problem than the one this
+connector has.** The reasoning there is about *skipping stored chunks*
+without reading them, which does need statistics `H5D_chunk_rec_t` has no
+room for. But this connector evaluates at push time, when it is holding the
+data in memory anyway, having just written it — so the predicate costs one
+pass over a buffer already in cache and needs no format change, no schema
+field, and no new dependency. The design-plan's cost estimate was attached
+to the storage-side optimization, and got read as the cost of the feature.
+
+Three things fell out of building it that are worth stating:
+
+- **The `Entry.predicate` schema field, reserved for this since M2, stays
+  unpopulated — it was misfiled.** A predicate belongs to a *subscription*
+  (reader → writer, one per subscriber), not to a manifest entry (writer →
+  file, one per write). Putting it on an `Entry` would have meant a step's
+  manifest carrying one subscriber's query, which is neither meaningful to
+  another subscriber nor to a later reader of the file. The field is left in
+  the schema rather than removed: FlatBuffers ignores it, and removing it
+  would renumber nothing but would rewrite history in the `.fbs`.
+- **No wire-format change was needed for a discontiguous result.** Matching
+  elements are delivered as one push per maximal contiguous run, each
+  labelled with its own `elem_start`/`elem_count` — the identical trick the
+  M8.5 strided-write fix already used, and for the identical reason (a push
+  describes one flat range truthfully or not at all). A predicate matching
+  one region stays a single push. Past a cap of 64 runs the match set is
+  coalesced to the span containing it, a superset, never truncated — the
+  alternative at the cap is either a hundred tiny RPCs or a truncated
+  answer, and truncation here is data loss. `test/t_predicate.c` exercises
+  that path with an alternating pattern producing ~100 runs, and checks the
+  coalesced span is exactly the one containing every match.
+- **An unevaluable predicate over-sends rather than under-sends.** Against
+  a compound, a string, an unsigned 64-bit type whose values can exceed
+  `LLONG_MAX`, or a float wider than `double`,
+  `H5VL__stream_eval_predicate()` declines and the whole overlap goes out as
+  if no predicate had been set. Same rule the rest of the routing code
+  follows, for the same reason: over-sending is inefficiency, under-sending
+  is data loss. `test/t_predicate.c` pins this with a compound-typed dataset
+  carrying a predicate that cannot apply to it.
+
+The comparison itself borrows HDF5 rather than reimplementing: both sides
+are moved into one canonical type with `H5Tconvert()`, chosen from the
+*data's* class, so a big-endian writer, a 16-bit-int subscriber and a
+floating-point constant against integer data all work without this code
+knowing anything about representation. The constant travels as `H5Tencode()`
+bytes for the same reason. Only the small blob header — op, version, two
+lengths — is hand-rolled, and it is written explicitly little-endian, which
+is the lesson the VL length tag taught (see the cross-endian section).
 
 #### Onion-backed addressable step history — shipped 2026-08-15
 
@@ -787,6 +886,7 @@ and the honest answer has two halves rather than one.
 | **Live** (writer holds it open) | `**NOT FOUND**` | error | error | **No** — use `h5stream tail` |
 | **Finished** stream | opens | opens | opens | Yes, but see below |
 | **Exported** (`h5stream export`) | opens | opens | opens | **Yes, fully** |
+| **Archived** (`h5stream history`) | opens¹ | opens¹ | opens¹ | Yes for the latest state; past revisions need an onion fapl |
 
 **Live streams: the tools do not work, and cannot.** All three fail, and this
 is not a shortcoming of the tools or something a future release fixes: while
@@ -811,8 +911,22 @@ groups and no bookkeeping. All three tools work normally, and so will
 anything else that reads HDF5 — this is the answer for handing a stream to a
 plotting script, an existing analysis pipeline, or a colleague.
 
+¹ **Archived files, and the one honest caveat about them.** The canonical
+file an archive consists of is ordinary HDF5 and opens in any tool — that is
+how the recorded page size is readable with `h5dump -a`. But a *past
+revision* is not reachable from the command line: `h5dump` does have
+`--vfd-name onion`, and its `--vfd-info` is a string that the tools library
+casts straight to `H5FD_onion_fapl_info_t *`, so there is no way to spell a
+revision number there. Measured: `h5dump --vfd-name onion` on an archive
+prints the empty canonical file rather than any revision. Addressing a
+revision therefore takes a few lines of C (`H5Pset_fapl_onion()` with
+`revision_num` and the recorded `page_size`), which
+`test/t_onion_history.c` shows end to end. This is a tools gap, not a
+format one — the history is there and any HDF5 program can read it.
+
 The practical guidance, then: `h5stream tail` while it is running,
-`h5stream export` once it is not, and the standard tools on the result.
+`h5stream export` once it is not for a single current snapshot, and
+`h5stream history` when the whole step history should be re-openable.
 Pointing `h5dump` at a stream directly is the one path that disappoints, and
 it disappoints in both states for different reasons.
 

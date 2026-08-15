@@ -76,6 +76,16 @@
  *          blobs, mirroring how payload bytes already move today. A
  *          subscription with no DCPL (or one the refilter callback declines)
  *          gets the exact M8/M8.5 raw-bytes behavior unchanged.
+ *
+ *          M9, predicate pushdown: a subscription may additionally carry an
+ *          opaque predicate blob (vs_tr_reader_subscribe_predicate()). The
+ *          writer evaluates it against the bytes it is about to send --
+ *          through another registered callback, vs_tr_predicate_fn, for the
+ *          same HDF5-free reason -- and sends only the runs of elements that
+ *          match, or nothing at all when none do. This is the one reduction
+ *          in the protocol that can take a push to zero bytes: subvolume
+ *          routing and precision both still send *something* for every write
+ *          that overlaps a subscription.
  */
 
 #ifndef VOL_STREAM_TR_MERCURY_H
@@ -132,6 +142,90 @@ typedef int (*vs_tr_refilter_fn)(const void *raw_buf, uint64_t elem_size, uint64
  * thread-safe against a concurrent vs_tr_writer_push_data() call -- call
  * once, right after vs_tr_start(), before any step replay can run. */
 void vs_tr_set_refilter_cb(vs_tr_t *tr, vs_tr_refilter_fn fn);
+
+/* M9 predicate pushdown: one maximal contiguous run of matching elements,
+ * counted in elements relative to the overlap slice handed to
+ * vs_tr_predicate_fn -- start == 0 is that slice's first element, not the
+ * object's. vs_tr_writer_push_data() adds the slice's own global offset
+ * back before a run goes on the wire. */
+typedef struct vs_tr_run_t {
+    uint64_t start;
+    uint64_t count;
+} vs_tr_run_t;
+
+/* Cap on how many runs one overlap slice may be decomposed into. Each run
+ * becomes its own RPC, so a predicate matching a finely alternating pattern
+ * would otherwise turn one push into thousands of tiny ones -- slower and
+ * bulkier than just sending everything. Past the cap the callback coalesces
+ * rather than truncating (see vs_tr_predicate_fn); truncating would be data
+ * loss. */
+#define VS_TR_MAX_PRED_RUNS 64
+
+/* M9: implemented by H5VLstream.c, registered via vs_tr_set_predicate_cb().
+ * Same division of labour as vs_tr_refilter_fn -- this module carries
+ * pred_enc and type_enc without ever decoding either.
+ *
+ * Given raw_buf (count elements of elem_size bytes, unfiltered) and this
+ * subscriber's own pred_enc, the callback fills runs[] with the maximal
+ * contiguous runs of elements satisfying the predicate and returns how many
+ * it wrote (0 .. max_runs). A return of 0 -- "nothing here matches" -- is
+ * the point of the whole exercise: the caller then sends this subscriber
+ * nothing at all for this write, the only reduction in the protocol that
+ * reaches zero bytes.
+ *
+ * Returning -1 means "cannot evaluate this": a datatype the predicate does
+ * not apply to, a malformed blob, a failed HDF5 call. The caller then
+ * pushes the whole overlap exactly as if no predicate had been given --
+ * this project's standing rule that over-sending is inefficiency while
+ * under-sending is data loss. A subscriber consequently may receive
+ * elements that do not match, and must not read delivery as proof of a
+ * match. */
+typedef int (*vs_tr_predicate_fn)(const void *raw_buf, uint64_t elem_size, uint64_t count,
+                                    const uint8_t *pred_enc, uint64_t pred_enc_len,
+                                    const uint8_t *type_enc, uint64_t type_enc_len, vs_tr_run_t *runs,
+                                    int max_runs);
+
+/* Registers the callback used to evaluate a subscriber's predicate (M9).
+ * NULL (the default) means a predicate is carried but never acted on, so
+ * every push goes out whole -- exactly M8.5's behavior. Same threading rule
+ * as vs_tr_set_refilter_cb(): call once, right after vs_tr_start(). */
+void vs_tr_set_predicate_cb(vs_tr_t *tr, vs_tr_predicate_fn fn);
+
+/* M8.5 follow-up: implemented by H5VLstream.c, registered via
+ * vs_tr_set_selection_cb(). Same HDF5-free division of labour as the two
+ * callbacks above -- this module carries H5Sencode2 blobs without decoding
+ * them.
+ *
+ * A subscription's requested range reaches this module as a flat element
+ * span, which is the smallest span *containing* the selection. For a
+ * selection that is not contiguous in flat order -- a column of a 2-D
+ * dataset, say, whose bounding span is nearly the whole dataset -- routing
+ * on that span alone sends elements nobody asked for. Given the
+ * subscriber's own encoded selection, this callback reports which parts of
+ * the flat range [range_start, range_start + range_count) the selection
+ * actually covers, as runs relative to range_start.
+ *
+ * write_space_enc is the encoded dataspace of the write being pushed, and
+ * exists so the callback can confirm that both describe the same extent
+ * before treating a flat index from one as meaningful in the other.
+ * Mismatched extents are the shape of bug that has twice cost this project
+ * silent data loss, so the callback declines rather than assumes.
+ *
+ * Returns the number of runs written (0 .. max_runs); 0 means the selection
+ * does not touch this range at all and nothing is sent for it. Returns -1 to
+ * decline -- an undecodable blob, extents that disagree, or a selection too
+ * fragmented to describe in max_runs -- and the caller then sends the whole
+ * range, exactly the bounding-span behavior this refines. Over-sending is
+ * inefficiency; under-sending is data loss. */
+typedef int (*vs_tr_selection_fn)(const uint8_t *sub_space_enc, uint64_t sub_space_enc_len,
+                                    const uint8_t *write_space_enc, uint64_t write_space_enc_len,
+                                    uint64_t range_start, uint64_t range_count, vs_tr_run_t *runs,
+                                    int max_runs);
+
+/* Registers the callback used to narrow a push to a subscriber's actual
+ * selection. NULL (the default) leaves routing on the flat bounding span.
+ * Same threading rule as vs_tr_set_refilter_cb(). */
+void vs_tr_set_selection_cb(vs_tr_t *tr, vs_tr_selection_fn fn);
 
 /* Starts Margo and SSG on na_str (e.g. "na+sm", "ofi+tcp"). Both writer and
  * reader run in server mode: a writer must receive RPCs (get_current_step,
@@ -234,7 +328,20 @@ int vs_tr_writer_min_acked_step(vs_tr_t *tr, uint64_t *min_acked_step);
  * arrive, not a fatal error to the caller. Returns 0 if the RPC was
  * delivered and acknowledged, -1 otherwise. */
 int vs_tr_reader_subscribe(vs_tr_t *tr, const char *path, uint64_t sel_start, uint64_t sel_count,
-                            const uint8_t *dcpl_enc, uint64_t dcpl_enc_len);
+                            const uint8_t *dcpl_enc, uint64_t dcpl_enc_len, const uint8_t *space_enc,
+                            uint64_t space_enc_len);
+
+/* Reader side (M9): attach a predicate to an *existing* subscription for
+ * path -- vs_tr_reader_subscribe() must have succeeded for the same path
+ * first, since the predicate narrows a subscription rather than being one.
+ * pred_enc is opaque here and meaningful only to the registered
+ * vs_tr_predicate_fn; pass NULL/0 to clear a predicate previously set.
+ * Returns 0 only if the writer both answered and found that subscription,
+ * -1 otherwise (no writer reachable, or no such subscription) -- unlike
+ * vs_tr_reader_subscribe() this distinction matters, because silently
+ * dropping a predicate would over-send rather than fail visibly. */
+int vs_tr_reader_subscribe_predicate(vs_tr_t *tr, const char *path, const uint8_t *pred_enc,
+                                       uint64_t pred_enc_len);
 
 /* Writer side: push the subset of buf that overlaps each subscriber's own
  * requested range to that subscriber (M8.5) -- buf holds write_count
@@ -245,15 +352,25 @@ int vs_tr_reader_subscribe(vs_tr_t *tr, const char *path, uint64_t sel_start, ui
  * is buf's own H5Tencode() bytes, handed to the registered refilter
  * callback (vs_tr_set_refilter_cb()) for any subscriber that provided a
  * dcpl_enc at subscribe time; pass NULL/0 if the caller never registers a
- * callback (the type is then simply unused). Not an error for there to be
+ * callback (the type is then simply unused). space_enc/space_enc_len is
+ * this write's own H5Sencode2() bytes, handed to the registered selection
+ * callback (vs_tr_set_selection_cb()) so a subscriber's non-contiguous
+ * selection can be honored exactly rather than as its bounding span; NULL/0
+ * simply leaves that refinement off. Not an error for there to be
  * no subscribers at all (the ordinary case for most paths on most steps) --
  * mirrors vs_tr_writer_broadcast_step_ready()'s "no readers, proceed"
  * tolerance. Returns 0 on success (even if an individual member's RPC
- * failed), -1 only on a local error. */
+ * failed), -1 only on a local error.
+ *
+ * M9: a subscriber carrying a predicate receives one RPC per matching run
+ * of its overlap rather than one covering the whole overlap -- each run
+ * truthfully labelled with its own elem_start/elem_count, so the wire
+ * format is unchanged -- or no RPC at all if nothing matched. */
 int vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, const void *buf,
                             uint64_t elem_size, uint64_t write_start, uint64_t write_count,
                             const uint8_t *type_enc, uint64_t type_enc_len,
-                            const uint8_t *native_dcpl_enc, uint64_t native_dcpl_enc_len, void *native_ctx);
+                            const uint8_t *native_dcpl_enc, uint64_t native_dcpl_enc_len, void *native_ctx,
+                            const uint8_t *space_enc, uint64_t space_enc_len);
 
 /* Reader side: block up to timeout_ms for a pushed data item (one may
  * already be queued), filling *physical_step, *out_path (newly malloc'd,

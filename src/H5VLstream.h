@@ -147,12 +147,27 @@
  *              H5VL__stream_refilter_for_subscriber() in src/H5VLstream.c and
  *              vs_tr_refilter_fn in src/tr_mercury.h.
  *
- *              Still open: HDF5-storage-chunk-granularity routing (would need
- *              H5Sselect_intersect_block against a FilteredChunks payload
- *              form this codebase has never actually built, despite it being
- *              schema-defined since M2). Re-filtering accordingly always uses
- *              one chunk spanning the whole pushed subrange rather than
- *              honoring a chunk shape the subscriber's DCPL requested.
+ *              Update: routing now honors a subscription's *selection*, not
+ *              just its bounding span. The H5Sencode2 blob travels to the
+ *              writer, which intersects it with each write and sends one
+ *              push per contiguous run of the intersection -- so a
+ *              non-contiguous subscription (a column of a 2-D dataset)
+ *              receives exactly its own elements rather than a superset.
+ *
+ *              Still open, and narrower than it once looked: re-filtering
+ *              builds a single chunk spanning the pushed run rather than
+ *              honoring a chunk *shape* a subscriber's DCPL asks for. That
+ *              is about how a re-filtered push is stored in transit, not
+ *              about which elements are chosen.
+ *
+ *              M9 status: predicate pushdown. H5Fsubscribe_predicate()
+ *              attaches a value test to an existing subscription, and the
+ *              writer evaluates it against the bytes it is about to send,
+ *              transmitting only the runs of elements that satisfy it --
+ *              or nothing at all for a write where none do. That last case
+ *              is what distinguishes a predicate from every other narrowing
+ *              in this protocol: subvolume routing and precision both still
+ *              put something on the wire for each overlapping write.
  */
 
 #ifndef H5VLstream_H
@@ -226,6 +241,7 @@ H5VL_STREAM_API extern hid_t H5VL_STREAM_g;
 #define H5VL_STREAM_OP_WAIT_STEP_READY    "vol-stream:wait_step_ready"
 #define H5VL_STREAM_OP_SET_QUEUE_POLICY   "vol-stream:set_queue_policy"
 #define H5VL_STREAM_OP_GET_SUBSCRIBED_DATA "vol-stream:get_subscribed_data"
+#define H5VL_STREAM_OP_SUBSCRIBE_PREDICATE "vol-stream:subscribe_predicate"
 
 /** Status of the current step */
 typedef enum H5F_step_status_t {
@@ -387,15 +403,94 @@ H5VL_STREAM_API herr_t H5Fget_logical_steps(hid_t file_id, size_t *n_logical, ui
  *       re-filtered. A \p plists entry must be a real DCPL (H5P_DEFAULT means
  *       "no re-filtering", the original raw-bytes behavior).
  *
- * \note Still follow-up scope: the general N-D-selection case
- *       (H5Sselect_intersect_block against HDF5 storage chunks) -- routing is
- *       1-D element ranges, and re-filtering always uses a single chunk
- *       spanning the whole pushed subrange rather than honoring a chunk shape
- *       requested in \p plists. Call H5Fget_subscribed_data() after
- *       H5Fwait_step_ready() to retrieve what was pushed.
+ * \note \p spaces is honored as a selection, not merely as a bounding
+ *       span: the encoded selection travels to the writer, which sends one
+ *       push per contiguous run of its intersection with each write. A
+ *       selection that is contiguous in flat order (a whole object, a slab
+ *       of leading dimensions, a 1-D subrange) arrives as a single push, as
+ *       before; one that is not (a column) arrives as several, each
+ *       truthfully labelled. A selection too fragmented to describe in a
+ *       bounded number of runs falls back to the bounding span, which
+ *       over-sends rather than under-sends. Call H5Fget_subscribed_data()
+ *       after H5Fwait_step_ready() to retrieve what was pushed.
+ *
+ * \note Still follow-up scope: re-filtering (\p plists) always uses a
+ *       single chunk spanning the pushed run rather than honoring a chunk
+ *       shape requested there.
  */
 H5VL_STREAM_API herr_t H5Fsubscribe(hid_t file_id, size_t count, const char *const *paths, const hid_t *spaces,
                     const hid_t *plists);
+
+/**
+ * \brief M9: the comparison a subscription predicate applies to each element.
+ *
+ * Deliberately a value test against one scalar constant and nothing more.
+ * Anything richer (ranges, conjunctions, expressions over several objects)
+ * would be a query language, and HDF5 has no H5Q/H5X in the tree to borrow
+ * one from -- see dev-plan.md's M9 section for why that boundary is where
+ * it is.
+ */
+typedef enum H5VL_stream_pred_op_t {
+    H5VL_STREAM_PRED_LT = 0, /**< element <  value */
+    H5VL_STREAM_PRED_LE = 1, /**< element <= value */
+    H5VL_STREAM_PRED_GT = 2, /**< element >  value */
+    H5VL_STREAM_PRED_GE = 3, /**< element >= value */
+    H5VL_STREAM_PRED_EQ = 4, /**< element == value */
+    H5VL_STREAM_PRED_NE = 5  /**< element != value */
+} H5VL_stream_pred_op_t;
+
+/**
+ * \brief M9: reader only. Attach a value predicate to an existing
+ *        subscription, so the writer sends only elements satisfying it.
+ *
+ * Predicate pushdown: the test is evaluated by the *writer*, against the
+ * bytes it is about to marshal, so non-matching elements are never
+ * serialized and never cross the wire. A write in which nothing matches
+ * produces no RPC at all -- the only narrowing in this protocol that
+ * reaches zero bytes, since subvolume routing and per-subscriber precision
+ * both still send something for every overlapping write.
+ *
+ * H5Fsubscribe() must have succeeded for \p path first: a predicate narrows
+ * a subscription rather than being one. A later H5Fsubscribe() naming the
+ * same path clears the predicate, so re-subscribe first and re-apply the
+ * predicate after, never the reverse.
+ *
+ * \param file_id  File opened through the vol-stream connector for reading,
+ *                 with the transport enabled (see VOL_STREAM_NA)
+ * \param path     A path passed to a previous H5Fsubscribe() on this file
+ * \param op       The comparison to apply to every element
+ * \param type_id  Datatype of \p value, as an ordinary in-memory type
+ *                 (H5T_NATIVE_INT, say). Travels as H5Tencode() bytes, so a
+ *                 writer of different endianness converts correctly
+ * \param value    Address of the single scalar constant to compare against
+ * \return \herr_t. -1 if the transport is unavailable, if \p path has no
+ *         subscription on the writer, or if \p type_id cannot be encoded
+ *
+ * \note The predicate applies to atomic integer and floating-point data.
+ *       Against anything else -- a compound, a string, an unsigned 64-bit
+ *       integer whose values can exceed LLONG_MAX, a float wider than
+ *       double -- the writer cannot evaluate it and sends the subscription's
+ *       whole overlap instead, exactly as if no predicate had been set. This
+ *       is deliberate and follows the same rule as the rest of the routing
+ *       code: over-sending is inefficiency, under-sending is data loss. A
+ *       reader that must see only matching elements should therefore re-test
+ *       what arrives rather than treat delivery as proof of a match.
+ *
+ * \note Comparison happens in the data's own class, in \c long \c long for
+ *       integers and \c double for floats, with \p value converted by HDF5's
+ *       own conversion engine. A floating-point \p value against integer
+ *       data is truncated toward zero by that conversion, so prefer a
+ *       constant of the same class as the data.
+ *
+ * \note Matching elements are delivered as one push per maximal contiguous
+ *       run, each carrying its own \c elem_start / \c elem_count through
+ *       H5Fget_subscribed_data() -- no wire-format change, and a predicate
+ *       matching one contiguous region stays a single push. A match set too
+ *       fragmented to describe in a bounded number of runs is coalesced to
+ *       the span containing it (a superset), never truncated.
+ */
+H5VL_STREAM_API herr_t H5Fsubscribe_predicate(hid_t file_id, const char *path, H5VL_stream_pred_op_t op,
+                    hid_t type_id, const void *value);
 
 /**
  * \brief M8/M8.5: reader only. Block until the writer pushes data for a

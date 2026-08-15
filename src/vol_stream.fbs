@@ -6,6 +6,15 @@
 // Entry.predicate are left unpopulated -- reserved for later milestones
 // (M3 group provenance, a future filtered-chunk passthrough, and M8
 // subscription predicates respectively) without a schema change.
+//
+// Two of those three now stay unpopulated permanently, on evidence rather
+// than by omission: Payload.FilteredChunks was decided against in M8.5.1,
+// and Entry.predicate was misfiled. Predicate pushdown shipped in M9, and a
+// predicate belongs to a *subscription* (reader -> writer, one per
+// subscriber), not to a manifest entry (writer -> file, one per write) --
+// one subscriber's query means nothing to another subscriber, or to any
+// later reader of the file. Both fields are kept rather than removed, since
+// FlatBuffers ignores what nobody writes. See docs/dev-plan.md.
 namespace vs;
 
 enum Kind    : ubyte { DsetCreate, DsetWrite, Attr, Group, Link }
