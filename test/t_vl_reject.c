@@ -5,21 +5,25 @@
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
 /*
- * VL/reference capture-time reject guard.
+ * Capture-time reject guard for buffers that are not self-contained.
  *
  * A DsetWrite/Attr capture inside an open step memcpy()s whatever buffer
  * H5Dwrite()/H5Awrite() was given straight into the pending entry's
  * payload, replayed later via a *different* call once end_step() runs.
- * That is unsafe for a variable-length datatype (H5T_VLEN, or a
- * variable-length string): the buffer is an array of {len, pointer}
- * structs whose pointers are only valid in this process's own memory, not
- * portable bytes -- capturing them verbatim risks reading through a stale
- * pointer at replay time. Real deep-serialization support does not exist
- * yet (see docs/dev-plan.md's residual risks), so H5VL__stream_type_unsafe_
- * to_capture() rejects the write outright instead of silently corrupting
- * it -- this test proves that reject actually happens, for both a dataset
- * write and an attribute write, and that a plain (non-VL) write in the
- * same step is unaffected.
+ * That is only correct for buffers whose bytes stand alone. Where they do
+ * not -- a variable-length datatype is an array of {len, pointer} structs,
+ * pointing at memory the caller may reclaim the moment the write returns --
+ * capturing verbatim would read through stale pointers at replay time.
+ *
+ * **Scope note:** top-level VL types are no longer rejected. They are now
+ * deep-serialized at capture instead (H5VL__stream_vl_serialize(), covered
+ * end to end by test/t_vl_roundtrip.c), which is what Decision #4 always
+ * intended; this test asserted the interim reject and has been narrowed
+ * accordingly. What it still guards is the part that genuinely remains
+ * unhandled: a variable-length type *nested* inside a compound, where
+ * deep-serializing would mean rewriting the buffer member by member. That
+ * case must keep failing loudly rather than silently corrupting, and a
+ * plain (non-VL) write in the same step must be unaffected either way.
  */
 
 #include <stdio.h>
@@ -80,33 +84,54 @@ run(void)
 
     CHECK(H5Fbegin_step(fid, 0, NULL, 0), "begin_step");
 
-    /* Dataset write, variable-length string type. */
+    /* Top-level VL is deep-serialized now, not rejected -- asserted here so
+     * a regression back to rejecting would be caught by this test too, not
+     * only by t_vl_roundtrip.c. */
     CHECK((ds = H5Dcreate2(fid, "vlstr", vlstr_type, sp, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT)),
           "create VL-string dataset (deferred placeholder)");
-    H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
-    EXPECT(H5Dwrite(ds, vlstr_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, vlstr_buf) < 0,
-           "VL-string dataset write is rejected, not silently captured");
-    H5Eset_auto2(H5E_DEFAULT, (H5E_auto2_t)H5Eprint2, stderr);
+    EXPECT(H5Dwrite(ds, vlstr_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, vlstr_buf) >= 0,
+           "top-level VL-string dataset write is accepted (deep-serialized)");
     H5Dclose(ds);
 
-    /* Dataset write, H5T_VLEN sequence type. */
     CHECK((ds = H5Dcreate2(fid, "vlseq", vlseq_type, sp, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT)),
           "create VL-sequence dataset (deferred placeholder)");
-    H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
-    EXPECT(H5Dwrite(ds, vlseq_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, vlseq_buf) < 0,
-           "VL-sequence dataset write is rejected, not silently captured");
-    H5Eset_auto2(H5E_DEFAULT, (H5E_auto2_t)H5Eprint2, stderr);
+    EXPECT(H5Dwrite(ds, vlseq_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, vlseq_buf) >= 0,
+           "top-level VL-sequence dataset write is accepted (deep-serialized)");
     H5Dclose(ds);
 
-    /* Attribute write, variable-length string type, on a plain group (the
-     * file root). */
     CHECK((attr = H5Acreate2(fid, "vlattr", vlstr_type, scalar, H5P_DEFAULT, H5P_DEFAULT)),
           "create VL-string attribute (deferred placeholder)");
-    H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
-    EXPECT(H5Awrite(attr, vlstr_type, vlstr_buf) < 0,
-           "VL-string attribute write is rejected, not silently captured");
-    H5Eset_auto2(H5E_DEFAULT, (H5E_auto2_t)H5Eprint2, stderr);
+    EXPECT(H5Awrite(attr, vlstr_type, vlstr_buf) >= 0,
+           "top-level VL-string attribute write is accepted (deep-serialized)");
     H5Aclose(attr);
+
+    /* The case that genuinely remains unhandled, and so must still fail
+     * loudly: a VL buried at a byte offset inside a compound. */
+    {
+        typedef struct {
+            int   tag;
+            hvl_t v;
+        } compound_vl_t;
+        compound_vl_t crec;
+        hid_t         ctype, cds;
+
+        crec.tag   = 1;
+        crec.v.len = 0;
+        crec.v.p   = NULL;
+
+        CHECK((ctype = H5Tcreate(H5T_COMPOUND, sizeof(compound_vl_t))), "create compound type");
+        CHECK(H5Tinsert(ctype, "tag", HOFFSET(compound_vl_t, tag), H5T_NATIVE_INT), "insert tag member");
+        CHECK(H5Tinsert(ctype, "v", HOFFSET(compound_vl_t, v), vlseq_type), "insert nested VL member");
+
+        CHECK((cds = H5Dcreate2(fid, "compound_vl", ctype, scalar, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT)),
+              "create compound-with-VL dataset (deferred placeholder)");
+        H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
+        EXPECT(H5Dwrite(cds, ctype, H5S_ALL, H5S_ALL, H5P_DEFAULT, &crec) < 0,
+               "a VL nested inside a compound is still rejected, not silently captured");
+        H5Eset_auto2(H5E_DEFAULT, (H5E_auto2_t)H5Eprint2, stderr);
+        H5Dclose(cds);
+        H5Tclose(ctype);
+    }
 
     /* A plain (non-VL) dataset and attribute write in the same step must be
      * completely unaffected by the rejections above. */

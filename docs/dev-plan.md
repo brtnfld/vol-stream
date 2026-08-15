@@ -636,11 +636,38 @@ too. A rejected write does not poison the rest of the step — a plain write
 to a different object in the same step still replays correctly (verified in
 `test/t_vl_reject.c`, the exit gate for this fix). Real deep-serialization
 (a) is still not built; this closes the silent-corruption failure mode, not
-the missing feature. Reference translation, once built, should happen at
+the missing feature. **Update 2026-08-14: (a) has now landed too** — see the
+VL deep-serialization paragraph below. Reference translation, once built, should happen at
 write-time (intercepting `H5Rcreate_object`/`H5Rcreate_region`) rather than
 by walking the whole step's references synchronously inside `COMMITTING` —
 the latter would stall the collective barrier in proportion to reference
 count.
+
+**VL deep-serialization landed 2026-08-14 — the last piece of Decision #4.**
+A VL buffer is not self-contained (`H5T_VLEN` is an array of `hvl_t`
+{len, pointer}; a VL string an array of `char *`), and this connector defers
+the real write to `end_step()`, by which point the application is entitled to
+have reclaimed all of it. So capture now follows those pointers immediately
+and copies what they point at (`H5VL__stream_vl_serialize()`), and replay
+rebuilds real pointers into fresh allocations before writing
+(`H5VL__stream_vl_deserialize()`, released right after the write since HDF5
+has copied by then). The wire form is, per element, `[uint64 tag][tag-1
+bytes]`, where `tag == 0` marks a NULL pointer — the +1 bias is what keeps
+NULL distinguishable from a legitimately empty sequence or `""`, which HDF5
+round-trips differently.
+
+Wired on both the dataset and attribute capture/replay paths. `test/t_vl_
+roundtrip.c` covers ragged lengths (0, 1, many) and the empty string, checks
+what actually landed through the *native* connector, and — the load-bearing
+case — frees every application buffer **before** `end_step()` runs, so a
+regression back to capturing pointers rather than bytes would read freed
+memory and fail there.
+
+Still rejected, deliberately: a VL *nested* inside a compound or array, and
+a VL whose base type is itself variable-length. Deep-serializing those means
+walking a nested layout member by member, which this does not do.
+`test/t_vl_reject.c` was narrowed to assert exactly that remaining boundary
+(it previously asserted the interim "reject all VL" behavior).
 
 **Measured 2026-08-14 — reference support is feasible, but Decision #4
 understates what it takes.** Three probe programs run against the real

@@ -409,7 +409,14 @@ static H5VL_stream_t *H5VL__stream_new_child_obj(void *under_obj, hid_t under_vo
 static size_t H5VL__stream_pending_append(H5VL_stream_file_state_t *fs,
                              const H5VL_stream_pending_entry_t *entry);
 static hid_t  H5VL__stream_resolve_space(hid_t space_id, hid_t fallback_space_id);
+/* What H5VL__stream_vl_*() below can handle, decided once by
+ * H5VL__stream_type_vl_kind() and then passed around. */
+#define H5VL_STREAM_VL_NONE 0 /* not variable-length at all                  */
+#define H5VL_STREAM_VL_SEQ  1 /* H5T_VLEN of a fixed-size base type (hvl_t)  */
+#define H5VL_STREAM_VL_STR  2 /* variable-length string (char *)             */
+
 static htri_t H5VL__stream_type_unsafe_to_capture(hid_t type_id);
+static int    H5VL__stream_type_vl_kind(hid_t type_id);
 static const uint8_t *H5VL__stream_type_cache_lookup(H5VL_stream_type_cache_entry_t *arr, size_t n,
                              const char *path, size_t *out_len);
 static herr_t H5VL__stream_type_cache_upsert(H5VL_stream_type_cache_entry_t **arr, size_t *n, size_t *cap,
@@ -1606,12 +1613,21 @@ H5VL__stream_type_unsafe_to_capture_1(hid_t type_id, bool top_level)
 
     if (cls == H5T_NO_CLASS)
         return -1;
-    if (cls == H5T_VLEN)
+    if (cls == H5T_VLEN) {
+        /* Top-level VL sequences are deep-serialized at capture (see
+         * H5VL__stream_vl_serialize()); nested ones, and those over a base
+         * type that is itself variable-length, are still rejected. */
+        if (top_level && H5VL__stream_type_vl_kind(type_id) != H5VL_STREAM_VL_NONE)
+            return 0;
         return 1;
+    }
     if (cls == H5T_REFERENCE)
         return top_level ? 0 : 1;
     if (cls == H5T_STRING) {
         htri_t is_vl = H5Tis_variable_str(type_id);
+
+        if (is_vl > 0 && top_level)
+            return 0; /* deep-serialized, same as VL sequences above */
         return is_vl;
     }
     if (cls == H5T_COMPOUND) {
@@ -1702,6 +1718,266 @@ H5VL__stream_type_unsafe_to_capture(hid_t type_id)
 {
     return H5VL__stream_type_unsafe_to_capture_1(type_id, true);
 } /* end H5VL__stream_type_unsafe_to_capture() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_type_vl_kind
+ *
+ * Purpose:     Which variable-length shape type_id is, for the deep-
+ *              serialization capture path -- and only for shapes that path
+ *              actually handles at the top level of a write.
+ *
+ *              An H5T_VLEN whose base type is itself variable-length
+ *              (VL-of-VL, or VL of a compound containing one) reports NONE
+ *              rather than SEQ, so it stays on the reject path: serializing
+ *              it means recursing per element into a nested layout this
+ *              increment does not walk. A VL nested *inside* a compound is
+ *              likewise still rejected, by H5VL__stream_type_unsafe_to_
+ *              capture_1()'s top_level flag rather than here.
+ *
+ * Return:      One of H5VL_STREAM_VL_{NONE,SEQ,STR}; NONE on any H5T error
+ *              too, which simply routes to the ordinary reject/memcpy path.
+ *-------------------------------------------------------------------------
+ */
+static int
+H5VL__stream_type_vl_kind(hid_t type_id)
+{
+    H5T_class_t cls = H5Tget_class(type_id);
+
+    if (cls == H5T_STRING)
+        return (H5Tis_variable_str(type_id) > 0) ? H5VL_STREAM_VL_STR : H5VL_STREAM_VL_NONE;
+
+    if (cls == H5T_VLEN) {
+        hid_t  base = H5Tget_super(type_id);
+        htri_t base_unsafe;
+
+        if (base < 0)
+            return H5VL_STREAM_VL_NONE;
+        /* Reuse the existing recursive guard to answer "is the base itself
+         * self-contained bytes?" -- checked as a non-top-level type, so a
+         * base that is VL or a reference correctly disqualifies it. */
+        base_unsafe = H5VL__stream_type_unsafe_to_capture_1(base, false);
+        H5Tclose(base);
+        return (base_unsafe == 0) ? H5VL_STREAM_VL_SEQ : H5VL_STREAM_VL_NONE;
+    }
+
+    return H5VL_STREAM_VL_NONE;
+} /* end H5VL__stream_type_vl_kind() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_vl_serialize
+ *
+ * Purpose:     Deep-serialize a variable-length write buffer into bytes a
+ *              manifest can carry -- dev-plan.md Decision #4's "VL data via
+ *              deep serialization", the last piece of it to be built.
+ *
+ *              A VL buffer is not self-contained: H5T_VLEN is an array of
+ *              hvl_t {len, pointer} and a VL string is an array of char *,
+ *              with the actual bytes living wherever the application put
+ *              them. The application is free to reclaim those the moment
+ *              H5Dwrite() returns, but this connector replays the write
+ *              later, from end_step() -- so the pointers must be followed
+ *              *now* and the pointed-to bytes copied, not captured as
+ *              addresses. (Capturing them verbatim is exactly the silent-
+ *              corruption bug H5VL__stream_type_unsafe_to_capture() was
+ *              added to block.)
+ *
+ *              Wire form, per element, back to back:
+ *                  [uint64 tag][tag-1 bytes of payload]
+ *              where tag == 0 means a NULL pointer and tag == n+1 means n
+ *              bytes follow. The +1 bias is what keeps NULL distinguishable
+ *              from a legitimately empty sequence or "" string -- different
+ *              values that HDF5 round-trips differently.
+ *
+ * Return:      0 on success (*out_buf malloc'd, caller frees), -1 otherwise
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_vl_serialize(const void *buf, size_t count, hid_t type_id, int kind, uint8_t **out_buf,
+                          size_t *out_len)
+{
+    uint8_t *acc       = NULL;
+    size_t   acc_len   = 0;
+    size_t   base_size = 0;
+    size_t   i;
+
+    if (!buf || !out_buf || !out_len || kind == H5VL_STREAM_VL_NONE)
+        return -1;
+
+    if (kind == H5VL_STREAM_VL_SEQ) {
+        hid_t base = H5Tget_super(type_id);
+
+        if (base < 0)
+            return -1;
+        base_size = H5Tget_size(base);
+        H5Tclose(base);
+        if (base_size == 0)
+            return -1;
+    }
+
+    for (i = 0; i < count; i++) {
+        const void *src    = NULL;
+        size_t      nbytes = 0;
+        uint64_t    tag;
+        uint8_t    *grown;
+
+        if (kind == H5VL_STREAM_VL_SEQ) {
+            const hvl_t *v = &((const hvl_t *)buf)[i];
+
+            if (v->p) {
+                src    = v->p;
+                nbytes = v->len * base_size;
+            }
+        }
+        else {
+            const char *s = ((const char *const *)buf)[i];
+
+            if (s) {
+                src    = s;
+                nbytes = strlen(s);
+            }
+        }
+
+        tag = src ? (uint64_t)nbytes + 1 : 0;
+
+        if (NULL == (grown = (uint8_t *)realloc(acc, acc_len + sizeof(tag) + nbytes))) {
+            free(acc);
+            return -1;
+        }
+        acc = grown;
+        memcpy(acc + acc_len, &tag, sizeof(tag));
+        acc_len += sizeof(tag);
+        if (nbytes > 0) {
+            memcpy(acc + acc_len, src, nbytes);
+            acc_len += nbytes;
+        }
+    }
+
+    *out_buf = acc;
+    *out_len = acc_len;
+    return 0;
+} /* end H5VL__stream_vl_serialize() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_vl_deserialize
+ *
+ * Purpose:     Rebuild a real, writable VL buffer from what
+ *              H5VL__stream_vl_serialize() produced, so replay can hand it
+ *              to H5VLdataset_write()/H5VLattr_write(). Every element's
+ *              bytes get a fresh allocation this connector owns; HDF5
+ *              copies them during the write, so H5VL__stream_vl_free()
+ *              releases them immediately afterwards rather than leaving
+ *              them for H5Treclaim() (which is the *application's* contract
+ *              for buffers it supplied, not this one).
+ *
+ *              VL strings are NUL-terminated on reconstruction -- the wire
+ *              form carries an explicit length rather than relying on the
+ *              terminator, but H5Dwrite() of a VL string still expects real
+ *              C strings.
+ *
+ * Return:      0 on success (*out_buf malloc'd; release with
+ *              H5VL__stream_vl_free()), -1 otherwise
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_vl_deserialize(const uint8_t *bytes, size_t len, size_t count, hid_t type_id, int kind,
+                            void **out_buf)
+{
+    const uint8_t *p         = bytes;
+    const uint8_t *end       = bytes + len;
+    void          *arr       = NULL;
+    size_t         base_size = 0;
+    size_t         i         = 0;
+
+    if (!bytes || !out_buf || kind == H5VL_STREAM_VL_NONE)
+        return -1;
+
+    if (kind == H5VL_STREAM_VL_SEQ) {
+        hid_t base = H5Tget_super(type_id);
+
+        if (base < 0)
+            return -1;
+        base_size = H5Tget_size(base);
+        H5Tclose(base);
+        if (base_size == 0)
+            return -1;
+    }
+
+    if (NULL ==
+        (arr = calloc(count ? count : 1, kind == H5VL_STREAM_VL_SEQ ? sizeof(hvl_t) : sizeof(char *))))
+        return -1;
+
+    for (; i < count; i++) {
+        uint64_t tag;
+        size_t   nbytes;
+
+        if ((size_t)(end - p) < sizeof(tag))
+            goto error;
+        memcpy(&tag, p, sizeof(tag));
+        p += sizeof(tag);
+
+        if (tag == 0) /* NULL pointer -- calloc already left it that way */
+            continue;
+
+        nbytes = (size_t)(tag - 1);
+        if ((size_t)(end - p) < nbytes)
+            goto error;
+
+        if (kind == H5VL_STREAM_VL_SEQ) {
+            hvl_t *v = &((hvl_t *)arr)[i];
+
+            if (NULL == (v->p = malloc(nbytes ? nbytes : 1)))
+                goto error;
+            memcpy(v->p, p, nbytes);
+            v->len = nbytes / base_size;
+        }
+        else {
+            char **s = &((char **)arr)[i];
+
+            if (NULL == (*s = (char *)malloc(nbytes + 1)))
+                goto error;
+            memcpy(*s, p, nbytes);
+            (*s)[nbytes] = '\0';
+        }
+        p += nbytes;
+    }
+
+    *out_buf = arr;
+    return 0;
+
+error:
+    /* Release only what was built so far. */
+    while (i-- > 0) {
+        if (kind == H5VL_STREAM_VL_SEQ)
+            free(((hvl_t *)arr)[i].p);
+        else
+            free(((char **)arr)[i]);
+    }
+    free(arr);
+    return -1;
+} /* end H5VL__stream_vl_deserialize() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_vl_free
+ *
+ * Purpose:     Release a buffer H5VL__stream_vl_deserialize() built,
+ *              including each element's own allocation. Safe on NULL.
+ *-------------------------------------------------------------------------
+ */
+static void
+H5VL__stream_vl_free(void *buf, size_t count, int kind)
+{
+    size_t i;
+
+    if (!buf)
+        return;
+    for (i = 0; i < count; i++) {
+        if (kind == H5VL_STREAM_VL_SEQ)
+            free(((hvl_t *)buf)[i].p);
+        else
+            free(((char **)buf)[i]);
+    }
+    free(buf);
+} /* end H5VL__stream_vl_free() */
 
 /*-------------------------------------------------------------------------
  * H5Tencode/H5Sencode2/H5Pencode2 all use a two-call size-then-fill idiom,
@@ -3484,8 +3760,34 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
 
                 {
                     const void *payload_ptr = payload_buf + poff;
-                    herr_t      w = H5VLdataset_write(1, &real, file_obj->under_vol_id, &dtype, &mem_space,
-                                                      &dspace, H5P_DATASET_XFER_DEFAULT, &payload_ptr, NULL);
+                    int         vl_kind     = H5VL__stream_type_vl_kind(dtype);
+                    void       *vl_buf      = NULL;
+                    herr_t      w;
+
+                    /* A VL entry's payload is the deep-serialized form (see
+                     * H5VL__stream_vl_serialize()), not writable elements --
+                     * rebuild real hvl_t/char* values pointing at fresh
+                     * allocations before handing it to the under connector. */
+                    if (vl_kind != H5VL_STREAM_VL_NONE) {
+                        if (H5VL__stream_vl_deserialize(payload_buf + poff, (size_t)plen, (size_t)n_elem,
+                                                        dtype, vl_kind, &vl_buf) < 0) {
+                            H5Sclose(mem_space);
+                            H5Tclose(dtype);
+                            H5Sclose(dspace);
+                            ret_value = -1;
+                            goto done;
+                        }
+                        payload_ptr = vl_buf;
+                    }
+
+                    w = H5VLdataset_write(1, &real, file_obj->under_vol_id, &dtype, &mem_space, &dspace,
+                                          H5P_DATASET_XFER_DEFAULT, &payload_ptr, NULL);
+
+                    /* The write has copied whatever it needed, so these
+                     * allocations are this connector's to release now. */
+                    if (vl_buf)
+                        H5VL__stream_vl_free(vl_buf, (size_t)n_elem, vl_kind);
+
                     H5Sclose(mem_space);
                     if (w < 0) {
                         H5Tclose(dtype);
@@ -3676,9 +3978,34 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
 
                 if (plen > 0) {
                     const void *payload_ptr = payload_buf + poff;
+                    int         vl_kind     = H5VL__stream_type_vl_kind(dtype);
+                    void       *vl_buf      = NULL;
+                    hssize_t    a_nelem     = H5Sget_select_npoints(dspace);
+                    herr_t      aw;
 
-                    if (H5VLattr_write(attr, file_obj->under_vol_id, dtype, payload_ptr,
-                                       H5P_DATASET_XFER_DEFAULT, NULL) < 0) {
+                    /* Same as the DsetWrite path: a VL entry's payload is the
+                     * deep-serialized form, not writable elements. */
+                    if (vl_kind != H5VL_STREAM_VL_NONE && a_nelem > 0) {
+                        if (H5VL__stream_vl_deserialize(payload_buf + poff, (size_t)plen, (size_t)a_nelem,
+                                                        dtype, vl_kind, &vl_buf) < 0) {
+                            H5VLattr_close(attr, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+                            H5Tclose(dtype);
+                            H5Sclose(dspace);
+                            if (ddcpl >= 0)
+                                H5Pclose(ddcpl);
+                            ret_value = -1;
+                            goto done;
+                        }
+                        payload_ptr = vl_buf;
+                    }
+
+                    aw = H5VLattr_write(attr, file_obj->under_vol_id, dtype, payload_ptr,
+                                        H5P_DATASET_XFER_DEFAULT, NULL);
+
+                    if (vl_buf)
+                        H5VL__stream_vl_free(vl_buf, (size_t)a_nelem, vl_kind);
+
+                    if (aw < 0) {
                         H5VLattr_close(attr, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
                         H5Tclose(dtype);
                         H5Sclose(dspace);
@@ -5802,23 +6129,33 @@ H5VL_stream_attr_write(void *attr, hid_t mem_type_id, const void *buf, hid_t dxp
         H5VL_stream_pending_entry_t *e = &o->file_state->pending[o->pending_index];
         hssize_t                      n_elem;
         size_t                        nbytes;
+        int                           vl_kind;
 
         if ((n_elem = H5Sget_select_npoints(e->space_id)) < 0)
             return -1;
 
         /* See H5VL__stream_type_unsafe_to_capture()'s comment: reject a
-         * VL/reference-typed attribute rather than memcpy-ing pointers that
-         * are only valid in this process. */
+         * buffer that is not self-contained rather than memcpy-ing pointers
+         * only valid in this process. Top-level VL is exempt there because
+         * it is deep-serialized just below, exactly as on the dataset path. */
         if (H5VL__stream_type_unsafe_to_capture(e->type_id) != 0)
             return -1;
 
-        nbytes = (size_t)n_elem * H5Tget_size(e->type_id);
+        vl_kind = H5VL__stream_type_vl_kind(e->type_id);
+        nbytes  = (size_t)n_elem * H5Tget_size(e->type_id);
 
         free(e->payload);
         e->payload     = NULL;
         e->payload_len = 0;
 
-        if (nbytes > 0) {
+        if (n_elem > 0 && vl_kind != H5VL_STREAM_VL_NONE) {
+            /* Follow the pointers now, while the caller's buffer is alive --
+             * see H5VL__stream_vl_serialize(). */
+            if (H5VL__stream_vl_serialize(buf, (size_t)n_elem, e->type_id, vl_kind, &e->payload,
+                                          &e->payload_len) < 0)
+                return -1;
+        }
+        else if (nbytes > 0) {
             if (NULL == (e->payload = (uint8_t *)malloc(nbytes)))
                 return -1;
             memcpy(e->payload, buf, nbytes);
@@ -6253,6 +6590,7 @@ H5VL_stream_dataset_write(size_t count, void *dset[], hid_t mem_type_id[], hid_t
             hid_t                         resolved_fspace = H5VL__stream_resolve_space(file_space_id[i], create_entry->space_id);
             hssize_t                      n_elem;
             H5VL_stream_pending_entry_t   write_entry;
+            int                           vl_kind;
 
             if ((n_elem = H5Sget_select_npoints(resolved_fspace)) < 0)
                 return -1;
@@ -6270,15 +6608,28 @@ H5VL_stream_dataset_write(size_t count, void *dset[], hid_t mem_type_id[], hid_t
             }
 
             /* See H5VL__stream_type_unsafe_to_capture()'s comment: a raw
-             * memcpy of a VL/reference buffer captures pointers that are
-             * only valid in this process, not portable bytes -- reject
-             * rather than silently corrupt on replay. */
+             * memcpy of a buffer that is not self-contained captures
+             * pointers only valid in this process, not portable bytes --
+             * reject rather than silently corrupt on replay. Top-level VL
+             * shapes are exempt because they are deep-serialized just below
+             * instead of memcpy'd. */
             if (H5VL__stream_type_unsafe_to_capture(write_entry.type_id) != 0) {
                 H5VL__stream_pending_entry_clear(&write_entry);
                 return -1;
             }
 
-            if (n_elem > 0) {
+            vl_kind = H5VL__stream_type_vl_kind(write_entry.type_id);
+
+            if (n_elem > 0 && vl_kind != H5VL_STREAM_VL_NONE) {
+                /* Not self-contained bytes -- follow the pointers now, while
+                 * the application's buffer is still alive. */
+                if (H5VL__stream_vl_serialize(buf[i], (size_t)n_elem, write_entry.type_id, vl_kind,
+                                              &write_entry.payload, &write_entry.payload_len) < 0) {
+                    H5VL__stream_pending_entry_clear(&write_entry);
+                    return -1;
+                }
+            }
+            else if (n_elem > 0) {
                 size_t elem_size = H5Tget_size(write_entry.type_id);
                 size_t nbytes    = (size_t)n_elem * elem_size;
 
