@@ -702,6 +702,18 @@ came out holding the right logical names, and nothing else regressed — but
 carrying a NULL `shared`. So the fault was never the re-entrancy attempt 1
 found; it was something about translation itself.
 
+*Attempt 2's crash, root-caused afterwards (M8.5.1 turned it up).* Its replay
+half called `H5VLwrap_register(file_under_object, H5I_FILE)` to get an
+`hid_t` for `H5Rcreate_object()`, then `H5Idec_ref()` to release it. That id
+**owns** the object it wraps, so releasing it closed the underlying file
+itself — which is exactly the `f->shared == NULL` seen at the next
+`ensure_group()`. Nothing to do with translation, or with a reference
+entry's payload being shorter than `n_elem × H5Tget_size()`. Worth stating
+plainly because the same trap bit the M8.5.1 fast path independently: to
+reach an under-VOL object from inside a callback, do not take an `hid_t` at
+all — use the connector's own optional operations, which take the object
+directly.
+
 *What actually unblocked it: don't translate at all.* A raw memcpy diagnostic
 — accept the write, copy the bytes verbatim, exactly like any other
 fixed-size type — round-tripped correctly on the first try. The "unsafe"
