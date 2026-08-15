@@ -61,6 +61,24 @@ Two are real:
   the native library, not an arbitrary connector, so the free auto-`end_step` is
   off the table. Applications call `end_step` explicitly, as they do with ADIOS2.
 
+**Measured limit on the byte-identity promise (2026-08-14).** "Unbracketed
+writes remain a pure pass-through, identical to native HDF5" holds only when
+no transport is configured. With `VOL_STREAM_NA` set — either `na+sm` or
+`ofi+tcp`, so this is not transport-specific — an unbracketed write produces
+a file with the *same objects and the same data* but a different internal
+allocation: 2995 bytes against native's 2816 in `t_step`'s own reference
+case, the difference showing up as the superblock's end-of-file address.
+`h5ls`/`h5dump` show no extra objects or attributes, so nothing is being
+added to the logical file; the allocator simply takes a different path.
+
+Found by running `t_step` under `VOL_STREAM_NA`, which nothing had done
+before — every test that sets it is a transport test, and every test that
+checks byte identity ran without one, so the two had never met. Worth stating
+because the promise as written carries no qualification, and a reader would
+reasonably expect it to hold for a transport-enabled writer too. In practice
+a streaming writer is not the configuration anyone byte-compares, so this is
+documented rather than fixed.
+
 ## The five decisions
 
 ### 1. Is a step file-wide, or does each group get its own cadence?

@@ -326,12 +326,24 @@ jobs:
       # Reporting it does not: a regression that broke ofi+tcp outright would
       # still be plainly visible in the log, which is the coverage actually
       # wanted here. Revisit if the residual is ever fixed upstream.
+      # Scoped to the transport tests on purpose. VOL_STREAM_NA turns the
+      # transport on for *every* file the connector opens, so running the
+      # whole suite under it also forces one onto tests that are not about
+      # the transport at all -- and t_step's M0/M1 gate then fails, because
+      # a transport-enabled writer's file is not byte-identical to native
+      # (same objects and same data, but ~179 bytes of different internal
+      # allocation). That is a real and previously undocumented limit of the
+      # byte-identity promise rather than an ofi+tcp problem -- na+sm
+      # perturbs it identically -- so it is written up in dev-plan.md, not
+      # papered over here. Either way it is noise in this step, which exists
+      # to exercise libfabric.
       - name: Test over ofi+tcp (non-blocking -- see comment)
         continue-on-error: true
         run: |
           VOL_STREAM_NA=ofi+tcp \
           LD_LIBRARY_PATH=$HOME/mochi-install/lib:$HOME/mochi-install/lib64:$LD_LIBRARY_PATH \
-            ctest --test-dir build --output-on-failure
+            ctest --test-dir build --output-on-failure \
+              -R 'transport|rendezvous|queue_policy|subscribe|precision$|chunk_zerocopy|subvolume_nd|strided_write'
 
   # ---------------------------------------------------------------------------
   # Sanitizers. A background progress thread plus a step queue is the classic
