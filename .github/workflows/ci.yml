@@ -90,7 +90,8 @@ jobs:
             -DHDF5_BUILD_TOOLS=ON \
             -DHDF5_BUILD_EXAMPLES=OFF \
             -DHDF5_BUILD_FORTRAN=OFF \
-            -DHDF5_BUILD_CPP_LIB=OFF
+            -DHDF5_BUILD_CPP_LIB=OFF \
+            -DHDF5_ENABLE_ZLIB_SUPPORT=ON
           cmake --build hdf5-build --parallel
           cmake --install hdf5-build
 
@@ -356,7 +357,8 @@ jobs:
             -DHDF5_BUILD_TOOLS=ON \
             -DHDF5_BUILD_EXAMPLES=OFF \
             -DHDF5_BUILD_FORTRAN=OFF \
-            -DHDF5_BUILD_CPP_LIB=OFF
+            -DHDF5_BUILD_CPP_LIB=OFF \
+            -DHDF5_ENABLE_ZLIB_SUPPORT=ON
           cmake --build hdf5-build --parallel
           cmake --install hdf5-build
 

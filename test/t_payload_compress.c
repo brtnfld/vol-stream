@@ -47,12 +47,21 @@ main(void)
 
     printf("vol-stream: step payload staging is compressed\n");
 
-    /* Without deflate there is nothing to assert -- the connector correctly
-     * falls back to an uncompressed payload, which is not a failure. */
+    /* Skip, do not fail, without deflate. Payload compression is explicitly
+     * best-effort: the connector falls back to an uncompressed payload when
+     * the filter is unavailable, so a zlib-less HDF5 is a *supported*
+     * configuration and there is simply nothing here to assert.
+     *
+     * This differs from test/t_precision.c, which does fail without deflate
+     * -- there the filter is the feature under test, not an optional
+     * optimization of it. (Getting that distinction wrong is what turned
+     * this test red on every CI job that builds HDF5 without zlib, since
+     * HDF5_ENABLE_ZLIB_SUPPORT defaults to OFF.) */
     if (H5Zfilter_avail(H5Z_FILTER_DEFLATE) <= 0) {
-        printf("  FAIL  this HDF5 has no deflate filter -- rebuild it with "
-               "-DHDF5_ENABLE_ZLIB_SUPPORT=ON (it defaults to OFF)\n");
-        return 1;
+        printf("  skip  this HDF5 has no deflate filter, so the payload is "
+               "legitimately stored uncompressed -- nothing to check\n");
+        printf("\nall checks passed (skipped)\n");
+        return 0;
     }
 
     if ((vol_id = H5VL_stream_register()) < 0) {
