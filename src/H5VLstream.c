@@ -4348,12 +4348,45 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
         {
             hsize_t dims[1] = {(hsize_t)payload_len};
             hid_t   space   = H5Screate_simple(1, dims, NULL);
+            hid_t   pdcpl   = H5P_DATASET_CREATE_DEFAULT;
             void   *pds;
 
             H5Tset_tag(opaque_type, "vol-stream payload v1 (raw bytes, offsets in .manifest)");
             snprintf(name, sizeof(name), ".payload");
+
+            /* Compress the staging payload. It holds the step's raw bytes,
+             * and for a filtered dataset those are also written -- filtered
+             * -- into the real object right beside it, so the step group
+             * ends up storing the same data twice at very different cost.
+             * Measured on a 2000-int GZIP dataset: the real object allocated
+             * 48 bytes while .payload allocated the full 8000, making the
+             * staging copy 167x the size of the data it stages.
+             *
+             * Deflating it here is generic (it applies to every step, not
+             * only filtered datasets) and needs no format change: .payload
+             * is an opaque byte array this connector both writes and reads,
+             * so HDF5 transparently inflates it on the way back out and
+             * H5VL__stream_reader_index_one_step() is unaffected.
+             *
+             * Entirely best-effort: without deflate available, or if any of
+             * the property-list calls fail, this falls back to the previous
+             * uncompressed layout rather than failing the commit. A single
+             * whole-payload chunk keeps the reader's one-shot full read a
+             * single chunk read. */
+            if (payload_len > 0 && H5Zfilter_avail(H5Z_FILTER_DEFLATE) > 0) {
+                hid_t c = H5Pcreate(H5P_DATASET_CREATE);
+
+                if (c >= 0) {
+                    if (H5Pset_chunk(c, 1, dims) < 0 || H5Pset_deflate(c, 1) < 0) {
+                        H5Pclose(c);
+                    }
+                    else
+                        pdcpl = c;
+                }
+            }
+
             pds = H5VLdataset_create(step_group, &loc_params, file_obj->under_vol_id, name,
-                                     H5P_LINK_CREATE_DEFAULT, opaque_type, space, H5P_DATASET_CREATE_DEFAULT,
+                                     H5P_LINK_CREATE_DEFAULT, opaque_type, space, pdcpl,
                                      H5P_DATASET_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL);
             if (pds) {
                 if (payload_len > 0) {
@@ -4363,6 +4396,8 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                 }
                 H5VLdataset_close(pds, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
             }
+            if (pdcpl != H5P_DATASET_CREATE_DEFAULT)
+                H5Pclose(pdcpl);
             H5Sclose(space);
         }
 

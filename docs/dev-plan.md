@@ -252,6 +252,31 @@ pipeline) fails if it silently falls through, and `test/t_precision.c`
 (deliberately mismatched pipeline) continues to exercise the temporary-
 dataset route.
 
+**Step payload staging is compressed (2026-08-14).** Measuring before
+building `FilteredChunks` turned up a bigger and much cheaper win. Every step
+writes its raw bytes to `/step/<n>/.payload` and then replays the real
+objects beside it, so the same data is stored twice — and for a filtered
+dataset the two costs are nothing alike. On a 2000-int GZIP dataset the real
+object allocated **48** bytes while `.payload` allocated the full **8000**:
+the staging copy was 167x the size of the data it staged, and dominated the
+file.
+
+`.payload` is an opaque byte array this connector both writes and reads, so
+deflating it needs no format change and no reader change — HDF5 inflates it
+transparently. It now allocates **83 bytes instead of 8000** for that same
+step, and the win is generic (every step, not only filtered datasets) rather
+than confined to the case `FilteredChunks` would have addressed. Best-effort
+throughout: no deflate available, or any property-list call failing, falls
+back to the previous uncompressed layout rather than failing the commit.
+`test/t_payload_compress.c` asserts it, because no behavioral test can —
+compression is invisible to correctness checks, so a regression that dropped
+it would leave the whole suite green while the file quietly grew back.
+
+That measurement also changes the case for `FilteredChunks`: the duplication
+it was meant to attack is now largely gone, and what remains of its value is
+the CPU saved by not re-filtering at replay — which the M8.5.1 zero-copy path
+already captures for the transport side.
+
 Still not built: `FilteredChunks` as an actual payload form in the manifest,
 and chunk-grid-aware routing of a subscriber's N-D selection (subscription
 routing remains 1-D element-range intersection). Both remain M2-scale, and
