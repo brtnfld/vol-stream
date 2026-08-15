@@ -10,7 +10,11 @@
  * subscriber()'s comment in src/H5VLstream.c and vs_tr_refilter_fn's in
  * tr_mercury.h.
  *
- * Two OS processes, na+sm, same shape as test/t_subscribe.c.
+ * Two OS processes, na+sm, same shape as test/t_subscribe.c -- the CI-gating
+ * exit gate, rock solid. test/t_precision_dual.c is its companion: the exit
+ * gate met *literally* ("two subscribers... at different precisions from a
+ * single end_step"), three processes, real and working, but not wired into
+ * the default ctest run -- see that file's own top comment for why.
  *
  *   1. The writer creates/writes "/precise" (NELEM ints, a highly
  *      compressible constant-value pattern) with a plain, unfiltered DCPL

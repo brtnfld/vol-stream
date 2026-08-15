@@ -419,6 +419,19 @@ vs_reader_ack_ult(hg_handle_t handle)
 
     out.status = -1;
 
+    /* Writer-only, for exactly the reason spelled out in vs_subscribe_ult()
+     * below: vs_tr_reader_ack_step() uses the same probe-until-status-0 idiom
+     * to locate the writer, so a reader answering 0 here would swallow
+     * another reader's ack into its own (never-consulted) lag_table. The
+     * writer's min_acked_step would then never see that reader, silently
+     * under-reporting how far behind the group is -- M7 queue-policy
+     * backpressure applied against an incomplete view. */
+    if (tr && !tr->is_writer) {
+        margo_respond(handle, &out);
+        margo_destroy(handle);
+        return;
+    }
+
     if (tr && HG_SUCCESS == margo_get_input(handle, &in)) {
         size_t i;
 
@@ -496,6 +509,24 @@ vs_subscribe_ult(hg_handle_t handle)
     vs_subscribe_out_t   out;
 
     out.status = -1;
+
+    /* Only the writer may accept a subscription. Every process in the group
+     * registers this handler (Margo registers the full RPC set on both
+     * roles -- see vs_tr_start()), and vs_tr_reader_subscribe() finds "the
+     * writer" by probing members until one answers status 0. Answering 0
+     * from a reader therefore makes a *second* reader mistake the *first*
+     * reader for the writer and file its subscription in that reader's
+     * sub_table, where nothing ever consults it -- the subscriber then
+     * silently receives no data at all. Invisible with a single reader
+     * (its only non-self member is the real writer); ~50/50 with two, since
+     * it depends on group member ordering. vs_get_current_step_ult() is
+     * immune for a different reason: a reader has no has_last_step and so
+     * naturally answers -1. */
+    if (tr && !tr->is_writer) {
+        margo_respond(handle, &out);
+        margo_destroy(handle);
+        return;
+    }
 
     if (tr && HG_SUCCESS == margo_get_input(handle, &in) && in.path) {
         size_t i;
@@ -690,6 +721,25 @@ vs_tr_stop(vs_tr_t *tr)
         else
             ssg_group_leave(tr->group_id);
         tr->group_id = SSG_GROUP_ID_INVALID;
+
+        /* Settle window before tearing down SSG's own runtime state below.
+         * This mirrors mochi-ssg's own tests/ssg-join-leave-group.c, which
+         * deliberately sleeps between leave/destroy and finalize -- not
+         * cosmetic. A peer with a SWIM ping already in flight *to* this
+         * member (sent just before our leave/destroy gossiped out) still
+         * lands here and gets dispatched to swim_dping_req_recv_ult(),
+         * which asserts SSG's global runtime pointer is non-NULL --
+         * exactly what ssg_finalize() below sets to NULL. Without giving
+         * peers time to actually process our departure first, that
+         * dispatch can race ssg_finalize() and crash the process with
+         * "swim_dping_req_recv_ult: Assertion `ssg_rt' failed" -- root
+         * caused (not guessed) via a real stress-test crash and reading
+         * mochi-ssg's swim-fd-ping.c. This was a real usage gap on our
+         * side, not purely a third-party bug: one swim-suspect-timeout
+         * window's worth of margin (matches the writer's own
+         * swim_period_length_ms=200 / swim_suspect_timeout_periods=3
+         * group config below) gives that gossip time to land. */
+        usleep(750000);
     }
 
     ssg_finalize();

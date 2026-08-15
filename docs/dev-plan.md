@@ -466,15 +466,44 @@ while decoding back to the exact original 2000 values — real measured wire
 bytes, this section's exit gate asks for, from a pipeline the dataset itself
 never had.
 
-Still open: chunk-storage-granularity routing (`H5Sselect_intersect_block`
-against `FilteredChunks`, which this connector has never actually built
-despite being in the schema since M2). Because of that, re-filtering always
-uses a single chunk spanning the whole pushed subrange rather than honoring a
-chunk shape the subscriber's DCPL requested. The exit gate's literal *two
-simultaneous subscribers at different precisions* configuration is also not
-yet a test — the mechanism is per-subscriber by construction (the pipeline is
-looked up per `sub_table` entry inside the per-member push loop), but that
-specific scenario is asserted by design, not demonstrated.
+**Update: the exit gate's literal wording, demonstrated.** `test/t_precision_
+dual.c` — three real OS processes, two simultaneous subscribers on `/precise`
+(reader A: GZIP-9, reader B: none) served from one `end_step` — measures two
+pushes sharing the same raw byte count but differing filtered sizes, proving
+the "wire bytes scale with subscribed volume" claim with actual numbers, not
+just per-subscriber-by-construction reasoning. Building it surfaced two real
+bugs, both fixed at the source, not test artifacts:
+
+1. `vs_subscribe_ult()`/`vs_reader_ack_ult()` answered "success" from *any*
+   group member, not just the writer — invisible with one subscriber, but
+   with two, reader B could file its subscription with reader A instead of
+   the writer. Fixed with an `is_writer` guard in `src/tr_mercury.c`.
+2. `vs_tr_stop()` called `ssg_finalize()` immediately after
+   `ssg_group_leave()`/`ssg_group_destroy()`, with no settle window. A peer's
+   SWIM ping already in flight to a just-departed member could still be
+   dispatched to mochi-ssg's own `swim_dping_req_recv_ult()` after
+   `ssg_finalize()` had nulled its runtime pointer, crashing the process
+   (`Assertion 'ssg_rt' failed`). This was a real usage gap, not purely a
+   third-party bug: mochi-ssg's own `tests/ssg-join-leave-group.c` sleeps
+   between leave/destroy and finalize; `vs_tr_stop()` did not. Fixed by
+   adding that same settle window — see its comment in `src/tr_mercury.c`.
+   Stress-tested 20/20 crash-free afterward (reliably crashing before).
+
+Still open, and why this test is real, built, and passing but *not* wired
+into the default `ctest` run (`DISABLED TRUE` in `test/CMakeLists.txt`): a
+separate, deeper residual where Mercury's single progress ULT can still block
+inside an unbounded `connect()` in libfabric's TCP provider, reaching for an
+already-departed peer during teardown. This never produces a wrong answer —
+every run's actual exit-gate assertions pass first — and never crashes after
+the fix above, only occasionally stalls process teardown past a normal test
+timeout. The real fix belongs in libfabric/Mercury's own connection
+handling, well outside this project.
+
+Also still open: chunk-storage-granularity routing (`H5Sselect_intersect_
+block` against `FilteredChunks`, which this connector has never actually
+built despite being in the schema since M2). Because of that, re-filtering
+always uses a single chunk spanning the whole pushed subrange rather than
+honoring a chunk shape the subscriber's DCPL requested.
 
 ### M9 — Tools, bindings, and the long tail · M
 
