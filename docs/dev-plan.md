@@ -631,9 +631,31 @@ logical path (step prefix stripped) so a reader rebuilds against its own
 layout. And the same-step case is a real architectural limitation, not an
 oversight — it needs either a documented "targets must come from an earlier
 step" rule, or deferred reference resolution during `COMMITTING`, after
-objects materialize but before the manifest closes. Until one of those is
-built, `H5VL__stream_type_unsafe_to_capture()` rejecting references outright
-remains the correct interim behavior.
+objects materialize but before the manifest closes.
+
+**Status: path translation has landed; capture/replay has not.**
+`H5VL__stream_resolve_physical_path()`, writer-side `path_index` population,
+and the `H5VL_OBJECT_LOOKUP` translation branch are in, so
+`H5Rcreate_object(fid, "/target")` now works with the logical path
+(`test/t_ref_path.c`, which also asserts that a same-step target is still
+refused — the documented "earlier step" rule above). Capturing a dataset
+*of* references and replaying it is still not supported, so
+`H5VL__stream_type_unsafe_to_capture()` continues to reject reference-typed
+writes.
+
+The obstacle there is worth recording, because the obvious implementation
+does not work. Translating at capture by calling `H5Rget_obj_name()` inside
+the `dataset_write` callback crashes (`H5G_rootof: Assertion 'f->shared'
+failed`): resolving a reference makes HDF5 re-open the file named inside it,
+which re-enters this connector and builds then tears down a second file
+state over the same native file, invalidating the replay already in
+progress. Isolated with probe programs — the identical call at application
+level, followed by a create and an `end_step` replay, is fine; only the
+call from *within* a VOL callback breaks. The route that avoids re-entering
+HDF5 entirely: the connector already sees the target's logical path at
+`H5Rcreate_object()` time, as the name arriving in the `H5VL_OBJECT_LOOKUP`
+branch. Caching token → logical path there, and consulting that map at
+capture, needs no callback into the library at all.
 
 **The dependency risk is quality, not quantity.** Criteria before adding
 anything: actively maintained, deployed at target facilities, Spack-installable,
