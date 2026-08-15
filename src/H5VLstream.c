@@ -1555,31 +1555,13 @@ H5VL__stream_resolve_space(hid_t space_id, hid_t fallback_space_id)
 } /* end H5VL__stream_resolve_space() */
 
 /*-------------------------------------------------------------------------
- * Function:    H5VL__stream_type_unsafe_to_capture
+ * Function:    H5VL__stream_type_unsafe_to_capture_1
  *
- * Purpose:     A DsetWrite/Attr capture memcpy()s whatever buffer the
- *              caller handed H5Dwrite()/H5Awrite() straight into the
- *              pending entry's payload, replayed later via a *different*
- *              H5VLdataset_write()/H5VLattr_write() call once end_step()
- *              runs. That is only correct for buffers whose bytes are
- *              self-contained. Variable-length types (H5T_VLEN, and
- *              variable-length strings, H5Tis_variable_str()) violate that:
- *              the buffer is an array of {len, pointer} structs whose
- *              pointers are only valid in the caller's own process memory,
- *              not portable bytes -- capturing them verbatim and replaying
- *              later reads through a pointer that may already be stale (the
- *              caller is free to reclaim it, H5Treclaim(), the moment
- *              H5Dwrite() returns). H5T_REFERENCE has the same problem for
- *              a different reason: an H5R_ref_t's bytes are only meaningful
- *              resolved against the file/object that created it, and this
- *              connector has no name-translation step for references (see
- *              docs/dev-plan.md's Decision #4 and residual-risks section --
- *              designed, never implemented).
- *
- *              Until real deep-serialization (VL) and name-translation
- *              (references) capture paths exist, both must be rejected
- *              here with a clear error rather than silently captured and
- *              corrupted on replay.
+ * Purpose:     Recursive worker for H5VL__stream_type_unsafe_to_capture().
+ *              top_level distinguishes type_id itself from a type_id
+ *              reached by recursing into a compound member or array base
+ *              type -- see that function's comment for why a top-level
+ *              H5T_REFERENCE is exempted here but a nested one is not.
  *
  * Return:      Success:    TRUE/FALSE -- whether type_id (or a member of it,
  *                          for compound/array types) is unsafe to capture
@@ -1587,14 +1569,16 @@ H5VL__stream_resolve_space(hid_t space_id, hid_t fallback_space_id)
  *-------------------------------------------------------------------------
  */
 static htri_t
-H5VL__stream_type_unsafe_to_capture(hid_t type_id)
+H5VL__stream_type_unsafe_to_capture_1(hid_t type_id, bool top_level)
 {
     H5T_class_t cls = H5Tget_class(type_id);
 
     if (cls == H5T_NO_CLASS)
         return -1;
-    if (cls == H5T_VLEN || cls == H5T_REFERENCE)
+    if (cls == H5T_VLEN)
         return 1;
+    if (cls == H5T_REFERENCE)
+        return top_level ? 0 : 1;
     if (cls == H5T_STRING) {
         htri_t is_vl = H5Tis_variable_str(type_id);
         return is_vl;
@@ -1611,7 +1595,7 @@ H5VL__stream_type_unsafe_to_capture(hid_t type_id)
 
             if (member_type < 0)
                 return -1;
-            unsafe = H5VL__stream_type_unsafe_to_capture(member_type);
+            unsafe = H5VL__stream_type_unsafe_to_capture_1(member_type, false);
             H5Tclose(member_type);
             if (unsafe != 0)
                 return unsafe;
@@ -1624,11 +1608,68 @@ H5VL__stream_type_unsafe_to_capture(hid_t type_id)
 
         if (base_type < 0)
             return -1;
-        unsafe = H5VL__stream_type_unsafe_to_capture(base_type);
+        unsafe = H5VL__stream_type_unsafe_to_capture_1(base_type, false);
         H5Tclose(base_type);
         return unsafe;
     }
     return 0;
+} /* end H5VL__stream_type_unsafe_to_capture_1() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_type_unsafe_to_capture
+ *
+ * Purpose:     A DsetWrite/Attr capture memcpy()s whatever buffer the
+ *              caller handed H5Dwrite()/H5Awrite() straight into the
+ *              pending entry's payload, replayed later via a *different*
+ *              H5VLdataset_write()/H5VLattr_write() call once end_step()
+ *              runs. That is only correct for buffers whose bytes are
+ *              self-contained. Variable-length types (H5T_VLEN, and
+ *              variable-length strings, H5Tis_variable_str()) violate that:
+ *              the buffer is an array of {len, pointer} structs whose
+ *              pointers are only valid in the caller's own process memory,
+ *              not portable bytes -- capturing them verbatim and replaying
+ *              later reads through a pointer that may already be stale (the
+ *              caller is free to reclaim it, H5Treclaim(), the moment
+ *              H5Dwrite() returns).
+ *
+ *              H5T_REFERENCE at the TOP level (a plain reference or array of
+ *              references, not one buried inside a compound) is NOT rejected
+ *              here, unlike earlier in this project's history. Measured
+ *              directly (three probe programs, not inferred): a new-style
+ *              H5R_ref_t created against an object in *this same file*
+ *              (H5R_OBJECT2/H5R_DATASET_REGION2/H5R_ATTR -- the only kind
+ *              reachable through this connector's own API, since
+ *              H5Rcreate_object() takes a loc_id and constructs a reference
+ *              relative to loc_id's own file; there is no way to name a
+ *              genuinely foreign file without a loc_id in THAT file, which
+ *              would not route through this connector's object_specific()
+ *              at all) carries a NULL cached filename pointer -- inspected
+ *              directly at the byte level against H5Rpkg.h's private
+ *              H5R_ref_priv_obj_t layout. There is no heap pointer to
+ *              dangle, so an ordinary memcpy is exactly as safe as for any
+ *              other fixed-size scalar type, and end-to-end replay of a
+ *              raw-captured reference dataset was verified to resolve to
+ *              the correct target. A prior attempt at a separate
+ *              name-translation capture path (call H5Rget_obj_name() from
+ *              inside dataset_write, or cache token -> logical path at
+ *              H5Rcreate_object() time and translate at capture) is not
+ *              what is running here -- both were built, both hit the same
+ *              crash during end_step()'s replay, and both were abandoned;
+ *              see docs/dev-plan.md's reference-support section for the
+ *              full account. A reference nested inside a compound or array
+ *              still IS rejected: translating one at some byte offset inside
+ *              a struct would mean rewriting the buffer member by member,
+ *              which nothing here does.
+ *
+ * Return:      Success:    TRUE/FALSE -- whether type_id (or a member of it,
+ *                          for compound/array types) is unsafe to capture
+ *              Failure:    -1 (an H5T call itself failed)
+ *-------------------------------------------------------------------------
+ */
+static htri_t
+H5VL__stream_type_unsafe_to_capture(hid_t type_id)
+{
+    return H5VL__stream_type_unsafe_to_capture_1(type_id, true);
 } /* end H5VL__stream_type_unsafe_to_capture() */
 
 /*-------------------------------------------------------------------------

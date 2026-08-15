@@ -633,18 +633,19 @@ oversight — it needs either a documented "targets must come from an earlier
 step" rule, or deferred reference resolution during `COMMITTING`, after
 objects materialize but before the manifest closes.
 
-**Status: path translation has landed; capture/replay has not.**
-`H5VL__stream_resolve_physical_path()`, writer-side `path_index` population,
-and the `H5VL_OBJECT_LOOKUP` translation branch are in, so
-`H5Rcreate_object(fid, "/target")` now works with the logical path
+**Status: landed.** `H5VL__stream_resolve_physical_path()`, writer-side
+`path_index` population, and the `H5VL_OBJECT_LOOKUP` translation branch
+make `H5Rcreate_object(fid, "/target")` work with the logical path
 (`test/t_ref_path.c`, which also asserts that a same-step target is still
 refused — the documented "earlier step" rule above). Capturing a dataset
-*of* references and replaying it is still not supported, so
-`H5VL__stream_type_unsafe_to_capture()` continues to reject reference-typed
-writes.
+*of* references and replaying it now works too (`test/t_ref_roundtrip.c`):
+`H5VL__stream_type_unsafe_to_capture()` no longer rejects a *top-level*
+reference, and an ordinary memcpy — the same path every other fixed-size
+type already uses — carries it through capture and replay correctly.
 
-Two attempts have gone into the capture/replay half, and what each ruled out
-is worth recording so the next one starts further along.
+Two capture designs were tried and abandoned before landing on the one that
+works, and what each ruled out is worth recording, because the eventual fix
+is the opposite of what the danger looked like it required.
 
 *Attempt 1 — translate at capture with `H5Rget_obj_name()`.* Crashes
 (`H5G_rootof: Assertion 'f->shared' failed`). Resolving a reference goes
@@ -659,22 +660,31 @@ connector already sees the target's logical path at `H5Rcreate_object()`
 time, as the name arriving in the `H5VL_OBJECT_LOOKUP` branch, and the token
 that lookup returns is what ends up inside the reference (an `H5R_ref_t`
 begins with its token, for every reference flavour). Capture becomes a pure
-table lookup. **This part works** — the manifest payload comes out holding
-the right logical names, and nothing else regresses. But `end_step()` still
-crashes at the same assertion, now at the very first `ensure_group()` of the
-replay, with the *native* file object already carrying a NULL `shared`.
+table lookup, with no re-entrant HDF5 call anywhere. The manifest payload
+came out holding the right logical names, and nothing else regressed — but
+`end_step()` still crashed at the same assertion, now at the very first
+`ensure_group()` of the replay, with the *native* file object already
+carrying a NULL `shared`. So the fault was never the re-entrancy attempt 1
+found; it was something about translation itself.
 
-So the remaining fault is not the capture translation, and specifically not:
-re-entrancy from capture (removed), payload sizing (the manifest assembles
-from `payload_len` throughout, and a reference entry's payload is
-deliberately shorter than `n_elem × H5Tget_size()`), or `H5Rdestroy()`
-ordering in the application (tested both before and after `end_step()`).
-What is left, and what an attempt 3 should look at first: the only
-behavioural difference from the passing `t_ref_path.c` is that a
-`H5Dwrite()` of an `H5T_STD_REF` dataset is now *accepted* rather than
-rejected, against a dataset that is still a deferred placeholder with no
-underlying object. HDF5's own reference bookkeeping around a successful
-write is the next thing to rule in or out.
+*What actually unblocked it: don't translate at all.* A raw memcpy diagnostic
+— accept the write, copy the bytes verbatim, exactly like any other
+fixed-size type — round-tripped correctly on the first try. The "unsafe"
+premise from the original guard doesn't hold for the only case reachable
+through this connector's own API: `H5Rcreate_object()` builds a reference
+relative to its `loc_id`'s own file, so an application cannot name a
+genuinely foreign file without a `loc_id` in *that* file — which would not
+route through this connector at all. For a same-file reference
+(`H5R_OBJECT2`/`H5R_DATASET_REGION2`/`H5R_ATTR`, confirmed via
+`H5Rget_type()`), the cached filename pointer inside the private
+`H5R_ref_priv_obj_t` is NULL — read directly at the byte level against
+HDF5's own (private, `H5Rpkg.h`) layout. Nothing to dangle, so memcpy is
+exactly as safe as for any other scalar. `H5VL__stream_type_unsafe_to_
+capture()` now takes a `top_level` flag: a reference at the top level of a
+write is exempt; one nested inside a compound or array still is not, since
+translating that would mean rewriting the buffer member by member, which
+nothing here does — `test/t_ref_roundtrip.c` asserts that boundary
+explicitly, not just the positive case.
 
 **The dependency risk is quality, not quantity.** Criteria before adding
 anything: actively maintained, deployed at target facilities, Spack-installable,
