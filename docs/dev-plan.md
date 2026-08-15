@@ -664,7 +664,8 @@ In scope:
 they commit, tails new ones as they arrive, and reorganizes a running stream
 into a static file that `h5dump` reads without complaint.
 
-*Progress: `list` and `export` have landed and are tested. `tail` has not.*
+*Progress: `list`, `export` and `tail` have all landed and are tested. The
+exit gate above is met.*
 
 **Measured 2026-08-15 — `tail` cannot be built by polling the file.** The
 obvious implementation, re-opening the file and watching for new `/step/<n>/`
@@ -680,12 +681,20 @@ transport a hard requirement of the subcommand (`VOL_STREAM_NA` set, writer
 publishing its group) rather than a preference: there is no other channel by
 which a second process learns a step was committed.
 
-A transport-based implementation is written but **not shipped**, because
-verifying it needs the sentinel-coordinated writer/reader harness the M4–M8
-tests use — an ad-hoc writer exits and destroys its SSG group before the
-reader finishes joining, which is a fault in the test, not the tool. Shipping
-a `tail` that has never been observed following a live writer would be worse
-than not shipping one.
+The transport-based implementation has since shipped, once its test harness
+was built correctly. The first attempt had the reader racing a fixed-length
+writer: an ad-hoc writer emits its steps and exits, destroying its SSG group
+before the reader finishes joining, so the reader reports "Group not found"
+and gives up. That looks exactly like a broken tool and is entirely the
+test's fault.
+
+The fix was to invert the dependency rather than to tune timings — the
+writer now keeps committing steps until the *reader* signals it is done, so
+the reader may join whenever it manages to and steps will still be arriving.
+That removes the attach race outright instead of making it less likely.
+`test/t_h5stream_tail.c` asserts the tool observed at least three steps while
+the writer was still running, which is precisely what the polling version
+could not do; 10/10 stress runs, each seeing all three.
 
 This replaces the previous gate, which was *"a viewer written entirely in
 Python follows a live C or Fortran writer, subscribing to a subvolume, with

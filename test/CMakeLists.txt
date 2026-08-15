@@ -61,6 +61,18 @@ if(VOL_STREAM_HAVE_MERCURY)
     TIMEOUT 60
     DISABLED TRUE
   )
+  # M9: h5stream `tail` follows a *live* writer, which is only possible over
+  # the transport -- a writer's open file cannot be read by another process
+  # at all. So unlike list/export it belongs here, with the other
+  # transport-dependent tests.
+  add_executable(t_h5stream_tail t_h5stream_tail.c)
+  target_link_libraries(t_h5stream_tail PRIVATE vol_stream)
+  add_test(NAME h5stream_tail COMMAND t_h5stream_tail $<TARGET_FILE:h5stream>)
+  set_tests_properties(h5stream_tail PROPERTIES
+    ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
+    TIMEOUT 90
+  )
+
   # t_queue_policy.c gates its Spill scenario on this at compile time -- the
   # library's own VOL_STREAM_HAVE_BAKE compile definition is PRIVATE to the
   # vol_stream target, so a consumer target needs its own copy to see it.

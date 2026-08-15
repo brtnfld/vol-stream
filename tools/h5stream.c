@@ -39,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "hdf5.h"
 #include "H5VLstream.h"
@@ -48,9 +49,13 @@ usage(void)
 {
     fprintf(stderr, "usage: h5stream list FILE\n"
                     "       h5stream export FILE OUT\n"
+                    "       h5stream tail FILE [--max-steps N] [--timeout-ms T]   (needs VOL_STREAM_NA)\n"
                     "\n"
                     "  list     Steps in FILE: physical step, logical ids, objects written.\n"
-                    "  export   Write OUT: each object at its logical path, newest version.\n");
+                    "  export   Write OUT: each object at its logical path, newest version.\n"
+                    "  tail     Follow a live stream, reporting each step as it commits.\n"
+                    "           Requires the transport (VOL_STREAM_NA) -- a live writer's file\n"
+                    "           cannot be read by another process.\n");
 }
 
 /* H5Literate2 callback: print one object inside a step group, skipping the
@@ -374,6 +379,93 @@ done:
     return rc;
 }
 
+/*
+ * tail: follow a live stream, reporting each step as it commits.
+ *
+ * Uses the connector's own reader path -- H5Fwait_step_ready() -- and not
+ * polling the file, because polling cannot work. A writer holds the file
+ * open, and HDF5 does not permit another process to read it meanwhile:
+ * plain `h5ls` on a stream mid-write reports "NOT FOUND" even though the
+ * file exists on disk with content. That is the constraint dev-plan.md names
+ * in its opening section ("h5dump assumes random access and will fail
+ * unhelpfully"), and the transport exists precisely to answer it. An earlier
+ * cut of this subcommand did poll, worked fine against a finished stream,
+ * and reported nothing at all against a live one.
+ *
+ * The consequence is a real requirement rather than a preference: tail needs
+ * the transport enabled (VOL_STREAM_NA set, and the writer publishing its
+ * group), because that is the only channel by which a second process learns
+ * a step was committed. Without it the reader open fails, and saying so
+ * plainly is more use than silently following nothing.
+ *
+ * Terminates on --max-steps, or --timeout-ms with no new step; otherwise
+ * follows indefinitely, which is what an interactive user wants and what a
+ * test must not do.
+ */
+static int
+cmd_tail(const char *fname, long max_steps, long interval_ms, long timeout_ms)
+{
+    hid_t    vol_id = H5I_INVALID_HID, fapl = H5I_INVALID_HID, fid = H5I_INVALID_HID;
+    long     reported = 0;
+    int      rc       = 1;
+
+    (void)interval_ms; /* the wait is driven by the transport, not a poll */
+
+    if ((vol_id = H5VL_stream_register()) < 0) {
+        fprintf(stderr, "h5stream: cannot register the vol-stream connector\n");
+        goto done;
+    }
+    if ((fapl = H5Pcreate(H5P_FILE_ACCESS)) < 0 || H5Pset_vol(fapl, vol_id, NULL) < 0 ||
+        H5Pset_file_locking(fapl, false, true) < 0) {
+        fprintf(stderr, "h5stream: cannot build a file-access property list\n");
+        goto done;
+    }
+
+    H5E_BEGIN_TRY
+    {
+        fid = H5Fopen(fname, H5F_ACC_RDONLY, fapl);
+    }
+    H5E_END_TRY
+    if (fid < 0) {
+        fprintf(stderr,
+                "h5stream: cannot attach to '%s' as a reader.\n"
+                "  tail follows a *live* writer, which requires the transport: set VOL_STREAM_NA\n"
+                "  (e.g. na+sm or ofi+tcp) and make sure the writer is running and has published\n"
+                "  its group file. For a stream that is already finished, use `h5stream list`.\n",
+                fname);
+        goto done;
+    }
+
+    for (;;) {
+        uint64_t phys = 0, wall = 0;
+
+        if (H5Fwait_step_ready(fid, (uint64_t)(timeout_ms > 0 ? timeout_ms : 1000), &phys, &wall) < 0) {
+            if (timeout_ms > 0) {
+                rc = 0; /* quiet exit: nothing new within the timeout */
+                goto done;
+            }
+            continue; /* follow indefinitely */
+        }
+
+        printf("step %llu\n", (unsigned long long)phys);
+        fflush(stdout);
+
+        if (max_steps > 0 && ++reported == max_steps) {
+            rc = 0;
+            goto done;
+        }
+    }
+
+done:
+    if (fid >= 0)
+        H5Fclose(fid);
+    if (fapl >= 0)
+        H5Pclose(fapl);
+    if (vol_id >= 0)
+        H5VLclose(vol_id);
+    return rc;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -383,6 +475,26 @@ main(int argc, char **argv)
     }
     if (strcmp(argv[1], "list") == 0)
         return cmd_list(argv[2]);
+    if (strcmp(argv[1], "tail") == 0) {
+        long max_steps = 0, interval_ms = 200, timeout_ms = 0;
+        int  a;
+
+        for (a = 3; a < argc; a++) {
+            if (strcmp(argv[a], "--max-steps") == 0 && a + 1 < argc)
+                max_steps = strtol(argv[++a], NULL, 10);
+            else if (strcmp(argv[a], "--interval-ms") == 0 && a + 1 < argc)
+                interval_ms = strtol(argv[++a], NULL, 10);
+            else if (strcmp(argv[a], "--timeout-ms") == 0 && a + 1 < argc)
+                timeout_ms = strtol(argv[++a], NULL, 10);
+            else {
+                usage();
+                return 2;
+            }
+        }
+        if (interval_ms <= 0)
+            interval_ms = 200;
+        return cmd_tail(argv[2], max_steps, interval_ms, timeout_ms);
+    }
     if (strcmp(argv[1], "export") == 0) {
         if (argc < 4) {
             usage();
