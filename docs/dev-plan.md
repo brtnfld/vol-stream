@@ -646,15 +646,37 @@ built despite being in the schema since M2). Because of that, re-filtering
 always uses a single chunk spanning the whole pushed subrange rather than
 honoring a chunk shape the subscriber's DCPL requested.
 
-### M9 — Tools, bindings, and the long tail · M
+### M9 — Tools and the long tail · M
 
-`h5stream` promoted from test scaffolding to a real tool: list steps, tail a live
-stream, reorganize into a static file. h5py bindings. Document the
-tool-compatibility matrix honestly, `h5dump` included. Then predicate pushdown,
-onion-backed addressable step history, and an ADIOS2 interop bridge.
+**Scope narrowed 2026-08-15.** An ADIOS2 interop bridge is **dropped** — not
+deferred. h5py bindings are **postponed**, not abandoned.
 
-**Exit gate.** A viewer written entirely in Python follows a live C or Fortran
-writer, subscribing to a subvolume, with no user-written C glue.
+In scope:
+
+- `h5stream`, a real tool: list steps, tail a live stream, reorganize one
+  into a static file. Note it does not exist yet in any form — the original
+  wording ("promoted from test scaffolding") overstated the starting point,
+  as there is no such scaffolding.
+- The tool-compatibility matrix, documented honestly, `h5dump` included.
+- Then predicate pushdown and onion-backed addressable step history.
+
+**Exit gate.** `h5stream` follows a live writer end to end: lists steps as
+they commit, tails new ones as they arrive, and reorganizes a running stream
+into a static file that `h5dump` reads without complaint.
+
+This replaces the previous gate, which was *"a viewer written entirely in
+Python follows a live C or Fortran writer, subscribing to a subvolume, with
+no user-written C glue."* That gate is precisely the h5py deliverable, so
+postponing h5py left the milestone with nothing reachable to prove. It is
+kept verbatim here and becomes M9's gate again if h5py is picked up — the
+Python-viewer scenario is a strictly better demonstration than the tool
+alone, which is why it is parked rather than discarded.
+
+The narrowing also changes what the milestone is worth. The bridge and the
+bindings were the two items aimed at other ecosystems; what remains is aimed
+at this one — making a live stream inspectable with the tools an HDF5 user
+already has, which is also what the "existing tools on a stream" constraint
+in the opening section says is the real adoption risk.
 
 ## CI matrix
 
