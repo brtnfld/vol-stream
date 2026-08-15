@@ -607,6 +607,34 @@ by walking the whole step's references synchronously inside `COMMITTING` —
 the latter would stall the collective barrier in proportion to reference
 count.
 
+**Measured 2026-08-14 — reference support is feasible, but Decision #4
+understates what it takes.** Three probe programs run against the real
+connector (not code reading) establish:
+
+1. `H5Rcreate_object(fid, "/target", …)` for a target created in the **same
+   step** fails outright — `object 'target' doesn't exist`. Deferred writes
+   mean the target is genuinely not in the underlying file until
+   `end_step()` replays the manifest.
+2. The same call for a target in a **prior, committed** step also fails, for
+   a different reason: steps land group-based at `/step/<n>/`, so the
+   application's logical `/target` is physically `/step/0/target` (confirmed
+   with `h5dump -n`).
+3. The same call given the **physical** path works, and `H5Rget_obj_name()`
+   returns `/step/0/target` — so the HDF5 mechanism this decision rests on
+   is sound.
+
+The consequence: name translation is the easy half. `H5VL_stream_object_
+specific()` is currently a pure passthrough, so making the natural call
+`H5Rcreate_object(fid, "/target")` work needs a logical→physical path
+translation layer in the object-lookup path; capture would then store the
+logical path (step prefix stripped) so a reader rebuilds against its own
+layout. And the same-step case is a real architectural limitation, not an
+oversight — it needs either a documented "targets must come from an earlier
+step" rule, or deferred reference resolution during `COMMITTING`, after
+objects materialize but before the manifest closes. Until one of those is
+built, `H5VL__stream_type_unsafe_to_capture()` rejecting references outright
+remains the correct interim behavior.
+
 **The dependency risk is quality, not quantity.** Criteria before adding
 anything: actively maintained, deployed at target facilities, Spack-installable,
 bounded scope, stays out of the wire protocol. Mercury, Argobots, Margo and
