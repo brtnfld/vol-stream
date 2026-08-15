@@ -664,6 +664,29 @@ In scope:
 they commit, tails new ones as they arrive, and reorganizes a running stream
 into a static file that `h5dump` reads without complaint.
 
+*Progress: `list` and `export` have landed and are tested. `tail` has not.*
+
+**Measured 2026-08-15 — `tail` cannot be built by polling the file.** The
+obvious implementation, re-opening the file and watching for new `/step/<n>/`
+groups, works against a finished stream and reports nothing at all against a
+live one. The reason is not subtle and is not ours: while a writer holds the
+file open, another process cannot read it. Plain `h5ls` on a stream mid-write
+prints `**NOT FOUND**` even though the file is on disk with content in it.
+
+That is this document's own "existing tools on a stream" constraint, met in
+practice rather than in theory — and it is precisely why the connector has a
+transport. `tail` has to be built on `H5Fwait_step_ready()`, which makes the
+transport a hard requirement of the subcommand (`VOL_STREAM_NA` set, writer
+publishing its group) rather than a preference: there is no other channel by
+which a second process learns a step was committed.
+
+A transport-based implementation is written but **not shipped**, because
+verifying it needs the sentinel-coordinated writer/reader harness the M4–M8
+tests use — an ad-hoc writer exits and destroys its SSG group before the
+reader finishes joining, which is a fault in the test, not the tool. Shipping
+a `tail` that has never been observed following a live writer would be worse
+than not shipping one.
+
 This replaces the previous gate, which was *"a viewer written entirely in
 Python follows a live C or Fortran writer, subscribing to a subvolume, with
 no user-written C glue."* That gate is precisely the h5py deliverable, so
