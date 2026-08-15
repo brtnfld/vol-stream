@@ -105,11 +105,25 @@ typedef struct vs_tr_t vs_tr_t;
  * *out_filter_mask (H5Dget_chunk_info_by_coord()'s filter_mask, needed on
  * the far side to reconstruct correctly if any filter chose to skip
  * itself). Returns 0 on success; a non-zero return falls back to sending
- * this subscriber raw, unfiltered bytes instead of failing the push. */
+ * this subscriber raw, unfiltered bytes instead of failing the push.
+ *
+ * native_dcpl_enc/native_dcpl_enc_len (M8.5.1, chunk-level fast path) are
+ * the H5Pencode2() bytes of the DCPL the write actually landed under --
+ * NULL/0 if the caller has none available. native_ctx is likewise opaque to
+ * this module (and to the caller in between, vs_tr_writer_push_data(), which
+ * only forwards it): H5VLstream.c is both the sole producer and sole
+ * consumer, using it to reach the just-written, already-filtered dataset
+ * object directly (H5Dget_chunk_info_by_coord()/H5Dread_chunk2() against the
+ * real chunk, not a throwaway one) when a subscriber's own dcpl_enc turns
+ * out to match native_dcpl_enc's pipeline and chunking exactly -- true
+ * zero-copy, skipping the temporary-dataset round trip entirely. Safe to
+ * pass NULL for both on any call site that has nothing to offer; the
+ * callback then always falls back to the temporary-dataset path. */
 typedef int (*vs_tr_refilter_fn)(const void *raw_buf, uint64_t elem_size, uint64_t count,
                                    const uint8_t *dcpl_enc, uint64_t dcpl_enc_len, const uint8_t *type_enc,
-                                   uint64_t type_enc_len, void **out_buf, uint64_t *out_len,
-                                   uint32_t *out_filter_mask);
+                                   uint64_t type_enc_len, const uint8_t *native_dcpl_enc,
+                                   uint64_t native_dcpl_enc_len, void *native_ctx, void **out_buf,
+                                   uint64_t *out_len, uint32_t *out_filter_mask);
 
 /* Registers the callback used to re-filter a subscriber's overlap slice
  * through their own requested DCPL (M8.5). NULL (the default) means every
@@ -238,7 +252,8 @@ int vs_tr_reader_subscribe(vs_tr_t *tr, const char *path, uint64_t sel_start, ui
  * failed), -1 only on a local error. */
 int vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, const void *buf,
                             uint64_t elem_size, uint64_t write_start, uint64_t write_count,
-                            const uint8_t *type_enc, uint64_t type_enc_len);
+                            const uint8_t *type_enc, uint64_t type_enc_len,
+                            const uint8_t *native_dcpl_enc, uint64_t native_dcpl_enc_len, void *native_ctx);
 
 /* Reader side: block up to timeout_ms for a pushed data item (one may
  * already be queued), filling *physical_step, *out_path (newly malloc'd,

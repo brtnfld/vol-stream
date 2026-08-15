@@ -21,7 +21,8 @@ add_test(NAME ref_path COMMAND t_ref_path)
 # are only built/run when VOL_STREAM_HAVE_MERCURY is on (see
 # ../CMakeLists.txt's VOL_STREAM_ENABLE_MERCURY option).
 if(VOL_STREAM_HAVE_MERCURY)
-  foreach(t t_transport t_rendezvous t_queue_policy t_subscribe t_precision t_precision_dual)
+  foreach(t t_transport t_rendezvous t_queue_policy t_subscribe t_precision t_precision_dual
+           t_chunk_zerocopy)
     add_executable(${t} ${t}.c)
     target_link_libraries(${t} PRIVATE vol_stream)
   endforeach()
@@ -30,7 +31,8 @@ if(VOL_STREAM_HAVE_MERCURY)
   add_test(NAME queue_policy COMMAND t_queue_policy)
   add_test(NAME subscribe COMMAND t_subscribe)
   add_test(NAME precision COMMAND t_precision)
-  set_tests_properties(transport rendezvous queue_policy subscribe precision PROPERTIES
+  add_test(NAME chunk_zerocopy COMMAND t_chunk_zerocopy)
+  set_tests_properties(transport rendezvous queue_policy subscribe precision chunk_zerocopy PROPERTIES
     ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
     TIMEOUT 60
   )

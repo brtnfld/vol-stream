@@ -215,12 +215,47 @@ for that push — decompress, apply the subscriber's own pipeline, re-compress
 zero-copy only for subscribers whose pipeline matches the write-time DCPL
 exactly.
 
-Per-subscriber precision has since shipped (M8.5) and this rule is currently
-satisfied *trivially*, not by an implemented branch: every payload is still
-the `Raw` form, so re-filtering always starts from unfiltered bytes and the
-conflict cannot arise. The rule above becomes live code the moment
-`FilteredChunks` capture is built — that is the first thing to implement
-alongside it, not an afterthought.
+Per-subscriber precision shipped in M8.5, and the conflict rule above is now
+**live code rather than a trivially-satisfied one** — though reached from the
+opposite direction than this section assumed.
+
+**M8.5.1 — the zero-copy fast path.** No new capture machinery or payload
+form was needed to get the first real benefit. By the time a subscriber is
+served, replay has *already* written a real, chunked, filtered dataset into
+the underlying file — so when a subscriber's requested pipeline is the one
+the data was written under, the compressed bytes it wants exist verbatim,
+and `H5VL__stream_refilter_zero_copy()` reads them straight out
+(`H5VL_NATIVE_DATASET_GET_CHUNK_INFO_BY_COORD` /
+`H5VL_NATIVE_DATASET_CHUNK_READ`) instead of rebuilding an identical
+throwaway `H5FD_CORE` dataset and re-running the same filters over the same
+input to recompute the same answer.
+
+That is exactly this section's rule, enforced by construction: matching
+pipeline → serve stored filtered bytes; differing pipeline → fall back to
+re-filtering from `Raw`. The equivalence test is `H5Pequal()` on the decoded
+subscriber and write-time DCPLs, which compares chunking as well as filters,
+so a subscriber asking for a different chunk shape correctly declines rather
+than being silently served the dataset's own shape. Declining is always safe
+— the slow path still produces a correct result.
+
+Two constraints are deliberate, both matching this section's own "partial
+writes degrade to `Raw`" rule: the push must cover the whole dataset from
+element 0 (a partial overlap would need the chunk grid walked and per-chunk
+intersection computed), and the extent must be exactly one chunk (the
+receiving side reconstructs a single whole-extent chunk, so serving several
+would need a wire-format change). Anything else declines to the slow path.
+
+Both branches are covered by tests that distinguish *which* ran, not merely
+that the data came out right: `VOL_STREAM_DEBUG_REFILTER` tags the fast
+path's log line `(zero-copy)`, so `test/t_chunk_zerocopy.c` (matching
+pipeline) fails if it silently falls through, and `test/t_precision.c`
+(deliberately mismatched pipeline) continues to exercise the temporary-
+dataset route.
+
+Still not built: `FilteredChunks` as an actual payload form in the manifest,
+and chunk-grid-aware routing of a subscriber's N-D selection (subscription
+routing remains 1-D element-range intersection). Both remain M2-scale, and
+neither is needed for the case above.
 
 ### Connector state machine
 

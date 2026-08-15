@@ -1240,7 +1240,8 @@ vs_tr_reader_subscribe(vs_tr_t *tr, const char *path, uint64_t sel_start, uint64
 int
 vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, const void *buf,
                         uint64_t elem_size, uint64_t write_start, uint64_t write_count,
-                        const uint8_t *type_enc, uint64_t type_enc_len)
+                        const uint8_t *type_enc, uint64_t type_enc_len,
+                        const uint8_t *native_dcpl_enc, uint64_t native_dcpl_enc_len, void *native_ctx)
 {
     ssg_member_id_t   self_id;
     int                 group_size, i;
@@ -1334,7 +1335,8 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
              * would have gotten without a dcpl_enc at all. */
             if (sub_dcpl_enc_len > 0 && tr->refilter_fn &&
                 0 == tr->refilter_fn(overlap_ptr, elem_size, overlap_count, sub_dcpl_enc, sub_dcpl_enc_len,
-                                       type_enc, type_enc_len, &filtered_buf, &filtered_len, &filter_mask))
+                                       type_enc, type_enc_len, native_dcpl_enc, native_dcpl_enc_len,
+                                       native_ctx, &filtered_buf, &filtered_len, &filter_mask))
                 did_refilter = 1;
 
             in.physical_step = physical_step;

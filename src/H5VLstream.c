@@ -119,6 +119,32 @@ typedef struct H5VL_stream_file_state_t  H5VL_stream_file_state_t;
  * only until end_step encodes and closes them; dcpl_id/dapl_id are
  * H5I_INVALID_HID on a DsetWrite entry, which never has its own DCPL/DAPL.
  */
+/* M8.5.1: what the chunk-level zero-copy fast path needs to reach the real,
+ * already-filtered dataset replay just wrote. Passed opaquely through
+ * tr_mercury.c (which stays HDF5-free and only forwards the pointer) as
+ * vs_tr_refilter_fn's native_ctx -- see H5VL__stream_refilter_zero_copy().
+ *
+ * under_dset/under_vol_id are borrowed: they belong to the replay frame that
+ * is still mid-flight, valid only for the duration of the
+ * vs_tr_writer_push_data() call they are handed to, and must be neither
+ * closed nor retained. The under-VOL object is deliberately carried raw
+ * rather than as an hid_t: H5VLwrap_register() would hand back an id that
+ * *owns* the object, so releasing it would close the dataset replay itself
+ * still owns and later closes (observed as a double-close crash -- the same
+ * trap the H5R replay attempt hit). The chunk reads therefore go through the
+ * native connector's own optional operations, which take the object
+ * directly.
+ *
+ * write_start/total_elems describe the write being pushed, so the fast path
+ * can confirm it covers the whole dataset before serving stored chunk bytes.
+ */
+typedef struct H5VL_stream_native_chunk_ctx_t {
+    void    *under_dset;
+    hid_t    under_vol_id;
+    uint64_t write_start;
+    uint64_t total_elems;
+} H5VL_stream_native_chunk_ctx_t;
+
 typedef struct H5VL_stream_pending_entry_t {
     int            kind;
     char          *path;
@@ -455,8 +481,13 @@ static void H5VL__stream_transport_start_reader(H5VL_stream_file_state_t *fs, co
  * data()'s the reverse operation, used in the get_subscribed_data handler. */
 static int H5VL__stream_refilter_for_subscriber(const void *raw_buf, uint64_t elem_size, uint64_t count,
                              const uint8_t *dcpl_enc, uint64_t dcpl_enc_len, const uint8_t *type_enc,
-                             uint64_t type_enc_len, void **out_buf, uint64_t *out_len,
-                             uint32_t *out_filter_mask);
+                             uint64_t type_enc_len, const uint8_t *native_dcpl_enc,
+                             uint64_t native_dcpl_enc_len, void *native_ctx, void **out_buf,
+                             uint64_t *out_len, uint32_t *out_filter_mask);
+static int H5VL__stream_refilter_zero_copy(const void *raw_buf, uint64_t elem_size, uint64_t count,
+                             const uint8_t *dcpl_enc, uint64_t dcpl_enc_len, const uint8_t *native_dcpl_enc,
+                             uint64_t native_dcpl_enc_len, void *native_ctx, void **out_buf,
+                             uint64_t *out_len, uint32_t *out_filter_mask);
 static int H5VL__stream_unfilter_pushed_data(const void *filtered_buf, uint64_t filtered_len,
                              const uint8_t *dcpl_enc, uint64_t dcpl_enc_len, const uint8_t *type_enc,
                              uint64_t type_enc_len, uint64_t count, uint32_t filter_mask, void **out_buf,
@@ -1735,6 +1766,168 @@ H5VL__stream_encode_dcpl(hid_t dcpl_id, uint8_t **buf, size_t *len)
 
 #ifdef VOL_STREAM_HAVE_MERCURY
 /*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_refilter_zero_copy
+ *
+ * Purpose:     M8.5.1, the chunk-level fast path behind
+ *              H5VL__stream_refilter_for_subscriber(). Serve a subscriber
+ *              straight from the already-filtered chunk that replay just
+ *              wrote, instead of rebuilding an identical throwaway dataset
+ *              and re-running the same filter pipeline over the same bytes
+ *              to arrive at the same answer. This is dev-plan.md's
+ *              "FilteredChunks" idea applied where it actually pays off
+ *              first: the writer already holds a real, chunked, filtered
+ *              dataset by this point in replay, so no new capture machinery
+ *              is needed to reach it.
+ *
+ *              Only taken when it is provably equivalent to the slow path.
+ *              All of these must hold, and any one failing simply declines:
+ *
+ *              - The subscriber's DCPL and the dataset's own write-time DCPL
+ *                have identical filter pipelines (H5Pequal on the decoded
+ *                property lists -- which compares chunking too, so a
+ *                subscriber asking for a different chunk shape correctly
+ *                falls through rather than being silently served the
+ *                dataset's shape instead).
+ *              - The push covers the whole dataset, starting at element 0.
+ *                A partial overlap would need the chunk grid walked and
+ *                per-chunk intersection computed; dev-plan.md's own rule is
+ *                that partial writes degrade to Raw, and that is what
+ *                declining here does.
+ *              - The extent is exactly one chunk. The slow path always
+ *                produces a single whole-extent chunk, and the receiving
+ *                side (H5VL__stream_unfilter_pushed_data()) assumes exactly
+ *                that, so serving multiple chunks would need a wire-format
+ *                change this increment deliberately does not make.
+ *
+ *              raw_buf/elem_size are used only to confirm the push really
+ *              is the whole dataset; the bytes sent come from the dataset.
+ *
+ * Return:      0 if served zero-copy (*out_buf malloc'd, caller frees),
+ *              -1 to decline -- never fatal, the caller falls back.
+ *-------------------------------------------------------------------------
+ */
+static int
+H5VL__stream_refilter_zero_copy(const void *raw_buf, uint64_t elem_size, uint64_t count,
+                                const uint8_t *dcpl_enc, uint64_t dcpl_enc_len,
+                                const uint8_t *native_dcpl_enc, uint64_t native_dcpl_enc_len,
+                                void *native_ctx, void **out_buf, uint64_t *out_len,
+                                uint32_t *out_filter_mask)
+{
+    H5VL_stream_native_chunk_ctx_t *ctx  = (H5VL_stream_native_chunk_ctx_t *)native_ctx;
+    hid_t                           sub  = H5I_INVALID_HID, nat = H5I_INVALID_HID;
+    hsize_t                         chunk_dims[H5S_MAX_RANK];
+    hsize_t                         chunk_offset[H5S_MAX_RANK];
+    void                           *filtered = NULL;
+    unsigned                        mask     = 0;
+    haddr_t                         addr;
+    hsize_t                         chunk_size = 0;
+    int                             rank, r;
+    int                             ret_value = -1;
+
+    (void)raw_buf;
+
+    if (!ctx || !ctx->under_dset)
+        return -1;
+    /* Whole-dataset pushes only -- see the partial-overlap note above. */
+    if (ctx->write_start != 0 || ctx->total_elems != count || elem_size == 0)
+        return -1;
+
+    if ((sub = H5Pdecode(dcpl_enc)) < 0)
+        goto done;
+    if ((nat = H5Pdecode(native_dcpl_enc)) < 0)
+        goto done;
+
+    /* The equivalence test. H5Pequal covers the filter pipeline *and* the
+     * chunk dimensions, which is exactly the pair that has to match for the
+     * dataset's own stored bytes to be what this subscriber asked for. */
+    if (H5Pequal(sub, nat) <= 0)
+        goto done;
+
+    if (H5Pget_layout(nat) != H5D_CHUNKED)
+        goto done;
+    if ((rank = H5Pget_chunk(nat, H5S_MAX_RANK, chunk_dims)) < 0)
+        goto done;
+
+    /* Single-chunk extents only, matching what the receiving side expects. */
+    {
+        hsize_t chunk_elems = 1;
+
+        for (r = 0; r < rank; r++) {
+            chunk_elems *= chunk_dims[r];
+            chunk_offset[r] = 0;
+        }
+        if (chunk_elems != (hsize_t)count)
+            goto done;
+    }
+
+    /* Native-connector optional ops rather than H5Dget_chunk_info_by_coord()/
+     * H5Dread_chunk2(): those need an hid_t, and the only way to get one for
+     * an under-VOL object hands back an owning reference (see the ctx
+     * struct's comment). These take the object directly. A non-native under
+     * connector simply fails the call and the caller falls back. */
+    {
+        H5VL_optional_args_t                args;
+        H5VL_native_dataset_optional_args_t dset_args;
+
+        memset(&dset_args, 0, sizeof(dset_args));
+        dset_args.get_chunk_info_by_coord.offset      = chunk_offset;
+        dset_args.get_chunk_info_by_coord.filter_mask = &mask;
+        dset_args.get_chunk_info_by_coord.addr        = &addr;
+        dset_args.get_chunk_info_by_coord.size        = &chunk_size;
+
+        args.op_type = H5VL_NATIVE_DATASET_GET_CHUNK_INFO_BY_COORD;
+        args.args    = &dset_args;
+
+        if (H5VLdataset_optional(ctx->under_dset, ctx->under_vol_id, &args, H5P_DATASET_XFER_DEFAULT,
+                                 NULL) < 0)
+            goto done;
+    }
+    if (chunk_size == 0)
+        goto done;
+    if (NULL == (filtered = malloc((size_t)chunk_size)))
+        goto done;
+    {
+        H5VL_optional_args_t                args;
+        H5VL_native_dataset_optional_args_t dset_args;
+        size_t                              buf_size = (size_t)chunk_size;
+
+        memset(&dset_args, 0, sizeof(dset_args));
+        dset_args.chunk_read.offset   = chunk_offset;
+        dset_args.chunk_read.filters  = (uint32_t)mask;
+        dset_args.chunk_read.buf      = filtered;
+        dset_args.chunk_read.buf_size = &buf_size;
+
+        args.op_type = H5VL_NATIVE_DATASET_CHUNK_READ;
+        args.args    = &dset_args;
+
+        if (H5VLdataset_optional(ctx->under_dset, ctx->under_vol_id, &args, H5P_DATASET_XFER_DEFAULT,
+                                 NULL) < 0)
+            goto done;
+    }
+
+    /* Same diagnostic the slow path emits, so a test can tell the two apart
+     * (and confirm the fast path is the one that ran) rather than only
+     * seeing that some re-filtering happened. */
+    if (getenv("VOL_STREAM_DEBUG_REFILTER"))
+        fprintf(stderr, "  refilter  raw=%llu filtered=%llu bytes (zero-copy)\n",
+                (unsigned long long)(elem_size * count), (unsigned long long)chunk_size);
+
+    *out_buf         = filtered;
+    *out_len         = (uint64_t)chunk_size;
+    *out_filter_mask = (uint32_t)mask;
+    filtered         = NULL;
+    ret_value        = 0;
+
+done:
+    free(filtered);
+    if (sub >= 0)
+        H5Pclose(sub);
+    if (nat >= 0)
+        H5Pclose(nat);
+    return ret_value;
+} /* end H5VL__stream_refilter_zero_copy() */
+
+/*-------------------------------------------------------------------------
  * Function:    H5VL__stream_refilter_for_subscriber
  *
  * Purpose:     M8.5 precision: vs_tr_refilter_fn's implementation (see that
@@ -1767,8 +1960,9 @@ H5VL__stream_encode_dcpl(hid_t dcpl_id, uint8_t **buf, size_t *len)
 static int
 H5VL__stream_refilter_for_subscriber(const void *raw_buf, uint64_t elem_size, uint64_t count,
                                        const uint8_t *dcpl_enc, uint64_t dcpl_enc_len, const uint8_t *type_enc,
-                                       uint64_t type_enc_len, void **out_buf, uint64_t *out_len,
-                                       uint32_t *out_filter_mask)
+                                       uint64_t type_enc_len, const uint8_t *native_dcpl_enc,
+                                       uint64_t native_dcpl_enc_len, void *native_ctx, void **out_buf,
+                                       uint64_t *out_len, uint32_t *out_filter_mask)
 {
     hid_t    dcpl = -1, type = -1, space = -1, fapl = -1, fid = -1, ds = -1;
     hsize_t  dims[1];
@@ -1781,6 +1975,19 @@ H5VL__stream_refilter_for_subscriber(const void *raw_buf, uint64_t elem_size, ui
 
     if (count == 0 || !dcpl_enc || dcpl_enc_len == 0 || !type_enc || type_enc_len == 0)
         return -1;
+
+    /* M8.5.1 zero-copy fast path: when this subscriber's requested pipeline
+     * is the one the data was *already* written under, the compressed bytes
+     * it wants exist verbatim in the real dataset that replay just wrote --
+     * so read them straight out instead of rebuilding an identical throwaway
+     * dataset and re-running the same filters over the same input to get the
+     * same answer. Declining here is always safe: everything below still
+     * produces a correct result, just more expensively. */
+    if (native_ctx && native_dcpl_enc && native_dcpl_enc_len > 0 &&
+        0 == H5VL__stream_refilter_zero_copy(raw_buf, elem_size, count, dcpl_enc, dcpl_enc_len,
+                                             native_dcpl_enc, native_dcpl_enc_len, native_ctx, out_buf,
+                                             out_len, out_filter_mask))
+        return 0;
 
     if ((dcpl = H5Pdecode(dcpl_enc)) < 0)
         goto done;
@@ -3233,15 +3440,27 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                     needs_close[i] = 1;
             }
             else if (kind == vs_Kind_DsetWrite) {
-                void    *real = NULL;
-                size_t   j;
-                hid_t    mem_space = -1;
-                hssize_t n_elem;
+                void                   *real = NULL;
+                size_t                  j;
+                hid_t                   mem_space = -1;
+                hssize_t                n_elem;
+                flatbuffers_uint8_vec_t create_dcpl_enc     = NULL;
+                size_t                  create_dcpl_enc_len = 0;
 
+                /* Also picks up the creating entry's own dcpl_enc: a
+                 * DsetWrite entry carries no DCPL of its own (see
+                 * H5VL_stream_pending_entry_t), so the pipeline this data
+                 * actually landed under -- what M8.5.1's zero-copy fast path
+                 * has to compare a subscriber's request against -- is only
+                 * available from the DsetCreate being resolved here. */
                 for (j = i; j-- > 0;)
                     if (vs_Entry_kind(vs_Entry_vec_at(entries, j)) == vs_Kind_DsetCreate &&
                         strcmp(vs_Entry_path(vs_Entry_vec_at(entries, j)), path) == 0) {
-                        real = replay_under[j];
+                        vs_Entry_table_t ce = vs_Entry_vec_at(entries, j);
+
+                        real                = replay_under[j];
+                        create_dcpl_enc     = vs_Entry_dcpl_enc(ce);
+                        create_dcpl_enc_len = flatbuffers_uint8_vec_len(create_dcpl_enc);
                         break;
                     }
 
@@ -3294,6 +3513,10 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                         if (H5VL__stream_space_1d_bounds(dspace, &w_start, &w_count) >= 0) {
                             uint8_t *push_type_enc     = NULL;
                             size_t   push_type_enc_len = 0;
+                            uint8_t *native_dcpl_enc     = NULL;
+                            size_t   native_dcpl_enc_len = 0;
+
+                            H5VL_stream_native_chunk_ctx_t native_ctx;
 
                             /* Only needed if a subscriber actually wants
                              * precision re-filtering (vs_tr_writer_push_
@@ -3304,10 +3527,51 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                              * per-subscriber decision, not something this
                              * call site can know in advance. */
                             H5VL__stream_encode_type(dtype, &push_type_enc, &push_type_enc_len);
+
+                            /* M8.5.1: offer the chunk-level zero-copy fast
+                             * path what it needs -- the DCPL this write
+                             * actually landed under, and a borrowed handle on
+                             * the real dataset holding the already-filtered
+                             * bytes. Only worth building when the write was
+                             * chunked and filtered; an unfiltered or
+                             * contiguous dataset has no stored compressed
+                             * chunk to serve, so the fast path could not
+                             * apply anyway. Everything here is strictly
+                             * optional: on any failure the push simply goes
+                             * out with NULLs and the callback takes its
+                             * ordinary temporary-dataset route. */
+                            memset(&native_ctx, 0, sizeof(native_ctx));
+                            if (create_dcpl_enc && create_dcpl_enc_len > 0) {
+                                hid_t nat = H5Pdecode(create_dcpl_enc);
+
+                                if (nat >= 0) {
+                                    if (H5Pget_layout(nat) == H5D_CHUNKED && H5Pget_nfilters(nat) > 0) {
+                                        /* The manifest's own bytes are already
+                                         * exactly what the callback needs to
+                                         * compare against -- no re-encode. */
+                                        native_dcpl_enc     = (uint8_t *)create_dcpl_enc;
+                                        native_dcpl_enc_len = create_dcpl_enc_len;
+
+                                        native_ctx.under_dset   = real;
+                                        native_ctx.under_vol_id = file_obj->under_vol_id;
+                                        native_ctx.write_start  = w_start;
+                                        native_ctx.total_elems  = (uint64_t)n_elem;
+                                    }
+                                    H5Pclose(nat);
+                                }
+                            }
+
                             vs_tr_writer_push_data(file_obj->file_state->transport, physical_step, path,
                                                      payload_ptr, H5Tget_size(dtype), w_start,
                                                      (uint64_t)n_elem, push_type_enc,
-                                                     (uint64_t)push_type_enc_len);
+                                                     (uint64_t)push_type_enc_len, native_dcpl_enc,
+                                                     (uint64_t)native_dcpl_enc_len,
+                                                     native_ctx.under_dset ? &native_ctx : NULL);
+
+                            /* native_dcpl_enc is deliberately not freed: it
+                             * points into the manifest buffer, not to an
+                             * allocation of this call's own. Nothing in
+                             * native_ctx is owned here either. */
                             free(push_type_enc);
                         }
                     }
@@ -3443,9 +3707,15 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                             size_t   push_type_enc_len = 0;
 
                             H5VL__stream_encode_type(dtype, &push_type_enc, &push_type_enc_len);
+                            /* No native chunk context: an attribute has no
+                             * chunked/filtered storage to serve bytes from,
+                             * so the zero-copy fast path never applies here
+                             * and a subscriber's precision request always
+                             * takes the temporary-dataset route. */
                             vs_tr_writer_push_data(file_obj->file_state->transport, physical_step, path,
                                                      payload_ptr, H5Tget_size(dtype), a_start, a_count,
-                                                     push_type_enc, (uint64_t)push_type_enc_len);
+                                                     push_type_enc, (uint64_t)push_type_enc_len, NULL, 0,
+                                                     NULL);
                             free(push_type_enc);
                         }
                     }
