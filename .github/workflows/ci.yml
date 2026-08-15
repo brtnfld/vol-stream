@@ -201,6 +201,14 @@ jobs:
             libfabric-dev libjson-c-dev libboost-dev pkg-config autoconf automake libtool \
             uuid-dev pandoc
 
+      # HDF5_ENABLE_ZLIB_SUPPORT=ON is required, not cosmetic: HDF5 defaults
+      # it OFF, and t_precision/t_precision_dual (M8.5 per-subscriber
+      # precision) measure a subscriber-requested GZIP pipeline actually
+      # shrinking the wire bytes -- impossible without a real deflate filter.
+      # Installing zlib1g-dev above is necessary but NOT sufficient; without
+      # this flag H5Pset_deflate() still succeeds (it only records a filter
+      # id) and the failure surfaces indirectly as filtered-size == raw-size
+      # plus a "required filter is not registered" error from the reader.
       - name: Build HDF5 develop
         run: |
           git clone --depth 1 --branch develop \
@@ -212,7 +220,8 @@ jobs:
             -DHDF5_BUILD_TOOLS=ON \
             -DHDF5_BUILD_EXAMPLES=OFF \
             -DHDF5_BUILD_FORTRAN=OFF \
-            -DHDF5_BUILD_CPP_LIB=OFF
+            -DHDF5_BUILD_CPP_LIB=OFF \
+            -DHDF5_ENABLE_ZLIB_SUPPORT=ON
           cmake --build hdf5-build --parallel
           cmake --install hdf5-build
 

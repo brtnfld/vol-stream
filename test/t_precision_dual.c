@@ -426,6 +426,15 @@ main(void)
 
     printf("vol-stream M8/M8.5 exit gate: two subscribers, different precisions, one step (ofi+tcp)\n");
 
+    /* Same reason as test/t_precision.c's identical check -- see its comment.
+     * Without a real deflate filter the two subscribers' pipelines cannot
+     * differ in wire size, which is the whole measurement here. */
+    if (H5Zfilter_avail(H5Z_FILTER_DEFLATE) <= 0) {
+        printf("  FAIL  this HDF5 has no deflate filter -- rebuild it with "
+               "-DHDF5_ENABLE_ZLIB_SUPPORT=ON (it defaults to OFF)\n");
+        return 1;
+    }
+
     /* ofi+tcp, not na+sm: this is the only THREE-process test in the suite,
      * and na+sm moves bytes with process_vm_readv(), which Linux's Yama LSM
      * (kernel.yama.ptrace_scope=1, the common default) permits only against

@@ -305,6 +305,21 @@ main(void)
 
     printf("vol-stream M8.5: per-subscriber precision (na+sm)\n");
 
+    /* This test's entire premise is that a subscriber's requested GZIP
+     * pipeline measurably shrinks the wire bytes, so it cannot mean anything
+     * without a working deflate filter. HDF5's own HDF5_ENABLE_ZLIB_SUPPORT
+     * defaults to *OFF*, and H5Pset_deflate() still succeeds when it is off
+     * (it only records the filter id in the DCPL) -- the failure surfaces
+     * much later and very indirectly, as a push whose "filtered" size equals
+     * its raw size plus an unrelated-looking "required filter is not
+     * registered" error from the reader's decode. Checked explicitly here so
+     * a zlib-less HDF5 reports the real reason instead of that puzzle. */
+    if (H5Zfilter_avail(H5Z_FILTER_DEFLATE) <= 0) {
+        printf("  FAIL  this HDF5 has no deflate filter -- rebuild it with "
+               "-DHDF5_ENABLE_ZLIB_SUPPORT=ON (it defaults to OFF)\n");
+        return 1;
+    }
+
     setenv("VOL_STREAM_NA", "na+sm", 1);
     unlink(READY_SENTINEL);
     unlink(READER_DONE_SENTINEL);
