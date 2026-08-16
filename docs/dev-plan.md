@@ -1420,40 +1420,51 @@ only ~12–24 us here, so there is almost nothing per subscriber to overlap.
 The prediction may still hold on a real fabric with real round trips; it is
 not demonstrated, and should not be claimed until it is.
 
-#### Open bug: a subscriber's push can go missing at fan-out
+#### The push loop indexed a mutable rank space — found by `b_push_fanout`, fixed
 
-Running `test/b_push_fanout.c` surfaced a real defect that predates this
-work and is independent of it. At 4 and 8 subscribers the writer
-intermittently issues **one fewer data push than it has (subscriber, step)
-pairs** — 238 or 239 of an expected 240 — and the subscriber that loses one
-then blocks until its `H5Fget_subscribed_data()` timeout, having received
+Writing `test/b_push_fanout.c` surfaced a real data-loss defect that
+predates the async push and is independent of it. At 4 and 8 subscribers
+the writer issued **one fewer data push than it had (subscriber, step)
+pairs** — 238 of an expected 240 — and the subscribers that lost one
+blocked until their `H5Fget_subscribed_data()` timeout, having received
 every earlier step correctly.
 
-What it is *not*, ruled out by measurement rather than reasoning: not a
-forward timeout (239 pushes totalled ~11 ms, so nothing waited near the 1 s
-bound), and not a stale group or subscription view (instrumenting the push
-loop showed `group_size=9` and all 8 matching subscriptions present at
-every single step). The push is therefore dropped by one of the
-early-`continue` paths in `vs_tr_writer_push_data()`'s member loop, and the
-most likely candidate is the `ssg_get_group_member_addr()` call — which
-this same file *already documents as transiently failing*, and already
-retries for on the reader side (`vs_tr_reader_join_group()` retries it 10
-times at 50 ms). The writer's push loop makes the identical call with no
-retry: it just `continue`s, silently dropping that subscriber's data for
-that step, with no error surfaced to either side and no record that
-anything was lost.
+Worth recording how it was found, because the first two hypotheses were
+both wrong and both were killed by measurement rather than argument. Not a
+forward timeout: 239 pushes totalled ~11 ms, so nothing waited anywhere
+near the 1 s bound. Not a stale group or subscription view either:
+instrumenting the loop showed `group_size=9` with all 8 matching
+subscriptions present at every single step. The prime suspect at that point
+was `ssg_get_group_member_addr()`, since this same file already documents
+that call as transiently failing and already retries it on the reader side
+— a tidy story that turned out to be the wrong call entirely.
 
-The synchronous push hit this in most runs at 4/8 subscribers; the async
-push has not reproduced it in any run so far. That is timing, not a fix —
-nothing in this change addresses the missing retry, and it should not be
-treated as fixed. `b_push_fanout` is therefore built but deliberately not
-registered as a ctest, so the suite stays honest about this rather than
-going red on an open bug; run it by hand.
+Instrumenting every `continue` in the loop named it exactly:
+`ssg_get_group_member_id_from_rank()` failing for **ranks 7 and 8 at the
+final step**, reproducibly, 3 runs out of 3. That is a
+time-of-check/time-of-use bug on the rank space. The loop read
+`ssg_get_group_size()` once and then walked ranks 0..N-1 doing blocking
+network I/O in the body; a subscriber that receives its last push and calls
+`H5Fclose()` leaves the SSG group *while the loop is still running*, the
+group shrinks, and the top ranks stop existing. SSG was answering honestly
+the whole time — asking a mutable rank space for a stable identity, across
+blocking calls, was the mistake. **Not a third-party bug**, which is worth
+stating plainly given how close the earlier `ssg_get_group_member_addr()`
+theory came to being filed as one.
 
-The fix is a retry around the writer-side address lookup mirroring the
-reader-side one, and — separately and more importantly — deciding whether
-"best-effort push" should be allowed to mean "silently lose a step's data
-for one subscriber". A subscriber has no way to detect the loss today.
+Fixed by iterating the subscription snapshot itself rather than the group's
+ranks. The snapshot already holds exactly the members subscribed to this
+path, and a `ssg_member_id_t` stays valid whether or not that member is
+still present — `ssg_get_group_member_addr()` then reports a departure per
+member, without touching anyone else's push. This also deletes the
+`O(group_size * n_snapshot)` match loop, since the subscribers to one path
+are typically far fewer than the group's members.
+
+Verified the way a regression fix should be: the bug reproduced **3/3**
+before and **0/4** after, on the same harness, using the inline-wait
+variant where it fires most reliably. `b_push_fanout` is now registered as
+a ctest (every subscriber verifies every value it receives, so it guards
+this directly), and the suite is 43/43 across three consecutive runs.
 
 **Benchmarked 2026-08-15: the growing time-series array, streamed for
 real.** ADIOS2 has no published benchmark for this exact case either --

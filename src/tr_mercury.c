@@ -1773,7 +1773,6 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
                         const uint8_t *space_enc, uint64_t space_enc_len)
 {
     ssg_member_id_t   self_id;
-    int                 group_size, i;
     uint64_t           write_end;
 
     if (!tr || !path || elem_size == 0)
@@ -1781,8 +1780,6 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
     if (tr->group_id == SSG_GROUP_ID_INVALID)
         return 0; /* no group -- no subscribers possible, same "proceed" tolerance as broadcast */
     if (SSG_SUCCESS != ssg_get_self_id(tr->mid, &self_id))
-        return 0;
-    if (SSG_SUCCESS != ssg_get_group_size(tr->group_id, &group_size))
         return 0;
 
     write_end = write_start + write_count;
@@ -1865,12 +1862,32 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
         }
         pthread_mutex_unlock(&tr->sub_lock);
 
-        for (i = 0; i < group_size; i++) {
+        /* Iterate the subscribers themselves, NOT the group's rank space.
+         *
+         * This used to walk ranks 0..ssg_get_group_size()-1 and look each
+         * rank's member up, which is a time-of-check/time-of-use bug: the
+         * loop body does blocking network I/O, and a subscriber that
+         * receives its last push and closes leaves the SSG group while the
+         * loop is still running. The group then shrinks, the top ranks stop
+         * existing, and ssg_get_group_member_id_from_rank() correctly fails
+         * for them -- silently dropping the pushes of subscribers that had
+         * nothing to do with the departure. Reproduced by
+         * test/b_push_fanout.c at 8 subscribers: ranks 7 and 8 skipped at
+         * the final step, two readers left waiting for data that was never
+         * sent, every time. SSG was answering honestly; indexing a mutable
+         * rank space across blocking calls was the mistake.
+         *
+         * The snapshot already holds exactly the members subscribed to this
+         * path, so a member_id is all that is needed -- it stays valid
+         * whether or not that member is still present, and
+         * ssg_get_group_member_addr() below is what reports a departure, per
+         * member, without touching anyone else's push. This also drops the
+         * O(group_size * n_snapshot) match loop, since subscribers to one
+         * path are typically far fewer than group members. */
+        for (si = 0; si < n_snapshot; si++) {
         ssg_member_id_t member_id;
         hg_addr_t         addr;
         hg_handle_t        handle;
-        size_t             j;
-        int                subscribed = 0;
         uint64_t           sub_start = 0, sub_end = 0, overlap_start, overlap_end, overlap_count;
         uint8_t           *sub_dcpl_enc = NULL;
         uint64_t           sub_dcpl_enc_len = 0;
@@ -1883,35 +1900,28 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
         int                n_sel = 1, n_runs = 1, sr, r;
         int                member_unreachable = 0;
 
-        if (SSG_SUCCESS != ssg_get_group_member_id_from_rank(tr->group_id, i, &member_id))
-            continue;
+        member_id = snapshot[si].member_id;
+
+        /* A writer does not subscribe to itself, but the table is populated
+         * from the wire, so keep the guard. */
         if (member_id == self_id)
             continue;
 
-        for (j = 0; j < n_snapshot; j++)
-            if (snapshot[j].member_id == member_id) {
-                sub_start = snapshot[j].sel_start;
-                /* UINT64_MAX sel_count means "whole object" -- keep sub_end
-                 * at the UINT64_MAX sentinel too rather than computing
-                 * sel_start + sel_count, which would overflow. */
-                sub_end   = (snapshot[j].sel_count == UINT64_MAX) ? UINT64_MAX
-                                                                    : sub_start + snapshot[j].sel_count;
-                /* Take ownership out of the snapshot rather than copying
-                 * again -- sub_table has at most one entry per (member_id,
-                 * path) pair, so this slot is never matched a second time. */
-                sub_dcpl_enc      = snapshot[j].dcpl_enc;
-                sub_dcpl_enc_len  = snapshot[j].dcpl_enc_len;
-                sub_pred_enc      = snapshot[j].pred_enc;
-                sub_pred_enc_len  = snapshot[j].pred_enc_len;
-                sub_space_enc     = snapshot[j].space_enc;
-                sub_space_enc_len = snapshot[j].space_enc_len;
-                snapshot[j].dcpl_enc = snapshot[j].pred_enc = snapshot[j].space_enc = NULL;
-                subscribed = 1;
-                break;
-            }
-
-        if (!subscribed)
-            continue;
+        sub_start = snapshot[si].sel_start;
+        /* UINT64_MAX sel_count means "whole object" -- keep sub_end at the
+         * UINT64_MAX sentinel too rather than computing sel_start +
+         * sel_count, which would overflow. */
+        sub_end = (snapshot[si].sel_count == UINT64_MAX) ? UINT64_MAX : sub_start + snapshot[si].sel_count;
+        /* Take ownership out of the snapshot rather than copying again --
+         * each slot is visited exactly once now, so nothing else can claim
+         * these. */
+        sub_dcpl_enc      = snapshot[si].dcpl_enc;
+        sub_dcpl_enc_len  = snapshot[si].dcpl_enc_len;
+        sub_pred_enc      = snapshot[si].pred_enc;
+        sub_pred_enc_len  = snapshot[si].pred_enc_len;
+        sub_space_enc     = snapshot[si].space_enc;
+        sub_space_enc_len = snapshot[si].space_enc_len;
+        snapshot[si].dcpl_enc = snapshot[si].pred_enc = snapshot[si].space_enc = NULL;
 
         /* M8.5: only the overlap between what this member asked for and
          * what was just written -- never the whole write, and never

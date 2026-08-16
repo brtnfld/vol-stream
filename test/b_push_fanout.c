@@ -5,8 +5,16 @@
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
 /*
- * Benchmark, not a correctness test: how the writer's own per-step cost
- * scales with the NUMBER OF SUBSCRIBERS.
+ * A benchmark that turned into a correctness gate too: how the writer's own
+ * per-step cost scales with the NUMBER OF SUBSCRIBERS.
+ *
+ * The correctness half was not planned. Writing this found a real data-loss
+ * bug -- the push loop walked the SSG *rank* space while doing blocking
+ * network I/O, so a subscriber closing mid-loop shrank the group and
+ * silently dropped other subscribers' pushes (see docs/dev-plan.md, and
+ * vs_tr_writer_push_data()'s own comment). Because every subscriber below
+ * verifies every value it receives, this file is the regression guard for
+ * that fix: it reproduced the bug 3/3 before and 0/4 after.
  *
  * b_stream_grow.c and b_stream_grow_tail.c both measure one writer against
  * exactly one subscriber, which is the case where the data push matters

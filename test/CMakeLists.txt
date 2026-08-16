@@ -98,16 +98,19 @@ if(VOL_STREAM_HAVE_MERCURY)
   # measure a single subscriber, the case where it matters least. See its
   # own top comment.
   #
-  # Built but deliberately NOT registered as a test: running it surfaced a
-  # real, pre-existing bug that has nothing to do with the benchmark itself
-  # -- at 4 and 8 subscribers the writer intermittently issues one fewer
-  # data push than it has (subscriber, step) pairs, and the subscriber that
-  # loses one then blocks until its H5Fget_subscribed_data() timeout. See
-  # docs/dev-plan.md ("a subscriber's push can go missing at fan-out").
-  # Registering it would make the suite red on that open bug rather than on
-  # anything this benchmark is measuring; run it by hand until it is fixed.
+  # Registered as a test, not just built: writing it exposed a real bug
+  # (the writer indexed the SSG rank space across blocking pushes, so one
+  # subscriber closing mid-loop silently dropped other subscribers' data --
+  # see docs/dev-plan.md), and because every subscriber here verifies every
+  # value it receives, this is the regression guard for that fix. It
+  # reproduced the bug 3/3 before and 0/4 after.
   add_executable(b_push_fanout b_push_fanout.c)
   target_link_libraries(b_push_fanout PRIVATE vol_stream)
+  add_test(NAME push_fanout_benchmark COMMAND b_push_fanout)
+  set_tests_properties(push_fanout_benchmark PROPERTIES
+    ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
+    TIMEOUT 300
+  )
 
   # Every test above registers the connector explicitly, which leaves the
   # process default VOL native -- and that is exactly what hid the connector's
