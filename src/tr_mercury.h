@@ -143,6 +143,39 @@ typedef int (*vs_tr_refilter_fn)(const void *raw_buf, uint64_t elem_size, uint64
  * once, right after vs_tr_start(), before any step replay can run. */
 void vs_tr_set_refilter_cb(vs_tr_t *tr, vs_tr_refilter_fn fn);
 
+/* M8.5 follow-up: implemented by H5VLstream.c, registered via
+ * vs_tr_set_refilter_shape_cb(). Query-only, deliberately kept separate
+ * from vs_tr_refilter_fn rather than changing that callback's contract:
+ * given a subscriber's dcpl_enc and the element count of one run about to
+ * be pushed to them, reports how many elements per chunk that DCPL
+ * actually asked for via H5Pget_chunk() -- 0 means "no real preference
+ * (unchunked, or a chunk shape >= count)," in which case the caller pushes
+ * the whole run as one RPC exactly as before, calling vs_tr_refilter_fn
+ * once with the full run.
+ *
+ * A return > 0 and < count means the caller instead splits the run into
+ * that many (or fewer, for a final remainder) elements per slice and calls
+ * vs_tr_refilter_fn once per slice, each becoming its own RPC with its own
+ * elem_start/elem_count -- the same "one push per contiguous run"
+ * mechanism M8.5's selection-run splitting and M9's predicate-run
+ * splitting already use (see the reader-side note on
+ * vs_tr_reader_wait_data() below), just splitting on chunk boundaries
+ * instead of selection/predicate-match boundaries. This is why the far
+ * side (vs_tr_reader_wait_data()) needs no change at all: each slice's own
+ * refiltered bytes already are a single real chunk of exactly the
+ * subscriber's requested size, the same shape vs_tr_refilter_fn always
+ * produces -- only what counts as "the whole run" being refiltered in one
+ * call changes, at the caller, not the callback's own behavior.
+ *
+ * NULL (the default) means every push still goes out as one RPC per run,
+ * exactly the original M8.5 behavior -- the residual this closes is
+ * opt-in via registering this callback, not a behavior change on its own.
+ * Same threading rule as vs_tr_set_refilter_cb(): call once, right after
+ * vs_tr_start(). */
+typedef uint64_t (*vs_tr_refilter_shape_fn)(const uint8_t *dcpl_enc, uint64_t dcpl_enc_len, uint64_t count,
+                                              uint64_t elem_size);
+void vs_tr_set_refilter_shape_cb(vs_tr_t *tr, vs_tr_refilter_shape_fn fn);
+
 /* M9 predicate pushdown: one maximal contiguous run of matching elements,
  * counted in elements relative to the overlap slice handed to
  * vs_tr_predicate_fn -- start == 0 is that slice's first element, not the

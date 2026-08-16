@@ -513,6 +513,47 @@ resolution — this increment only changes *which rank* issues each
 region is not yet combined into fewer/larger writes or specially resolved on
 read.
 
+**Update 2026-08-16: the "still open" wording above overstated what was
+actually missing.** Reading the code directly (not just this paragraph)
+before touching anything: a concentrated write already lands as an ordinary
+`H5VLdataset_write()` against the real underlying file, with the originating
+rank's own hyperslab selection intact — a reader was never broken or
+suboptimal, since plain HDF5 hyperslab I/O already resolves a decomposition
+mismatch between writer and reader for free once bytes are real file bytes
+(`test/t_parallel.c`'s reader phase already uses an independently-computed
+decomposition that need not match the writer's, and always did). There was
+never a read-side gap to close, and `H5Sselect_project_intersection` was
+never actually needed for correctness here.
+
+What *was* real: `H5VL__stream_replay_concentrated_writes()` opened and
+closed the target dataset once per contributing entry — once per rank's own
+write, whether local or received — even when several entries in one group
+targeted the same shared path. Closed by gathering every entry (this rank's
+own plus every group member's, decode-only via a new `H5VL__stream_recv_
+entry()`) into one job list *before* issuing any I/O, then grouping by path:
+entries sharing a path — regardless of which member they came from — now
+share one `H5VLdataset_open()`/`H5VLdataset_close()` pair, each entry still
+getting its own `H5VLdataset_write()` call in exactly the original relative
+order. Deliberately *not* combined into one `H5VLdataset_write()` call via
+its `count`-array form across contributors sharing a path: that would need
+building one unioned destination selection (`H5Sselect_hyperslab(...,
+H5S_SELECT_OR, ...)`) and a matching flattened memory-side gather buffer in
+the file selection's own iteration order — exactly the selection-algebra
+shape `H5Sselect_project_intersection` would have been for, and HDF5 does
+not document a same-dataset-repeated-in-one-multi-write ordering guarantee
+strong enough to trust for overlapping regions without far deeper
+verification than this pass could give it. Reopen elimination is the safe,
+verifiable slice of "combine into fewer/larger writes" and is what actually
+matched "the current cost" this section originally meant (repeated
+open/close, not repeated write, per entry).
+
+Verified against the exact same two aggregation shapes this section already
+claimed (3→2, 7→3 two-groups-plus-singleton), byte-exact, via
+`run_parallel_test.sh --concentration N` run directly — and, since that
+script had never actually been CI-wired despite the claim above, two new
+`ctest` entries now cover it for real: `parallel_concentration` (3→2) and
+`parallel_concentration_7x3`.
+
 ### M7 — Queue policy and BAKE spill · M
 
 `Block`, `Discard` and `Spill`, plus reserve slots and latest-step-only for
@@ -674,6 +715,48 @@ implied: re-filtering still builds a single chunk spanning the pushed run
 rather than honoring a chunk *shape* a subscriber's DCPL asks for. That
 affects how a re-filtered push is stored on the way across, not which
 elements are chosen.
+
+**Update 2026-08-16: closed, and without a wire-format change.** The
+obvious-looking fix — teach `H5VL__stream_refilter_for_subscriber()` to
+write several real chunks and send them as one bigger RPC — would have
+meant extending `vs_data_push_in_t` itself (today: one `payload` blob, one
+`filter_mask`) to carry an array of chunks, a change to the Mercury proc
+struct every writer and reader in a running job shares.
+
+Not needed. `H5Fget_subscribed_data()` already accepts several independent
+pushes for one logical write — that is exactly what selection-run splitting
+(the paragraph above) and M9's predicate-run splitting already do, each run
+becoming its own `vs_data_push_in_t` RPC with its own `elem_start`/
+`elem_count`. Chunk-shape honoring reuses that same mechanism instead of
+inventing a second one: a new query-only callback,
+`vs_tr_refilter_shape_fn` (`H5VL__stream_refilter_shape_for_subscriber()`
+in `src/H5VLstream.c`), decodes a subscriber's `dcpl_enc` just far enough to
+answer "how many elements per chunk did this DCPL actually ask for via
+`H5Pget_chunk()`" — 0 when there is no real preference (unchunked, or a
+requested shape ≥ the run), which is every existing test
+(`test/t_precision.c`, `test/t_chunk_zerocopy.c` both request a chunk shape
+equal to the whole extent) and therefore a provable no-op against every
+prior caller. A non-zero answer smaller than the run makes `vs_tr_writer_
+push_data()`'s per-run loop in `src/tr_mercury.c` split that run into
+that-sized slices and call the *existing*, unmodified `vs_tr_refilter_fn`
+once per slice — `H5VL__stream_refilter_for_subscriber()` needed no
+internal change at all, since handing it a smaller `count` already produces
+a correctly-sized single chunk of exactly that count, the same "spans the
+run" behavior it always had, just applied to a smaller run. The push-loop's
+repeated RPC-forward logic was factored into `vs_tr_push_one_item()` so the
+whole-run path (unchanged) and the new per-slice path share it rather than
+duplicating the margo forward/timeout/cleanup sequence.
+
+New test, since none of the existing precision/chunk tests could have
+caught a regression here (all of them request a chunk shape equal to the
+whole run, exactly the case that must *not* split): `test/t_chunk_shape_
+split.c`, 64 ints, subscriber requests a chunk shape of 16 — asserts
+exactly 4 pushes of 16 elements each are received (not 1 of 64), each
+independently GZIP-filtered and correctly decoded across chunk boundaries.
+Verified both ways: passes with the new callback registered, and — reverted
+(`if (0) vs_tr_set_refilter_shape_cb(...)`) — fails with exactly the old
+symptom (1 push of 64), confirming the test actually exercises the change
+rather than passing by construction.
 
 ### M9 — Tools and the long tail · M
 
@@ -1267,6 +1350,110 @@ version of `benchmark/adios2_compare/README.md` claimed `adios2_bench.cpp`
 already used the tail-only idiom -- it did not (it writes a full rewrite
 every step, same as `test/b_stream_grow.c`); that was a real documentation
 error, corrected here and in `adios2_bench_tail.cpp`'s introduction.
+
+#### The asynchronous subscriber push — shipped 2026-08-16, and it is worth ~6%, not 15x
+
+The first of those two options is built. Measured before assuming, which
+turned out to matter: **the blocking push was never big enough to explain
+the ADIOS2 gap.** Instrumenting the forward directly (`VOL_STREAM_PUSH_STATS=1`,
+reported by `vs_tr_stop()`) put it at 3.1–3.9 ms of a ~48 ms
+`b_stream_grow_tail.c` run and 24–27 ms of a ~305 ms `b_stream_grow.c` run
+— **7–9% of the writer's own time**, so even eliminating it entirely could
+not have closed a 15.5x ratio. Anyone reading the paragraph above as "async
+push is one of the two things that would close the gap" should read this
+instead: it is a real but modest win, and the gap remains a fixed-per-step-
+cost problem.
+
+What made it worth doing anyway is that the same instrumentation showed the
+cost was almost perfectly *hideable*. The writer work between a step's last
+push and its `step_ready` broadcast — the rest of replay, discarding the
+pending buffer, resolving the step's deferred-request completion — measured
+~28 ms and ~237 ms against pushes costing ~3 ms and ~25 ms. An order of
+magnitude more room than needed.
+
+So each push is now issued with `margo_iforward_timed()` and parked on a
+per-transport in-flight list (`vs_tr_inflight_t`), and the whole set is
+settled once by `vs_tr_drain_pushes()` at the top of
+`vs_tr_writer_broadcast_step_ready()` — before the step is announced.
+Draining *there* rather than later is what keeps this a pure latency
+overlap and not a change in what a subscriber observes: a reader woken by
+`step_ready` still finds the step's data already queued, and pushes cannot
+reorder across a step boundary because step N's are all complete before
+step N+1's are issued. `vs_tr_stop()` drains too, for a writer that pushed
+and closed without ending the step.
+
+**No payload copy was needed, and that was verified rather than assumed.**
+The design depends on Mercury serializing the input during
+`margo_iforward()` rather than at wait time, because `H5Fend_step()` frees
+the replay payload buffers between issuing these pushes and draining them —
+a deferred read would send freed memory, which is silent corruption rather
+than a crash. Confirmed directly with a standalone probe: forward a 1 MiB
+payload (past the eager path, so the bulk/extra-buffer route is exercised
+too), overwrite the source the instant `iforward()` returns, and the
+receiver still sees every original byte.
+
+Measured A/B, same binary, the only difference a one-line probe restoring
+the inline wait (so build-to-build variance cannot explain it):
+
+| | inline wait | async | |
+|---|---|---|---|
+| `b_stream_grow_tail.c`, total wall (median of 7) | 42.65 ms | 40.10 ms | **6.0% faster** |
+| `b_stream_grow.c`, throughput (median of 5) | 146.64 MiB/s | 155.68 MiB/s | **6.2% faster** |
+| time blocked in the push path, tail | 2.8–3.9 ms | 0.69–0.87 ms | ~4x less |
+| time blocked in the push path, full | 24–26 ms | 4.4–4.7 ms | ~5.5x less |
+
+The residual blocked time is issue cost — `margo_create()` plus the input
+proc's copy of the payload into Mercury's own buffer — which is real and
+does not go away.
+
+**The fan-out win predicted for this change did not materialize, at least
+not on this transport.** The reasoning was that the writer issues one push
+per (subscriber, selection run, predicate run, chunk), so waiting inline
+costs the *sum* of those round trips while draining once costs roughly the
+slowest — a per-subscriber term that should collapse from a network round
+trip to an issue cost. `test/b_push_fanout.c` was written to measure
+exactly that (1/2/4/8 subscribers, each its own process, each verifying
+every value it receives). It does not show it: the per-subscriber slope is
+~0.08 ms inline and ~0.077 ms async — no meaningful difference. The reason
+is visible in the same stats: on loopback `ofi+tcp` a push round trip is
+only ~12–24 us here, so there is almost nothing per subscriber to overlap.
+The prediction may still hold on a real fabric with real round trips; it is
+not demonstrated, and should not be claimed until it is.
+
+#### Open bug: a subscriber's push can go missing at fan-out
+
+Running `test/b_push_fanout.c` surfaced a real defect that predates this
+work and is independent of it. At 4 and 8 subscribers the writer
+intermittently issues **one fewer data push than it has (subscriber, step)
+pairs** — 238 or 239 of an expected 240 — and the subscriber that loses one
+then blocks until its `H5Fget_subscribed_data()` timeout, having received
+every earlier step correctly.
+
+What it is *not*, ruled out by measurement rather than reasoning: not a
+forward timeout (239 pushes totalled ~11 ms, so nothing waited near the 1 s
+bound), and not a stale group or subscription view (instrumenting the push
+loop showed `group_size=9` and all 8 matching subscriptions present at
+every single step). The push is therefore dropped by one of the
+early-`continue` paths in `vs_tr_writer_push_data()`'s member loop, and the
+most likely candidate is the `ssg_get_group_member_addr()` call — which
+this same file *already documents as transiently failing*, and already
+retries for on the reader side (`vs_tr_reader_join_group()` retries it 10
+times at 50 ms). The writer's push loop makes the identical call with no
+retry: it just `continue`s, silently dropping that subscriber's data for
+that step, with no error surfaced to either side and no record that
+anything was lost.
+
+The synchronous push hit this in most runs at 4/8 subscribers; the async
+push has not reproduced it in any run so far. That is timing, not a fix —
+nothing in this change addresses the missing retry, and it should not be
+treated as fixed. `b_push_fanout` is therefore built but deliberately not
+registered as a ctest, so the suite stays honest about this rather than
+going red on an open bug; run it by hand.
+
+The fix is a retry around the writer-side address lookup mirroring the
+reader-side one, and — separately and more importantly — deciding whether
+"best-effort push" should be allowed to mean "silently lose a step's data
+for one subscriber". A subscriber has no way to detect the loss today.
 
 **Benchmarked 2026-08-15: the growing time-series array, streamed for
 real.** ADIOS2 has no published benchmark for this exact case either --

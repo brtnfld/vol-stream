@@ -501,6 +501,22 @@ static herr_t H5VL__stream_drain_spill(H5VL_stream_t *file_obj, uint64_t min_ack
 #endif
 static herr_t H5VL__stream_apply_queue_policy(H5VL_stream_t *file_obj);
 #ifdef H5_HAVE_PARALLEL
+/* M6.5 concentrator topology: one write "job" gathered by a concentrator,
+ * either its own (borrowed straight from fs->pending[], recv_msg/recv_path
+ * NULL) or received from a group member (recv_msg/recv_path own the
+ * storage type_id/space_id/payload/path point into or were decoded from --
+ * see H5VL__stream_recv_entry()). Grouping these by path before issuing
+ * any I/O is what lets H5VL__stream_replay_concentrated_writes() open a
+ * shared target dataset once instead of once per contributing entry. */
+typedef struct H5VL_stream_concentrated_job_t {
+    const char *path;
+    hid_t       type_id;
+    hid_t       space_id;
+    const void *payload;
+    uint8_t    *recv_msg;  /* NULL for a local (borrowed) entry */
+    char       *recv_path; /* NULL for a local (borrowed) entry */
+} H5VL_stream_concentrated_job_t;
+
 /* M6.5: heterogeneous per-rank object sets -- see
  * H5VL__stream_replay_step_parallel()'s comment for the full design. */
 static herr_t H5VL__stream_build_agg_manifest(H5VL_stream_file_state_t *fs, uint8_t **out_buf,
@@ -519,8 +535,10 @@ static herr_t H5VL__stream_write_replica(H5VL_stream_t *file_obj, uint64_t physi
                              const char *rel_path, hid_t type_id, hid_t space_id, const void *payload);
 static herr_t H5VL__stream_send_write_entry_to_concentrator(const H5VL_stream_pending_entry_t *pe,
                              int concentrator, MPI_Comm comm);
-static herr_t H5VL__stream_recv_and_write_entry(H5VL_stream_t *file_obj, uint64_t physical_step,
-                             int source, MPI_Comm comm);
+static herr_t H5VL__stream_recv_entry(int source, MPI_Comm comm, H5VL_stream_concentrated_job_t *job_out);
+static herr_t H5VL__stream_job_list_append(H5VL_stream_concentrated_job_t **jobs, size_t *n_jobs,
+                             size_t *cap_jobs, const char *path, hid_t type_id, hid_t space_id,
+                             const void *payload, uint8_t *recv_msg, char *recv_path);
 static herr_t H5VL__stream_replay_concentrated_writes(H5VL_stream_t *file_obj, uint64_t physical_step,
                              int group_size);
 #endif
@@ -563,6 +581,12 @@ static int H5VL__stream_unfilter_pushed_data(const void *filtered_buf, uint64_t 
                              const uint8_t *dcpl_enc, uint64_t dcpl_enc_len, const uint8_t *type_enc,
                              uint64_t type_enc_len, uint64_t count, uint32_t filter_mask, void **out_buf,
                              size_t *out_len);
+/* M8.5 follow-up: vs_tr_refilter_shape_fn's implementation -- see its
+ * comment in tr_mercury.h for why this closes the "always builds a single
+ * chunk spanning the pushed run" residual without H5VL__stream_refilter_
+ * for_subscriber() itself needing any change. */
+static uint64_t H5VL__stream_refilter_shape_for_subscriber(const uint8_t *dcpl_enc, uint64_t dcpl_enc_len,
+                             uint64_t count, uint64_t elem_size);
 /* M9 predicate pushdown: vs_tr_predicate_fn's implementation -- see
  * H5VL__stream_eval_predicate()'s comment. */
 static int H5VL__stream_eval_predicate(const void *raw_buf, uint64_t elem_size, uint64_t count,
@@ -1567,9 +1591,10 @@ H5VL__stream_transport_start_writer(H5VL_stream_file_state_t *fs, const char *na
         return;
 
     /* M8.5 precision, and M9 predicate pushdown: register once, right after
-     * start -- see vs_tr_set_refilter_cb()'s comment. Both are writer-side
-     * callbacks, so this is the only place either needs to be set. */
+     * start -- see vs_tr_set_refilter_cb()'s comment. All writer-side
+     * callbacks, so this is the only place any of them needs to be set. */
     vs_tr_set_refilter_cb(fs->transport, H5VL__stream_refilter_for_subscriber);
+    vs_tr_set_refilter_shape_cb(fs->transport, H5VL__stream_refilter_shape_for_subscriber);
     vs_tr_set_predicate_cb(fs->transport, H5VL__stream_eval_predicate);
     vs_tr_set_selection_cb(fs->transport, H5VL__stream_selection_runs);
 
@@ -2817,6 +2842,62 @@ done:
         H5Pclose(dcpl);
     return ret_value;
 } /* end H5VL__stream_refilter_for_subscriber() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_refilter_shape_for_subscriber
+ *
+ * Purpose:     M8.5 follow-up: vs_tr_refilter_shape_fn's implementation --
+ *              see that typedef's comment in tr_mercury.h for the full
+ *              design. Decodes the subscriber's own dcpl_enc just far
+ *              enough to answer one question: did they ask for real
+ *              chunking (H5D_CHUNKED layout, H5Pget_chunk() dims[0] > 0),
+ *              and is that shape smaller than the run tr_mercury.c is
+ *              about to push? If so, the caller splits the run into that
+ *              many elements per RPC instead of pushing it as one chunk
+ *              spanning the whole run; H5VL__stream_refilter_for_
+ *              subscriber() itself needs no change at all, since a smaller
+ *              count handed to it already produces a correctly-sized
+ *              single chunk (the same "spanning the run" behavior, just
+ *              applied to a smaller run).
+ *
+ *              0 (no split) covers every case that must not split: no
+ *              dcpl_enc, a dcpl_enc that fails to decode, an unchunked
+ *              layout, or a requested chunk shape >= count -- every one of
+ *              this connector's current tests requests a chunk shape equal
+ *              to the whole run/extent (test/t_precision.c, test/t_
+ *              chunk_zerocopy.c), which is exactly the "no split" case, so
+ *              this function is provably a no-op against every existing
+ *              caller until a subscriber actually asks for something
+ *              smaller.
+ *
+ * Return:      Elements per chunk if the subscriber's DCPL asks for a real
+ *              chunk shape smaller than count; 0 otherwise (including any
+ *              decode failure -- declining, not erroring, matches every
+ *              other M8.5/M9 callback's "over-send rather than fail" rule).
+ *-------------------------------------------------------------------------
+ */
+static uint64_t
+H5VL__stream_refilter_shape_for_subscriber(const uint8_t *dcpl_enc, uint64_t dcpl_enc_len, uint64_t count,
+                                            uint64_t elem_size)
+{
+    hid_t    dcpl = H5I_INVALID_HID;
+    hsize_t  chunk_dims[1];
+    uint64_t result = 0;
+
+    (void)elem_size;
+
+    if (!dcpl_enc || dcpl_enc_len == 0)
+        return 0;
+    if ((dcpl = H5Pdecode(dcpl_enc)) < 0)
+        return 0;
+
+    if (H5Pget_layout(dcpl) == H5D_CHUNKED && H5Pget_chunk(dcpl, 1, chunk_dims) == 1 && chunk_dims[0] > 0 &&
+        (uint64_t)chunk_dims[0] < count)
+        result = (uint64_t)chunk_dims[0];
+
+    H5Pclose(dcpl);
+    return result;
+} /* end H5VL__stream_refilter_shape_for_subscriber() */
 
 /*-------------------------------------------------------------------------
  * M9, predicate pushdown.
@@ -6592,7 +6673,7 @@ done:
 } /* end H5VL__stream_send_write_entry_to_concentrator() */
 
 /*-------------------------------------------------------------------------
- * Function:    H5VL__stream_recv_and_write_entry
+ * Function:    H5VL__stream_recv_entry
  *
  * Purpose:     M6.5 concentrator topology. The receive side of
  *              H5VL__stream_send_write_entry_to_concentrator(): MPI_Probe
@@ -6600,16 +6681,21 @@ done:
  *              variable-length -- payload size differs per write), decode
  *              the type/space back into real ids via H5Tdecode2()/
  *              H5Sdecode() (mirrors how H5VL__stream_replay_manifest()
- *              already decodes a manifest entry's type_enc/space_enc), and
- *              perform the write via H5VL__stream_write_replica() exactly
- *              as if this rank had originated the entry itself.
+ *              already decodes a manifest entry's type_enc/space_enc).
+ *              Decode-only, deliberately: H5VL__stream_replay_concentrated_
+ *              writes() gathers every member's jobs before writing any of
+ *              them, so a shared target path opens once instead of once
+ *              per contributing entry -- see its own comment. *job_out
+ *              takes ownership of the raw recv buffer and the decoded
+ *              type_id/space_id; the caller frees them (H5VL__stream_
+ *              concentrated_job_release() at the end of the replay pass).
  *
  * Return:      Success:    0
  *              Failure:    -1
  *-------------------------------------------------------------------------
  */
 static herr_t
-H5VL__stream_recv_and_write_entry(H5VL_stream_t *file_obj, uint64_t physical_step, int source, MPI_Comm comm)
+H5VL__stream_recv_entry(int source, MPI_Comm comm, H5VL_stream_concentrated_job_t *job_out)
 {
     MPI_Status status;
     int        count = 0;
@@ -6619,27 +6705,22 @@ H5VL__stream_recv_and_write_entry(H5VL_stream_t *file_obj, uint64_t physical_ste
     char      *path = NULL;
     uint8_t   *type_enc, *space_enc, *payload;
     hid_t      type_id = -1, space_id = -1;
-    herr_t     ret_value = 0;
 
-    if (MPI_SUCCESS != MPI_Probe(source, 9102, comm, &status)) {
-        ret_value = -1;
-        goto done;
-    }
+    if (MPI_SUCCESS != MPI_Probe(source, 9102, comm, &status))
+        return -1;
     MPI_Get_count(&status, MPI_BYTE, &count);
-    if (NULL == (msg = (uint8_t *)malloc((size_t)count))) {
-        ret_value = -1;
-        goto done;
-    }
+    if (NULL == (msg = (uint8_t *)malloc((size_t)count)))
+        return -1;
     if (MPI_SUCCESS != MPI_Recv(msg, count, MPI_BYTE, source, 9102, comm, MPI_STATUS_IGNORE)) {
-        ret_value = -1;
-        goto done;
+        free(msg);
+        return -1;
     }
 
     memcpy(&v, msg + off, sizeof(v));
     off += sizeof(v);
     if (NULL == (path = (char *)malloc((size_t)v + 1))) {
-        ret_value = -1;
-        goto done;
+        free(msg);
+        return -1;
     }
     memcpy(path, msg + off, (size_t)v);
     path[v] = '\0';
@@ -6650,8 +6731,9 @@ H5VL__stream_recv_and_write_entry(H5VL_stream_t *file_obj, uint64_t physical_ste
     type_enc = msg + off;
     off += (size_t)v;
     if ((type_id = H5Tdecode2(type_enc, (size_t)v)) < 0) {
-        ret_value = -1;
-        goto done;
+        free(path);
+        free(msg);
+        return -1;
     }
 
     memcpy(&v, msg + off, sizeof(v));
@@ -6659,26 +6741,62 @@ H5VL__stream_recv_and_write_entry(H5VL_stream_t *file_obj, uint64_t physical_ste
     space_enc = msg + off;
     off += (size_t)v;
     if ((space_id = H5Sdecode(space_enc)) < 0) {
-        ret_value = -1;
-        goto done;
+        H5Tclose(type_id);
+        free(path);
+        free(msg);
+        return -1;
     }
 
     memcpy(&v, msg + off, sizeof(v));
     off += sizeof(v);
     payload = msg + off;
 
-    if (H5VL__stream_write_replica(file_obj, physical_step, path, type_id, space_id, payload) < 0)
-        ret_value = -1;
+    job_out->path      = path;
+    job_out->type_id   = type_id;
+    job_out->space_id  = space_id;
+    job_out->payload   = payload;
+    job_out->recv_msg  = msg;
+    job_out->recv_path = path;
+    return 0;
+} /* end H5VL__stream_recv_entry() */
 
-done:
-    if (type_id >= 0)
-        H5Tclose(type_id);
-    if (space_id >= 0)
-        H5Sclose(space_id);
-    free(path);
-    free(msg);
-    return ret_value;
-} /* end H5VL__stream_recv_and_write_entry() */
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_job_list_append
+ *
+ * Purpose:     M6.5 concentrator topology. Growable-array append for the
+ *              job list H5VL__stream_replay_concentrated_writes() gathers
+ *              before issuing any I/O -- same cap-doubling convention as
+ *              H5VL__stream_pending_append()'s fs->pending array.
+ *
+ * Return:      Success:    0
+ *              Failure:    -1
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_job_list_append(H5VL_stream_concentrated_job_t **jobs, size_t *n_jobs, size_t *cap_jobs,
+                              const char *path, hid_t type_id, hid_t space_id, const void *payload,
+                              uint8_t *recv_msg, char *recv_path)
+{
+    if (*n_jobs == *cap_jobs) {
+        size_t                           new_cap = *cap_jobs ? *cap_jobs * 2 : 8;
+        H5VL_stream_concentrated_job_t *grown;
+
+        if (NULL == (grown = (H5VL_stream_concentrated_job_t *)realloc(
+                         *jobs, new_cap * sizeof(H5VL_stream_concentrated_job_t))))
+            return -1;
+        *jobs     = grown;
+        *cap_jobs = new_cap;
+    }
+
+    (*jobs)[*n_jobs].path      = path;
+    (*jobs)[*n_jobs].type_id   = type_id;
+    (*jobs)[*n_jobs].space_id  = space_id;
+    (*jobs)[*n_jobs].payload   = payload;
+    (*jobs)[*n_jobs].recv_msg  = recv_msg;
+    (*jobs)[*n_jobs].recv_path = recv_path;
+    (*n_jobs)++;
+    return 0;
+} /* end H5VL__stream_job_list_append() */
 
 /*-------------------------------------------------------------------------
  * Function:    H5VL__stream_replay_concentrated_writes
@@ -6692,20 +6810,38 @@ done:
  *              group_size; the first rank in each group is that group's
  *              concentrator. A non-concentrator rank ships each of its own
  *              DsetWrite entries to its concentrator
- *              (H5VL__stream_send_write_entry_to_concentrator()) instead
- *              of writing it directly; the concentrator writes its own
- *              entries as usual (H5VL__stream_write_replica()) and then,
- *              for each other member of its group in ascending rank
- *              order, receives and writes that member's entries too
- *              (H5VL__stream_recv_and_write_entry()). The file ends up
- *              byte-identical to the non-concentrated path -- this changes
- *              *which rank* issues each H5VLdataset_write() call, not
- *              *what* gets written -- so it does not need
- *              H5Sselect_project_intersection() to combine contributors'
- *              selections into fewer, larger writes; that would be a
- *              further throughput optimization on top of this, not
- *              something correctness depends on, and is not attempted
- *              here.
+ *              (H5VL__stream_send_write_entry_to_concentrator()); the
+ *              concentrator gathers its own entries plus every other
+ *              group member's (H5VL__stream_recv_entry(), decode-only) into
+ *              one job list *before* issuing any I/O, then groups that
+ *              list by path.
+ *
+ *              This is the follow-up the file's earlier comment here
+ *              deferred: entries sharing a path -- whether they are this
+ *              rank's own or arrived from a member, and regardless of
+ *              which member -- now share a single H5VLdataset_open()/
+ *              H5VLdataset_close() pair instead of one pair per entry.
+ *              Each entry still gets its own H5VLdataset_write() call, in
+ *              exactly the original relative order (own entries first,
+ *              then members in ascending rank order, each member's own
+ *              entry order) -- deliberately not merged into one multi-
+ *              write via H5VLdataset_write()'s count>1 form, since that
+ *              would mean building one combined destination selection via
+ *              H5Sselect_hyperslab(..., H5S_SELECT_OR, ...) across
+ *              contributors and a matching flattened memory-side gather
+ *              buffer in the file selection's own iteration order --
+ *              exactly the H5Sselect_project_intersection()-shaped
+ *              selection algebra the earlier version of this comment
+ *              named and deferred, and still not attempted: HDF5 does not
+ *              document a same-dataset-repeated-in-one-multi-write-call
+ *              ordering guarantee strong enough to trust for overlapping
+ *              regions without much deeper verification than this session
+ *              can give it. What's implemented here is the same reopen
+ *              elimination described as "the current cost" (repeated
+ *              open/close, not repeated write, per entry), so per-entry
+ *              write semantics -- and therefore file content -- are
+ *              unchanged from the non-batched path; only how many times
+ *              a shared target dataset is opened and closed goes down.
  *
  *              Deadlock-safety: a non-concentrator rank's sends never wait
  *              on anything from its concentrator, and a concentrator
@@ -6714,7 +6850,10 @@ done:
  *              communication pattern (members only ever talk to their own
  *              concentrator), so ordinary blocking MPI_Send/MPI_Recv
  *              cannot deadlock regardless of message size or how far
- *              ahead/behind any one rank runs.
+ *              ahead/behind any one rank runs. Gathering before writing
+ *              does not change this: every receive still happens before
+ *              any write, exactly as before, just deferred slightly later
+ *              within that same "before" window.
  *
  * Return:      Success:    0
  *              Failure:    -1
@@ -6723,13 +6862,17 @@ done:
 static herr_t
 H5VL__stream_replay_concentrated_writes(H5VL_stream_t *file_obj, uint64_t physical_step, int group_size)
 {
-    H5VL_stream_file_state_t *fs            = file_obj->file_state;
-    int                        my_rank       = fs->mpi_rank;
-    int                        nranks        = fs->mpi_size;
-    int                        concentrator  = (my_rank / group_size) * group_size;
-    int                        group_end     = concentrator + group_size;
-    size_t                     i;
-    int                        m;
+    H5VL_stream_file_state_t       *fs           = file_obj->file_state;
+    int                              my_rank      = fs->mpi_rank;
+    int                              nranks       = fs->mpi_size;
+    int                              concentrator = (my_rank / group_size) * group_size;
+    int                              group_end    = concentrator + group_size;
+    size_t                           i;
+    int                              m;
+    herr_t                           ret_value = 0;
+    H5VL_stream_concentrated_job_t *jobs      = NULL;
+    size_t                           n_jobs = 0, cap_jobs = 0;
+    int                             *done_flag = NULL;
 
     if (group_end > nranks)
         group_end = nranks;
@@ -6758,27 +6901,141 @@ H5VL__stream_replay_concentrated_writes(H5VL_stream_t *file_obj, uint64_t physic
         return 0;
     }
 
-    /* This rank is a concentrator: its own entries first, exactly like the
-     * non-concentrated path. */
-    if (H5VL__stream_replay_local_writes(file_obj, physical_step) < 0)
-        return -1;
+    /* This rank is a concentrator: gather its own entries first (borrowed
+     * straight from fs->pending[] -- recv_msg/recv_path NULL, nothing to
+     * free for these), exactly the same set H5VL__stream_replay_local_
+     * writes() would have used. */
+    for (i = 0; i < fs->n_pending; i++) {
+        H5VL_stream_pending_entry_t *pe = &fs->pending[i];
+
+        if (pe->kind != vs_Kind_DsetWrite)
+            continue;
+        if (H5VL__stream_job_list_append(&jobs, &n_jobs, &cap_jobs, pe->path, pe->type_id, pe->space_id,
+                                          pe->payload, NULL, NULL) < 0) {
+            ret_value = -1;
+            goto done;
+        }
+    }
 
     for (m = concentrator + 1; m < group_end; m++) {
         int n_entries = 0, k;
 
-        if (MPI_SUCCESS != MPI_Recv(&n_entries, 1, MPI_INT, m, 9101, fs->comm, MPI_STATUS_IGNORE))
-            return -1;
+        if (MPI_SUCCESS != MPI_Recv(&n_entries, 1, MPI_INT, m, 9101, fs->comm, MPI_STATUS_IGNORE)) {
+            ret_value = -1;
+            goto done;
+        }
 
-        for (k = 0; k < n_entries; k++)
-            if (H5VL__stream_recv_and_write_entry(file_obj, physical_step, m, fs->comm) < 0)
-                return -1;
+        for (k = 0; k < n_entries; k++) {
+            H5VL_stream_concentrated_job_t job;
+
+            memset(&job, 0, sizeof(job));
+            if (H5VL__stream_recv_entry(m, fs->comm, &job) < 0) {
+                ret_value = -1;
+                goto done;
+            }
+            if (H5VL__stream_job_list_append(&jobs, &n_jobs, &cap_jobs, job.path, job.type_id, job.space_id,
+                                              job.payload, job.recv_msg, job.recv_path) < 0) {
+                H5Tclose(job.type_id);
+                H5Sclose(job.space_id);
+                free(job.recv_msg);
+                free(job.recv_path);
+                ret_value = -1;
+                goto done;
+            }
+        }
 
         if (n_entries > 0)
             printf("  concentrator rank %d wrote %d DsetWrite entries on behalf of rank %d\n", my_rank,
                    n_entries, m);
     }
 
-    return 0;
+    /* Every job gathered, none written yet. Now group by path: for each
+     * not-yet-written job (in original order), open its dataset once and
+     * write every remaining job sharing that path before closing it. */
+    if (n_jobs > 0 && NULL == (done_flag = (int *)calloc(n_jobs, sizeof(int)))) {
+        ret_value = -1;
+        goto done;
+    }
+
+    for (i = 0; i < n_jobs; i++) {
+        char               step_root[32];
+        char              *full_path;
+        size_t             full_len;
+        H5VL_loc_params_t  loc_params;
+        void              *real;
+        size_t             j;
+
+        if (done_flag[i])
+            continue;
+
+        snprintf(step_root, sizeof(step_root), "/step/%llu", (unsigned long long)physical_step);
+        full_len = strlen(step_root) + strlen(jobs[i].path) + 1;
+        if (NULL == (full_path = (char *)malloc(full_len))) {
+            ret_value = -1;
+            goto done;
+        }
+        snprintf(full_path, full_len, "%s%s", step_root, jobs[i].path);
+
+        memset(&loc_params, 0, sizeof(loc_params));
+        loc_params.obj_type = H5I_FILE;
+        loc_params.type     = H5VL_OBJECT_BY_SELF;
+        real = H5VLdataset_open(file_obj->under_object, &loc_params, file_obj->under_vol_id, full_path,
+                                  H5P_DATASET_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL);
+        free(full_path);
+        if (!real) {
+            ret_value = -1;
+            goto done;
+        }
+
+        for (j = i; j < n_jobs; j++) {
+            hid_t    mem_space;
+            hssize_t n_elem;
+            hsize_t  n_elem_h;
+
+            if (done_flag[j] || strcmp(jobs[j].path, jobs[i].path) != 0)
+                continue;
+
+            if ((n_elem = H5Sget_select_npoints(jobs[j].space_id)) < 0) {
+                H5VLdataset_close(real, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+                ret_value = -1;
+                goto done;
+            }
+            n_elem_h = (hsize_t)n_elem;
+            if ((mem_space = H5Screate_simple(1, &n_elem_h, NULL)) < 0) {
+                H5VLdataset_close(real, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+                ret_value = -1;
+                goto done;
+            }
+
+            {
+                herr_t w = H5VLdataset_write(1, &real, file_obj->under_vol_id, &jobs[j].type_id, &mem_space,
+                                              &jobs[j].space_id, H5P_DATASET_XFER_DEFAULT, &jobs[j].payload,
+                                              NULL);
+
+                H5Sclose(mem_space);
+                if (w < 0) {
+                    H5VLdataset_close(real, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+                    ret_value = -1;
+                    goto done;
+                }
+            }
+            done_flag[j] = 1;
+        }
+
+        H5VLdataset_close(real, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+    }
+
+done:
+    free(done_flag);
+    for (i = 0; i < n_jobs; i++)
+        if (jobs[i].recv_msg) {
+            H5Tclose(jobs[i].type_id);
+            H5Sclose(jobs[i].space_id);
+            free(jobs[i].recv_msg);
+            free(jobs[i].recv_path);
+        }
+    free(jobs);
+    return ret_value;
 } /* end H5VL__stream_replay_concentrated_writes() */
 
 /*-------------------------------------------------------------------------

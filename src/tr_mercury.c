@@ -29,10 +29,33 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+/* Diagnostic accounting for the data-push path, enabled by setting
+ * VOL_STREAM_PUSH_STATS=1 in the environment and reported once by
+ * vs_tr_stop(). Off by default and read exactly once, so a normal run pays
+ * one relaxed load of an int per push and nothing else -- cheap enough to
+ * leave in, and the only way to attribute writer-side step time to "waiting
+ * on a subscriber" versus everything else H5Fend_step() does. */
+static int      vs_push_stats_on          = -1;
+static uint64_t vs_push_stats_n           = 0;
+static uint64_t vs_push_stats_ns          = 0;
+static uint64_t vs_push_stats_bytes       = 0;
+static uint64_t vs_push_stats_last_end_ns = 0;
+static uint64_t vs_push_stats_tail_ns     = 0;
+
+static uint64_t
+vs_now_ns(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+} /* end vs_now_ns() */
 
 MERCURY_GEN_PROC(vs_step_ready_in_t, ((uint64_t)(physical_step))((uint64_t)(wall_time_ns)))
 MERCURY_GEN_PROC(vs_step_ready_out_t, ((int32_t)(status)))
@@ -126,6 +149,47 @@ typedef struct vs_tr_pending_t {
     uint64_t physical_step;
     uint64_t wall_time_ns;
 } vs_tr_pending_t;
+
+/* Writer side: one data push forwarded but not yet completed.
+ *
+ * The push RPC used to block the writer inside margo_forward_timed() until
+ * the subscriber had answered, once per (subscriber, selection run,
+ * predicate run, chunk) -- so a step's pushes cost the sum of their round
+ * trips, serialized, in the middle of H5Fend_step(). Measured on
+ * test/b_stream_grow_tail.c that was ~3ms of a ~35ms run, and on
+ * test/b_stream_grow.c ~25ms of ~290ms: 7-9% of the writer's own time spent
+ * waiting on a reader that has nothing left to say.
+ *
+ * Now each push is issued with margo_iforward_timed() and parked here, and
+ * the whole set is completed once, just before the step is announced (see
+ * vs_tr_drain_pushes()). The same measurements say that window -- the
+ * writer work between a step's last push and its step_ready broadcast -- is
+ * ~28ms and ~237ms respectively, an order of magnitude more than the pushes
+ * cost, so they now overlap it instead of adding to it.
+ *
+ * owned is the refilter callback's malloc'd output (NULL when the payload
+ * pointed into the caller's own buffer), freed once the request completes.
+ * It is safe to free the *source* bytes as soon as margo_iforward() returns
+ * -- Mercury runs the input proc, copying the payload into the handle's own
+ * buffer, before the call returns. That is not an assumption: it was
+ * verified directly by forwarding a 1 MiB payload (past the eager path, so
+ * the bulk/extra-buffer route was exercised too), overwriting the source
+ * the instant iforward() returned, and confirming the receiver still saw
+ * every original byte. It has to hold, because H5Fend_step() frees the
+ * replay payload buffers between issuing these pushes and draining them. */
+typedef struct vs_tr_inflight_t {
+    hg_handle_t     handle;
+    margo_request   req;
+    void           *owned;
+    ssg_member_id_t member_id;
+} vs_tr_inflight_t;
+
+/* Cap on pushes in flight at once. Reaching it completes the oldest to free
+ * a slot, so a write fanning out to many subscribers/runs/chunks stays
+ * bounded in outstanding RPCs and in memory rather than issuing thousands.
+ * Well above any realistic per-write fan-out, so the common case never
+ * touches the backpressure path at all. */
+#define VS_TR_MAX_INFLIGHT_PUSHES 256
 
 /* M7: writer-side lag tracking, one entry per reader that has ever acked.
  * Absence from this table (never acked, or departed and pruned) means "not
@@ -256,6 +320,13 @@ struct vs_tr_t {
      * original M8/M8.5 behavior, until then. */
     vs_tr_refilter_fn refilter_fn;
 
+    /* M8.5 follow-up, writer side: chunk-shape query callback, see
+     * vs_tr_refilter_shape_fn's comment in tr_mercury.h. NULL until
+     * vs_tr_set_refilter_shape_cb() is called -- a refiltered push then
+     * always spans the whole run in one RPC, exactly the original M8.5
+     * behavior. */
+    vs_tr_refilter_shape_fn refilter_shape_fn;
+
     /* M9, writer side: predicate-evaluation callback, see vs_tr_predicate_
      * fn's comment in tr_mercury.h. NULL until vs_tr_set_predicate_cb() is
      * called -- a predicate is then still carried and stored, just never
@@ -267,7 +338,32 @@ struct vs_tr_t {
      * vs_tr_set_selection_cb() is called -- routing then stays on the flat
      * bounding span a subscription's bounds describe. */
     vs_tr_selection_fn selection_fn;
+
+    /* Writer side: data pushes forwarded but not yet completed (see
+     * vs_tr_inflight_t and vs_tr_push_one_item()). Touched only by the
+     * application's own step thread -- the thread that runs replay, and so
+     * the only thread that calls vs_tr_writer_push_data(),
+     * vs_tr_writer_broadcast_step_ready() or vs_tr_stop() -- so unlike
+     * sub_table/lag_table/data_queue this needs no lock of its own. The
+     * callbacks consulted alongside it are documented (tr_mercury.h) as not
+     * thread-safe against a concurrent push either, for the same reason. */
+    vs_tr_inflight_t *inflight;
+    size_t             n_inflight;
+    size_t             cap_inflight;
+
+    /* Members whose push failed during the current vs_tr_writer_push_data()
+     * call, so the rest of that call stops forwarding to them -- the async
+     * spelling of the member_unreachable guard (see vs_tr_drain_one()).
+     * Reset at the top of every push call: a later write retries a member
+     * from scratch, exactly as the synchronous version did. */
+    ssg_member_id_t *failed;
+    size_t            n_failed;
+    size_t            cap_failed;
 };
+
+/* Defined with the rest of the in-flight push bookkeeping, below
+ * vs_tr_writer_push_data()'s helpers; declared here for vs_tr_stop(). */
+static void vs_tr_drain_pushes(vs_tr_t *tr);
 
 /*-------------------------------------------------------------------------
  * Small helpers
@@ -786,6 +882,13 @@ vs_tr_set_refilter_cb(vs_tr_t *tr, vs_tr_refilter_fn fn)
 }
 
 void
+vs_tr_set_refilter_shape_cb(vs_tr_t *tr, vs_tr_refilter_shape_fn fn)
+{
+    if (tr)
+        tr->refilter_shape_fn = fn;
+}
+
+void
 vs_tr_set_predicate_cb(vs_tr_t *tr, vs_tr_predicate_fn fn)
 {
     if (tr)
@@ -804,6 +907,22 @@ vs_tr_stop(vs_tr_t *tr)
 {
     if (!tr)
         return;
+
+    /* Anything still in flight -- a writer that pushed and then closed
+     * without ending the step -- must complete before margo_finalize()
+     * below, and its payload freed rather than leaked. */
+    vs_tr_drain_pushes(tr);
+
+    if (vs_push_stats_on > 0 && vs_push_stats_n > 0)
+        fprintf(stderr,
+                "[vol-stream push stats] %llu pushes, %.3f ms total in the forward "
+                "(%.1f us/push), %.2f MiB pushed; %.3f ms of writer work follows the last "
+                "push of a step before that step is announced (the window an async push "
+                "could overlap into)\n",
+                (unsigned long long)vs_push_stats_n, (double)vs_push_stats_ns / 1e6,
+                (double)vs_push_stats_ns / 1e3 / (double)vs_push_stats_n,
+                (double)vs_push_stats_bytes / (1024.0 * 1024.0),
+                (double)vs_push_stats_tail_ns / 1e6);
 
     pthread_mutex_lock(&tr->pending_lock);
     tr->stopped = 1;
@@ -871,6 +990,8 @@ vs_tr_stop(vs_tr_t *tr)
         }
         free(tr->data_queue);
     }
+    free(tr->inflight);
+    free(tr->failed);
     free(tr);
 }
 
@@ -1039,6 +1160,23 @@ vs_tr_writer_broadcast_step_ready(vs_tr_t *tr, uint64_t physical_step, uint64_t 
 
     if (!tr)
         return -1;
+
+    if (vs_push_stats_on > 0 && vs_push_stats_last_end_ns) {
+        vs_push_stats_tail_ns += vs_now_ns() - vs_push_stats_last_end_ns;
+        vs_push_stats_last_end_ns = 0;
+    }
+
+    /* Settle this step's data pushes before telling anyone the step exists.
+     * This is what keeps the async push a pure latency overlap rather than a
+     * change in what a subscriber observes: a reader woken by step_ready
+     * still finds the step's pushed data already queued, exactly as when
+     * every push blocked inline, and pushes never reorder across a step
+     * boundary because step N's are all complete before step N+1's are
+     * issued. The writer's own work between its last push and this point --
+     * the rest of replay, discarding the pending buffer, resolving the
+     * step's deferred-request completion -- is what the pushes overlapped
+     * with in the meantime. */
+    vs_tr_drain_pushes(tr);
 
     pthread_mutex_lock(&tr->last_step_lock);
     tr->has_last_step     = 1;
@@ -1415,6 +1553,218 @@ vs_tr_reader_subscribe_predicate(vs_tr_t *tr, const char *path, const uint8_t *p
     return matched ? 0 : -1;
 }
 
+/*-------------------------------------------------------------------------
+ * Writer-side in-flight push bookkeeping (see vs_tr_inflight_t)
+ *-------------------------------------------------------------------------
+ */
+
+/* Record one issued push. Returns 0 on success, -1 if the list could not be
+ * grown -- the caller then completes the request itself rather than losing
+ * it. */
+static int
+vs_tr_inflight_add(vs_tr_t *tr, hg_handle_t handle, margo_request req, void *owned,
+                    ssg_member_id_t member_id)
+{
+    if (tr->n_inflight == tr->cap_inflight) {
+        size_t            new_cap = tr->cap_inflight ? tr->cap_inflight * 2 : 8;
+        vs_tr_inflight_t *grown;
+
+        if (NULL == (grown = (vs_tr_inflight_t *)realloc(tr->inflight, new_cap * sizeof(*grown))))
+            return -1;
+        tr->inflight     = grown;
+        tr->cap_inflight = new_cap;
+    }
+
+    tr->inflight[tr->n_inflight].handle    = handle;
+    tr->inflight[tr->n_inflight].req       = req;
+    tr->inflight[tr->n_inflight].owned     = owned;
+    tr->inflight[tr->n_inflight].member_id = member_id;
+    tr->n_inflight++;
+    return 0;
+} /* end vs_tr_inflight_add() */
+
+/* Has a push to this member already failed during the current write? */
+static int
+vs_tr_member_failed(vs_tr_t *tr, ssg_member_id_t member_id)
+{
+    size_t i;
+
+    for (i = 0; i < tr->n_failed; i++)
+        if (tr->failed[i] == member_id)
+            return 1;
+    return 0;
+} /* end vs_tr_member_failed() */
+
+static void
+vs_tr_member_failed_add(vs_tr_t *tr, ssg_member_id_t member_id)
+{
+    if (vs_tr_member_failed(tr, member_id))
+        return;
+
+    if (tr->n_failed == tr->cap_failed) {
+        size_t           new_cap = tr->cap_failed ? tr->cap_failed * 2 : 4;
+        ssg_member_id_t *grown;
+
+        if (NULL == (grown = (ssg_member_id_t *)realloc(tr->failed, new_cap * sizeof(*grown))))
+            return; /* best-effort: without the note this member just gets
+                     * the rest of the write's pushes attempted anyway. */
+        tr->failed     = grown;
+        tr->cap_failed = new_cap;
+    }
+    tr->failed[tr->n_failed++] = member_id;
+} /* end vs_tr_member_failed_add() */
+
+/* Complete the oldest in-flight push, freeing everything it owns. A failed
+ * request (the 1s timeout, or a dead peer) notes its member so the rest of
+ * this write stops forwarding there -- the async spelling of the
+ * member_unreachable guard vs_tr_writer_push_data() has always applied. */
+static void
+vs_tr_drain_one(vs_tr_t *tr)
+{
+    vs_tr_inflight_t *e;
+
+    if (tr->n_inflight == 0)
+        return;
+
+    e = &tr->inflight[0];
+
+    if (HG_SUCCESS == margo_wait(e->req)) {
+        vs_data_push_out_t out;
+
+        if (HG_SUCCESS == margo_get_output(e->handle, &out))
+            margo_free_output(e->handle, &out);
+    }
+    else
+        vs_tr_member_failed_add(tr, e->member_id);
+
+    margo_destroy(e->handle);
+    free(e->owned);
+
+    memmove(&tr->inflight[0], &tr->inflight[1], (tr->n_inflight - 1) * sizeof(*tr->inflight));
+    tr->n_inflight--;
+} /* end vs_tr_drain_one() */
+
+/* Complete every outstanding push. Called before a step is announced (so a
+ * subscriber still has the step's data in hand no later than it did when
+ * every push blocked inline) and again at teardown. */
+static void
+vs_tr_drain_pushes(vs_tr_t *tr)
+{
+    while (tr->n_inflight > 0)
+        vs_tr_drain_one(tr);
+} /* end vs_tr_drain_pushes() */
+
+/* One vs_data_push_in_t RPC to one already-resolved member address.
+ * Factored out of vs_tr_writer_push_data()'s per-run loop so that loop can
+ * call this once per run (the original M8/M8.5 behavior) or, when a
+ * subscriber's own DCPL asks for a real chunk shape smaller than the run
+ * (vs_tr_refilter_shape_fn), once per chunk-sized slice of it -- see
+ * vs_tr_refilter_shape_fn's comment in tr_mercury.h for why the far side
+ * needs no change to handle either case: each call here is already a
+ * complete, independently-decodable push, exactly like today's existing
+ * one-push-per-selection-run and one-push-per-predicate-run splits.
+ *
+ * payload_owned, if non-NULL, is freed once the forward completes --
+ * callers pass the refilter callback's malloc'd output there, or NULL when
+ * payload_buf points into the caller's own live buffer (the raw-bytes,
+ * not-refiltered case). Either way the *source* bytes may die as soon as
+ * this returns; see vs_tr_inflight_t's comment.
+ *
+ * Returns 1 if the member should be treated as unreachable for the rest of
+ * this write (matching the existing member_unreachable convention), 0
+ * otherwise. Since the forward no longer completes here, that answer now
+ * covers a synchronous failure to issue plus anything vs_tr_drain_one()
+ * has since reported for this member -- see tr->failed. */
+static int
+vs_tr_push_one_item(vs_tr_t *tr, hg_addr_t addr, ssg_member_id_t member_id, uint64_t physical_step,
+                     const char *path, uint64_t elem_start, uint64_t elem_count, const void *payload_buf,
+                     uint64_t payload_len, const uint8_t *dcpl_enc, uint64_t dcpl_enc_len,
+                     const uint8_t *type_enc, uint64_t type_enc_len, uint32_t filter_mask,
+                     void *payload_owned)
+{
+    vs_data_push_in_t in;
+    hg_handle_t         handle;
+    int                  unreachable = 0;
+    uint64_t             t0          = 0;
+
+    in.physical_step  = physical_step;
+    in.path            = (hg_string_t)(uintptr_t)path;
+    in.elem_start      = elem_start;
+    in.elem_count      = elem_count;
+    in.filter_mask     = filter_mask;
+    in.payload.buf     = (void *)(uintptr_t)payload_buf;
+    in.payload.size    = payload_len;
+    in.dcpl_enc.buf    = (void *)(uintptr_t)dcpl_enc;
+    in.dcpl_enc.size   = dcpl_enc_len;
+    in.type_enc.buf    = (void *)(uintptr_t)type_enc;
+    in.type_enc.size   = type_enc_len;
+
+    /* Same bounded, best-effort forward vs_tr_writer_push_data() always
+     * used here -- see its own comment (now on this function) on why one
+     * timeout per unreachable member, not one per run/chunk, is the right
+     * bound. The 1s timeout still bounds one push; it is now measured from
+     * here to whenever vs_tr_drain_pushes() completes the request, and
+     * every push in a step is timing out concurrently rather than one after
+     * another, so an unreachable member costs the writer *at most* the same
+     * single timeout it used to and no longer needs the whole run loop to
+     * finish before the next one starts. */
+    if (vs_push_stats_on < 0) {
+        const char *e = getenv("VOL_STREAM_PUSH_STATS");
+
+        vs_push_stats_on = (e && *e && *e != '0') ? 1 : 0;
+    }
+    if (vs_push_stats_on)
+        t0 = vs_now_ns();
+
+    /* Bound outstanding RPCs before adding one more. */
+    if (tr->n_inflight >= VS_TR_MAX_INFLIGHT_PUSHES)
+        vs_tr_drain_one(tr);
+
+    if (HG_SUCCESS == margo_create(tr->mid, addr, tr->data_push_rpc_id, &handle)) {
+        margo_request req;
+
+        if (HG_SUCCESS == margo_iforward_timed(handle, &in, 1000.0, &req)) {
+            if (0 == vs_tr_inflight_add(tr, handle, req, payload_owned, member_id)) {
+                /* Owned by the in-flight list now -- completed, and its
+                 * payload freed, by vs_tr_drain_one(). */
+                payload_owned = NULL;
+                handle        = HG_HANDLE_NULL;
+            }
+            else {
+                /* Could not record it: complete it here rather than leak the
+                 * handle or lose track of the request. */
+                margo_wait(req);
+                margo_destroy(handle);
+                handle = HG_HANDLE_NULL;
+            }
+        }
+        else {
+            margo_destroy(handle);
+            handle      = HG_HANDLE_NULL;
+            unreachable = 1;
+        }
+    }
+    else
+        unreachable = 1;
+
+    if (vs_push_stats_on) {
+        uint64_t t1 = vs_now_ns();
+
+        vs_push_stats_n++;
+        vs_push_stats_ns += t1 - t0;
+        vs_push_stats_bytes += payload_len;
+        vs_push_stats_last_end_ns = t1;
+    }
+
+    /* A member the drain above reported dead is not worth issuing more to,
+     * even though this particular forward was accepted. */
+    if (!unreachable && vs_tr_member_failed(tr, member_id))
+        unreachable = 1;
+
+    free(payload_owned);
+    return unreachable;
+} /* end vs_tr_push_one_item() */
+
 int
 vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, const void *buf,
                         uint64_t elem_size, uint64_t write_start, uint64_t write_count,
@@ -1436,6 +1786,11 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
         return 0;
 
     write_end = write_start + write_count;
+
+    /* Fresh unreachable-member set per write, matching the synchronous
+     * version's scope exactly: a member given up on here is retried from
+     * scratch by the next write. */
+    tr->n_failed = 0;
 
     /* Snapshot every sub_table entry matching this path in one sub_lock
      * acquisition, instead of locking/unlocking once per group member below.
@@ -1643,14 +1998,42 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
         /* Nothing matched: this subscriber gets no RPC at all for this run.
          * The whole point of the predicate -- every other reduction in this
          * protocol still sends something. */
+        /* Same bounded, best-effort forward vs_tr_push_one_item() uses for
+         * every call below -- a stalled or gone subscriber must not stall
+         * the writer.
+         *
+         * The per-RPC timeout bounds one push, not one write: a write goes
+         * out as one RPC per contiguous run (up to VS_TR_MAX_PRED_RUNS, and
+         * again per selection run, and now again per chunk when a
+         * subscriber's DCPL asks for one smaller than the run), so nothing
+         * here structurally stopped an unreachable member from being
+         * charged the full timeout once per run. Giving up on that member
+         * after its first timeout makes the per-write bound explicit -- one
+         * timeout, not one per run/chunk.
+         *
+         * Measured, and the measurement is worth recording because it
+         * contradicts the obvious assumption: it did NOT cost a timeout per
+         * run beforehand. A 128-run write to an unreachable member took
+         * ~1.00s both with and without this guard, because Mercury itself
+         * stops retrying an address that has already timed out, so every
+         * later forward fails immediately. This guard therefore changes no
+         * number measured here.
+         *
+         * Kept anyway, as a bound this module owns rather than one it
+         * borrows. That fast-fail is Mercury's internal behavior observed on
+         * one provider (na+sm) in one failure mode, not a documented
+         * guarantee across providers or versions, and the cost if it ever
+         * differs is a multi-minute stall inside H5Fend_step() -- a poor
+         * thing to discover in production. For scale: a healthy push costs
+         * ~20us, so one timeout already costs ~50,000x the work it guards.
+         *
+         * The next write retries the member from scratch, and SSG's failure
+         * detector is what eventually removes it from the group, so nothing
+         * a later push would have delivered is lost. */
         for (r = 0; r < n_runs; r++) {
-            uint64_t          run_start = sel_start_abs + runs[r].start;
-            uint64_t          run_count = runs[r].count;
-            void             *filtered_buf = NULL;
-            uint64_t          filtered_len = 0;
-            uint32_t          filter_mask  = 0;
-            int               did_refilter = 0;
-            vs_data_push_in_t in;
+            uint64_t run_start = sel_start_abs + runs[r].start;
+            uint64_t run_count = runs[r].count;
+            uint64_t chunk_elems = 0;
 
             /* HG_ENCODE only reads this -- see hg_proc_vs_blob_t(). Slicing
              * by byte offset into buf: buf's own first element is
@@ -1658,94 +2041,84 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
              * elements in. */
             const void *run_ptr = (const uint8_t *)buf + (run_start - write_start) * elem_size;
 
-            /* M8.5 precision: this subscriber asked for a specific filter
-             * pipeline -- run the slice through it via the registered
-             * callback (see vs_tr_refilter_fn's comment) instead of sending
-             * raw bytes. A declined/failed refilter (no callback registered,
-             * or the callback itself fails) is not an error -- fall back to
-             * the exact raw-bytes behavior this subscriber would have gotten
-             * without a dcpl_enc at all.
-             *
-             * M9: native_ctx describes the whole write, so a predicate that
-             * split it declines the zero-copy fast path automatically --
-             * that path requires the push to cover the dataset exactly
-             * (ctx->total_elems != count), which a partial run never does.
-             * Correct by construction rather than by a check here. */
-            if (sub_dcpl_enc_len > 0 && tr->refilter_fn &&
-                0 == tr->refilter_fn(run_ptr, elem_size, run_count, sub_dcpl_enc, sub_dcpl_enc_len,
-                                       type_enc, type_enc_len, native_dcpl_enc, native_dcpl_enc_len,
-                                       native_ctx, &filtered_buf, &filtered_len, &filter_mask))
-                did_refilter = 1;
+            if (sub_dcpl_enc_len > 0 && tr->refilter_shape_fn)
+                chunk_elems = tr->refilter_shape_fn(sub_dcpl_enc, sub_dcpl_enc_len, run_count, elem_size);
 
-            in.physical_step = physical_step;
-            in.path             = (hg_string_t)path;
-            in.elem_start       = run_start;
-            in.elem_count       = run_count;
-            in.filter_mask      = filter_mask;
+            if (chunk_elems > 0 && chunk_elems < run_count) {
+                /* M8.5 follow-up: this subscriber's DCPL asked for a real
+                 * chunk shape smaller than the whole run -- honor it by
+                 * pushing each chunk as its own RPC rather than forcing one
+                 * chunk spanning the run (see vs_tr_refilter_shape_fn's
+                 * comment in tr_mercury.h for why the receiving side needs
+                 * no change for this). */
+                uint64_t off = 0;
 
-            if (did_refilter) {
-                in.payload.buf     = filtered_buf;
-                in.payload.size    = filtered_len;
-                in.dcpl_enc.buf    = sub_dcpl_enc;
-                in.dcpl_enc.size   = sub_dcpl_enc_len;
-                in.type_enc.buf    = (void *)(uintptr_t)type_enc;
-                in.type_enc.size   = type_enc_len;
+                while (off < run_count) {
+                    uint64_t    this_count = (run_count - off < chunk_elems) ? (run_count - off) : chunk_elems;
+                    const void *sub_ptr    = (const uint8_t *)run_ptr + off * elem_size;
+                    void       *cb_buf     = NULL;
+                    uint64_t    cb_len     = 0;
+                    uint32_t    cb_mask    = 0;
+
+                    if (tr->refilter_fn &&
+                        0 == tr->refilter_fn(sub_ptr, elem_size, this_count, sub_dcpl_enc, sub_dcpl_enc_len,
+                                               type_enc, type_enc_len, native_dcpl_enc, native_dcpl_enc_len,
+                                               native_ctx, &cb_buf, &cb_len, &cb_mask))
+                        member_unreachable = vs_tr_push_one_item(
+                            tr, addr, member_id, physical_step, path, run_start + off, this_count, cb_buf,
+                            cb_len, sub_dcpl_enc, sub_dcpl_enc_len, type_enc, type_enc_len, cb_mask, cb_buf);
+                    else
+                        /* Refilter declined/failed for this slice: fall back
+                         * to raw bytes for just this slice, the same
+                         * "decline, don't fail" rule the whole-run path
+                         * already follows. */
+                        member_unreachable = vs_tr_push_one_item(
+                            tr, addr, member_id, physical_step, path, run_start + off, this_count, sub_ptr,
+                            this_count * elem_size, NULL, 0, NULL, 0, 0, NULL);
+
+                    if (member_unreachable)
+                        break;
+                    off += this_count;
+                }
             }
             else {
-                in.payload.buf   = (void *)(uintptr_t)run_ptr;
-                in.payload.size  = run_count * elem_size;
-                in.dcpl_enc.buf  = NULL;
-                in.dcpl_enc.size = 0;
-                in.type_enc.buf  = NULL;
-                in.type_enc.size = 0;
-            }
+                /* Unchanged: one push spanning the whole run. */
+                void    *filtered_buf = NULL;
+                uint64_t filtered_len = 0;
+                uint32_t filter_mask  = 0;
+                int      did_refilter = 0;
 
-            /* Same bounded, best-effort forward as vs_tr_writer_broadcast_step_ready() --
-             * a stalled or gone subscriber must not stall the writer.
-             *
-             * The per-RPC timeout bounds one push, not one write: a write goes
-             * out as one RPC per contiguous run (up to VS_TR_MAX_PRED_RUNS,
-             * and again per selection run), so nothing here structurally
-             * stopped an unreachable member from being charged the full
-             * timeout once per run. Giving up on that member after its first
-             * timeout makes the per-write bound explicit -- one timeout, not
-             * one per run.
-             *
-             * Measured, and the measurement is worth recording because it
-             * contradicts the obvious assumption: it did NOT cost a timeout
-             * per run beforehand. A 128-run write to an unreachable member
-             * took ~1.00s both with and without this guard, because Mercury
-             * itself stops retrying an address that has already timed out, so
-             * every later forward fails immediately. This guard therefore
-             * changes no number measured here.
-             *
-             * Kept anyway, as a bound this module owns rather than one it
-             * borrows. That fast-fail is Mercury's internal behavior observed
-             * on one provider (na+sm) in one failure mode, not a documented
-             * guarantee across providers or versions, and the cost if it ever
-             * differs is a multi-minute stall inside H5Fend_step() -- a poor
-             * thing to discover in production. For scale: a healthy push
-             * costs ~20us, so one timeout already costs ~50,000x the work it
-             * guards.
-             *
-             * The next write retries the member from scratch, and SSG's
-             * failure detector is what eventually removes it from the group,
-             * so nothing a later push would have delivered is lost. */
-            if (HG_SUCCESS == margo_create(tr->mid, addr, tr->data_push_rpc_id, &handle)) {
-                if (HG_SUCCESS == margo_forward_timed(handle, &in, 1000.0)) {
-                    vs_data_push_out_t out;
+                /* M8.5 precision: this subscriber asked for a specific
+                 * filter pipeline -- run the slice through it via the
+                 * registered callback (see vs_tr_refilter_fn's comment)
+                 * instead of sending raw bytes. A declined/failed refilter
+                 * (no callback registered, or the callback itself fails) is
+                 * not an error -- fall back to the exact raw-bytes behavior
+                 * this subscriber would have gotten without a dcpl_enc at
+                 * all.
+                 *
+                 * M9: native_ctx describes the whole write, so a predicate
+                 * that split it declines the zero-copy fast path
+                 * automatically -- that path requires the push to cover the
+                 * dataset exactly (ctx->total_elems != count), which a
+                 * partial run never does. Correct by construction rather
+                 * than by a check here. */
+                if (sub_dcpl_enc_len > 0 && tr->refilter_fn &&
+                    0 == tr->refilter_fn(run_ptr, elem_size, run_count, sub_dcpl_enc, sub_dcpl_enc_len,
+                                           type_enc, type_enc_len, native_dcpl_enc, native_dcpl_enc_len,
+                                           native_ctx, &filtered_buf, &filtered_len, &filter_mask))
+                    did_refilter = 1;
 
-                    if (HG_SUCCESS == margo_get_output(handle, &out))
-                        margo_free_output(handle, &out);
-                }
+                if (did_refilter)
+                    member_unreachable = vs_tr_push_one_item(
+                        tr, addr, member_id, physical_step, path, run_start, run_count, filtered_buf,
+                        filtered_len, sub_dcpl_enc, sub_dcpl_enc_len, type_enc, type_enc_len, filter_mask,
+                        filtered_buf);
                 else
-                    member_unreachable = 1;
-                margo_destroy(handle);
+                    member_unreachable =
+                        vs_tr_push_one_item(tr, addr, member_id, physical_step, path, run_start, run_count,
+                                             run_ptr, run_count * elem_size, NULL, 0, NULL, 0, 0, NULL);
             }
-            else
-                member_unreachable = 1;
-
-            free(filtered_buf);
 
             if (member_unreachable)
                 break;

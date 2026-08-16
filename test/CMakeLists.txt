@@ -47,7 +47,7 @@ add_test(NAME dset_resize COMMAND t_dset_resize)
 # VOL_STREAM_ENABLE_MERCURY option).
 if(VOL_STREAM_HAVE_MERCURY)
   foreach(t t_transport t_rendezvous t_queue_policy t_subscribe t_precision t_precision_dual
-           t_chunk_zerocopy t_subvolume_nd t_strided_write t_predicate t_subvolume_strided)
+           t_chunk_zerocopy t_chunk_shape_split t_subvolume_nd t_strided_write t_predicate t_subvolume_strided)
     add_executable(${t} ${t}.c)
     target_link_libraries(${t} PRIVATE vol_stream)
   endforeach()
@@ -57,11 +57,15 @@ if(VOL_STREAM_HAVE_MERCURY)
   add_test(NAME subscribe COMMAND t_subscribe)
   add_test(NAME precision COMMAND t_precision)
   add_test(NAME chunk_zerocopy COMMAND t_chunk_zerocopy)
+  # M8.5 follow-up: a subscriber's requested chunk shape is honored, not
+  # forced to a single chunk spanning the whole run -- see t_chunk_shape_
+  # split.c's own top comment.
+  add_test(NAME chunk_shape_split COMMAND t_chunk_shape_split)
   add_test(NAME subvolume_nd COMMAND t_subvolume_nd)
   add_test(NAME strided_write COMMAND t_strided_write)
   add_test(NAME predicate COMMAND t_predicate)
   add_test(NAME subvolume_strided COMMAND t_subvolume_strided)
-  set_tests_properties(transport rendezvous queue_policy subscribe precision chunk_zerocopy subvolume_nd strided_write predicate subvolume_strided PROPERTIES
+  set_tests_properties(transport rendezvous queue_policy subscribe precision chunk_zerocopy chunk_shape_split subvolume_nd strided_write predicate subvolume_strided PROPERTIES
     ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
     TIMEOUT 60
   )
@@ -88,6 +92,22 @@ if(VOL_STREAM_HAVE_MERCURY)
     ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
     TIMEOUT 120
   )
+
+  # Writer-side cost against subscriber count (1/2/4/8), which is what the
+  # asynchronous data push actually changes -- the two benchmarks above both
+  # measure a single subscriber, the case where it matters least. See its
+  # own top comment.
+  #
+  # Built but deliberately NOT registered as a test: running it surfaced a
+  # real, pre-existing bug that has nothing to do with the benchmark itself
+  # -- at 4 and 8 subscribers the writer intermittently issues one fewer
+  # data push than it has (subscriber, step) pairs, and the subscriber that
+  # loses one then blocks until its H5Fget_subscribed_data() timeout. See
+  # docs/dev-plan.md ("a subscriber's push can go missing at fan-out").
+  # Registering it would make the suite red on that open bug rather than on
+  # anything this benchmark is measuring; run it by hand until it is fixed.
+  add_executable(b_push_fanout b_push_fanout.c)
+  target_link_libraries(b_push_fanout PRIVATE vol_stream)
 
   # Every test above registers the connector explicitly, which leaves the
   # process default VOL native -- and that is exactly what hid the connector's
@@ -172,6 +192,33 @@ if(MPI_C_FOUND AND MPIEXEC_EXECUTABLE)
             --reader-ranks 3
   )
   set_tests_properties(parallel_7x3 PROPERTIES TIMEOUT 180)
+
+  # M6.5 concentrator topology, both aggregation shapes dev-plan.md claims
+  # as verified (3->2, one 3-rank concentrator group; 7->3, two groups of
+  # 3 plus a singleton) -- previously only ever run manually (see
+  # reference_vol_stream_local_env.md-style local verification), not
+  # CI-wired at all. run_parallel_test.sh's own --concentration check
+  # (grep for "concentrator rank ... wrote ... on behalf of") is the gate
+  # against this silently no-op'ing again.
+  add_test(NAME parallel_concentration
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/run_parallel_test.sh
+            --mpirun       ${MPIEXEC_EXECUTABLE}
+            --bin          $<TARGET_FILE:t_parallel>
+            --plugin-dir   $<TARGET_FILE_DIR:vol_stream>
+            --concentration 2
+  )
+  set_tests_properties(parallel_concentration PROPERTIES TIMEOUT 120)
+
+  add_test(NAME parallel_concentration_7x3
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/run_parallel_test.sh
+            --mpirun       ${MPIEXEC_EXECUTABLE}
+            --bin          $<TARGET_FILE:t_parallel>
+            --plugin-dir   $<TARGET_FILE_DIR:vol_stream>
+            --writer-ranks 7
+            --reader-ranks 3
+            --concentration 3
+  )
+  set_tests_properties(parallel_concentration_7x3 PROPERTIES TIMEOUT 180)
 
   # A parallel writer with a queue policy set -- the combination end_step()
   # used to ignore outright, dispatching to the parallel replay without ever
