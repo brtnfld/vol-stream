@@ -3557,11 +3557,36 @@ H5VL__stream_pathmap_clear(H5VL_stream_pathmap_t *m)
  *              for inspectability and for a future transport that could reuse
  *              staged bytes -- both real, neither free.
  *
+ *              **File size is not the dominant cost -- CPU time is, and by a
+ *              lot.** Measured on benchmark/adios2_compare/'s growing-array
+ *              workload (test/b_stream_grow.c, a step rewriting the whole
+ *              current array every time, up to 1.6 MiB at the final step):
+ *              turning this OFF took writer-side commit latency from a mean
+ *              of ~5.7-7.3ms down to ~0.87-0.89ms (roughly 6-8x) and
+ *              aggregate throughput from ~140-145 MiB/s up to ~865-880 MiB/s
+ *              (roughly 6x) -- closing most of the gap this project's own
+ *              ADIOS2 SST comparison measured (docs/dev-plan.md). `perf
+ *              record` on the writer isolates why: with staging on, the
+ *              single largest cost by far is zlib `deflate()` (called via
+ *              H5Z__filter_deflate() from H5D__chunk_flush_entry()), because
+ *              the DCPL below always chunks .payload as ONE chunk spanning
+ *              the whole (in this workload, growing) buffer -- deflating an
+ *              ever-larger payload from scratch every single step, even at
+ *              the already-fastest level (1) this DCPL requests. With
+ *              staging off, that cost disappears entirely from the profile;
+ *              what remains (Mercury's own RPC byte-copying, ordinary HDF5
+ *              metadata operations for the real replayed object) is the
+ *              much harder floor to lower further.
+ *
  *              Left ON by default deliberately: it is long-standing,
  *              documented, and asserted by test/t_payload_compress.c, so
  *              flipping the default silently is not this knob's job. Deciding
- *              that 2x is the wrong trade for a given deployment is the
- *              caller's call, and this is the lever for it.
+ *              that 2x file size (or, for a workload like the one measured
+ *              above, a 6-8x latency/throughput cost) is the wrong trade for
+ *              a given deployment is the caller's call, and this is the
+ *              lever for it -- a streaming/throughput-sensitive deployment
+ *              should measure its own workload against turning this off
+ *              before assuming the default is the right choice.
  *-------------------------------------------------------------------------
  */
 static int

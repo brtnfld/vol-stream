@@ -2,10 +2,12 @@
 
 A one-to-one comparison of `test/b_stream_grow.c`'s workload (an
 unlimited-dimension array extended by a fixed chunk each step, re-created and
-rewritten in full every step -- the working alternative now that resizing a
-live cross-step handle is refused, see `docs/dev-plan.md`) run for real
-against ADIOS2's SST engine, its streaming engine and the fair counterpart to
-vol-stream's Mercury transport (not BP file staging).
+rewritten in full every step) run for real against ADIOS2's SST engine, its
+streaming engine and the fair counterpart to vol-stream's Mercury transport
+(not BP file staging). vol-stream can now also express this growth via a
+real `H5Dset_extent()` on a persistent handle instead of re-creating the
+dataset each step (see `docs/dev-plan.md` and `test/t_dset_resize.c`) --
+either pattern moves the same bytes and measures the same here.
 
 Same workload on both sides: 50 steps, `/series` growing by 8192 elements
 (32 KiB) per step to 409600 elements (1.6 MiB) at the final step, streamed
@@ -16,16 +18,23 @@ one-off comparison, kept here for reproducibility.
 ## Results (measured 2026-08-15, this machine, `ofi`/`sockets` fabric --
 no RDMA hardware present on either side of the comparison)
 
-| Metric | vol-stream (`ofi+tcp`) | ADIOS2 SST |
-|---|---|---|
-| Total bytes streamed (50 steps) | 39.84 MiB | 39.84 MiB (identical workload) |
-| Writer commit latency, mean | ~5.5-7 ms | ~0.2 ms |
-| Writer commit latency, max | up to 87 ms (outlier observed) | ~0.5 ms |
-| Start-to-receipt latency, mean | ~0.7-0.85 ms | ~0.6-2.7 ms (noisier run to run) |
-| Aggregate throughput | ~145-148 MiB/s | ~2800-3500 MiB/s |
+| Metric | vol-stream, staging ON (default) | vol-stream, staging OFF | ADIOS2 SST |
+|---|---|---|---|
+| Total bytes streamed (50 steps) | 39.84 MiB | 39.84 MiB | 39.84 MiB (identical workload) |
+| Writer commit latency, mean | ~5.7-7.3 ms | ~0.87-0.89 ms | ~0.2 ms |
+| Writer commit latency, max | up to 87 ms (outlier observed) | ~1.9 ms | ~0.5 ms |
+| Start-to-receipt latency, mean | ~0.7-0.85 ms | (not separately measured) | ~0.6-2.7 ms (noisier run to run) |
+| Aggregate throughput | ~140-145 MiB/s | ~865-880 MiB/s | ~2800-3500 MiB/s |
 
-See `docs/dev-plan.md`'s benchmark section for the full write-up and what
-this does and does not mean.
+"Staging OFF" is `VOL_STREAM_STAGE_PAYLOAD=0` -- an existing, already-
+documented, already-tested vol-stream knob (`H5VL__stream_stage_payload()`),
+not a new feature. `perf record` on the writer found zlib `deflate()` (the
+`.payload` staging dataset's compression, re-deflating this workload's
+ever-larger cumulative payload from scratch every step) as the single
+dominant cost with staging on; turning it off closes most of the gap to
+ADIOS2, from roughly 20x down to roughly 3-4x. See `docs/dev-plan.md`'s
+benchmark section for the full write-up, including why file-size-focused
+measurement missed this CPU cost the first time around.
 
 ## Building ADIOS2 locally
 
@@ -71,13 +80,19 @@ for call") gives no hint that this is the cause.
 
 ## Design notes -- what makes this a fair comparison, and where it isn't
 
-**Growing shape, expressed idiomatically per side.** vol-stream has no
-supported way to resize a dataset across steps (see `test/t_dset_resize.c`);
-its only working pattern is re-creating the object each step. ADIOS2 has a
-real mechanism for this (`Variable::SetShape()`/`SetSelection()` before each
-`Put()`, no redefinition needed) and it is used here rather than forcing
-ADIOS2 through vol-stream's own workaround -- each side uses its own
-idiomatic API for the *same data volume and growth pattern*, not a shared
+**Growing shape, expressed idiomatically per side.** At the time this
+comparison was first built, vol-stream had no supported way to resize a
+dataset across steps (see `test/t_dset_resize.c`'s history); its only
+working pattern was re-creating the object each step, and ADIOS2's own
+real mechanism (`Variable::SetShape()`/`SetSelection()` before each
+`Put()`, no redefinition needed) was used on its side rather than forcing
+ADIOS2 through vol-stream's workaround. vol-stream has since grown a real
+`H5Dset_extent()` on a persistent handle too (same file, same test) --
+both patterns are legitimate now, and this benchmark still uses the
+recreate-each-step form since that is what it originally measured; the
+comparison is unaffected either way, since both produce the same bytes on
+the wire. Each side still uses its own idiomatic API for the *same data
+volume and growth pattern*, not a shared
 code path.
 
 **Timestamps, not shared memory.** vol-stream's writer and reader are

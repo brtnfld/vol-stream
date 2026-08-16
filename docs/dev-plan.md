@@ -1296,6 +1296,56 @@ build break in ADIOS2 2.10.2's bundled `thirdparty/yaml-cpp` (missing
 vendored source) and the `ADIOS2_USE_MPI` application-side opt-in macro
 that a confusing compiler error gives no hint about needing.
 
+**Found the dominant cost, 2026-08-15: it is not the manifest encoding this
+section originally suspected -- it is `.payload` staging's compression,
+and there is already a lever for it.** Asked directly whether the gap
+above could be closed, so profiled the writer with `perf record` rather
+than guessing further. The single largest cost by far was zlib
+`deflate()` (via `H5Z__filter_deflate()` from `H5D__chunk_flush_entry()`)
+-- not `H5Tencode`/`H5Sencode2`/`H5Pencode2`, which barely register.
+`H5VL__stream_stage_payload()`'s own DCPL always chunks `/step/<n>/
+.payload` as one chunk spanning the *whole* buffer, so for this
+growing-array workload every step deflates an ever-larger payload from
+scratch -- up to 1.6 MiB at the final step -- even at the already-fastest
+level (1) that DCPL requests.
+
+`VOL_STREAM_STAGE_PAYLOAD=0` (an existing, already-documented,
+already-tested knob -- see `H5VL__stream_stage_payload()`'s own comment,
+now updated with these numbers) turns this off entirely. Measured on the
+identical benchmark:
+
+| Metric | Staging ON (default) | Staging OFF (`VOL_STREAM_STAGE_PAYLOAD=0`) | ADIOS2 SST |
+|---|---|---|---|
+| Writer commit latency, mean | ~5.7-7.3 ms | ~0.87-0.89 ms | ~0.2 ms |
+| Aggregate throughput | ~140-145 MiB/s | ~865-880 MiB/s | ~2800-3500 MiB/s |
+
+**Roughly 6-8x faster, closing most of the gap this section measured** --
+from ~20x slower than ADIOS2 to roughly 3-4x. Re-profiling with staging
+off shows no single dominant cost left: what remains is Mercury's own RPC
+byte-copying (`hg_proc_bytes` inside `vs_tr_writer_push_data`'s forward
+call) and ordinary HDF5 metadata operations for the real replayed
+object (property-list teardown, group traversal, the dataset create/write
+itself) -- ordinary per-step costs of this architecture rather than one
+avoidable hotspot, and a much harder floor to lower further.
+
+**Why this wasn't the obvious first guess:** `.payload` was built and
+measured for its **file-size** cost (dev-plan.md's own earlier write-up:
+"a stream file is a little over twice the size of the data in it"), and
+deflating it was framed as the fix *for that*. Nothing before this
+session had measured its CPU cost against a workload where the payload
+itself grows every step -- every existing test uses small, fixed-size
+data, where deflate's absolute cost is negligible regardless of level.
+The lever already existed; what was missing was measuring it against the
+right workload to notice it was the dominant cost of a different kind.
+
+**Still left ON by default, deliberately -- this finding does not change
+that.** `H5VL__stream_stage_payload()`'s own long-standing rule holds: a
+knob this consequential does not get its default flipped silently.
+Recommendation for a throughput-sensitive deployment: measure the actual
+workload with `VOL_STREAM_STAGE_PAYLOAD=0` before assuming the default is
+the right choice -- for a growing array, or any workload whose payload
+size is not small and fixed, it is very unlikely to be.
+
 **VL and reference support (Decision #4) were never implemented, not just
 deferred.** The residual-risk plan here was "ship them behind a property
 defaulting to off" if M2 slipped — but no such property exists, and neither
