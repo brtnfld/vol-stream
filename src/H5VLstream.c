@@ -8874,6 +8874,33 @@ H5VL_stream_dataset_specific(void *obj, H5VL_dataset_specific_args_t *args, hid_
     if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER)
         return -1;
 
+    /* Nor against a LIVE dataset while it is being captured into an open
+     * step -- the same predicate H5VL_stream_dataset_write() uses to decide
+     * whether a write belongs to the step. under_object here is not "the
+     * dataset" in any general sense: once a placeholder first materializes,
+     * H5VL__stream_replay_manifest() rewires under_object to point at THAT
+     * step's own real /step/<n>/ object and never moves it again -- every
+     * later step captures its own separate synthesized copy instead
+     * (H5VL__stream_step_create_index()), leaving the original handle
+     * permanently aimed at the first step's committed storage.
+     *
+     * dataset_specific (H5Dset_extent chief among them) has no capture path
+     * of its own -- it is the unconditional passthrough just below -- so
+     * calling it here reaches straight through to that first step's real
+     * object and mutates it in place, silently, after the fact. Measured
+     * directly: a dataset extended and appended to across N steps through
+     * one handle (the ordinary ADIOS2-style growing-array pattern) left
+     * step 0's own copy holding the FINAL extent rather than the extent it
+     * had when step 0 committed, because every later H5Dset_extent() landed
+     * on it instead of on that step's own snapshot. Declining is the same
+     * rule as the placeholder case above and everywhere else in this
+     * connector: an error the caller can act on beats a file that looks
+     * right and is not. Re-creating the dataset each step (already
+     * supported) is the working pattern for a shape that changes over
+     * time. */
+    if (H5VL__stream_dset_capture(o))
+        return -1;
+
     /* Save copy of underlying VOL connector ID, in case of
      * 'refresh' operation destroying the current object
      */

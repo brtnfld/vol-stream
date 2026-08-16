@@ -1075,6 +1075,47 @@ cached path never changes what actually lands in the file.
 
 **Existing tools on a live stream.** See the constraint section above.
 
+**A resize across steps silently corrupted an earlier, already-committed
+step (found 2026-08-15, verifying ADIOS2-comparable coverage rather than
+reviewing code).** ADIOS2's ordinary pattern for a time-series array is an
+unlimited-dimension variable extended and appended to once per step,
+through the same handle the whole run. Nothing in this suite had ever
+called `H5Dset_extent()`, so it went unexercised even though the same
+live-cross-step-handle pattern had already been fixed once for plain
+writes (see the M9 capture-gap section above).
+
+`H5VL_stream_dataset_specific()` was an unconditional passthrough straight
+to `under_object` for any non-placeholder dataset. That is fine for a
+dataset that has never been through a step -- but for one that has,
+`under_object` is not "the dataset" in any current sense: `H5VL__stream_
+replay_manifest()` rewires it to point at a step's own real `/step/<n>/`
+object exactly once, the step that first materializes a placeholder, and
+never moves it again (every later step captures its own separate
+synthesized copy instead, via `H5VL__stream_step_create_index()`). So
+calling `H5Dset_extent()` on the still-open handle in a later step reaches
+straight through to the *first* step's own committed real object and
+resizes it in place -- silently, since dataset-specific ops carry no
+capture/replay path of their own. Measured directly: a dataset grown by 2
+elements per step across 4 steps left `/step/0/`'s own copy holding the
+**final** extent (8), not the extent (2) it had when step 0 committed --
+retroactively rewriting history that had already landed on disk, discovered
+by actually running the pattern rather than reading the capture code and
+assuming dataset-specific ops were out of scope.
+
+Fixed the same way every other unsafe case in this connector is handled:
+decline rather than silently corrupt. `H5VL_stream_dataset_specific()` now
+refuses whenever `H5VL__stream_dset_capture()` -- the exact predicate
+`H5VL_stream_dataset_write()` already uses -- says this object's write
+would be captured, i.e. a live dataset materialized by an earlier step,
+called from inside a later open step. The working alternative already
+exists and needs no new code: re-create the dataset each step at its new
+size, exactly dev-plan.md decision #2's model (successive versions of one
+named object, landing group-based at `/step/<n>/`) applied to a shape that
+grows instead of staying fixed. `test/t_dset_resize.c` pins both halves --
+the earlier step's data surviving every declined resize attempt untouched,
+and the re-create-each-step alternative round-tripping correctly at four
+different sizes.
+
 **VL and reference support (Decision #4) were never implemented, not just
 deferred.** The residual-risk plan here was "ship them behind a property
 defaulting to off" if M2 slipped — but no such property exists, and neither

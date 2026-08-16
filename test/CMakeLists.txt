@@ -1,5 +1,6 @@
 foreach(t t_smoke t_step t_replay t_reader t_deferred t_vl_reject t_manifest_cache t_ref_path t_ref_roundtrip
-           t_vl_roundtrip t_attr_convert t_payload_compress t_step_rewrite t_reregister t_memspace t_manypaths)
+           t_vl_roundtrip t_attr_convert t_payload_compress t_step_rewrite t_reregister t_memspace t_manypaths
+           t_dset_resize)
   add_executable(${t} ${t}.c)
   target_link_libraries(${t} PRIVATE vol_stream)
 endforeach()
@@ -27,6 +28,12 @@ add_test(NAME memspace COMMAND t_memspace)
 # initial capacity, with colliding long-common-prefix keys. Every other test
 # uses a handful of paths, so the map never grows or collides in them.
 add_test(NAME manypaths COMMAND t_manypaths)
+# H5Dset_extent() on a live cross-step handle -- the ADIOS2-style growing
+# time-series array. Guards against a real bug found by running this: the
+# resize wasn't captured at all, so it landed directly on an EARLIER step's
+# already-committed real object, silently rewriting history. Now refused;
+# see H5VL_stream_dataset_specific()'s own comment and t_dset_resize.c.
+add_test(NAME dset_resize COMMAND t_dset_resize)
 
 # M4 exit gate: the two-process Mercury round trip. M5 exit gate: SSG
 # rendezvous, late joiners, and a departing reader that does not stall the
