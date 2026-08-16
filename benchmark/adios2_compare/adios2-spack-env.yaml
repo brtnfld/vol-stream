@@ -1,0 +1,28 @@
+# Local-only environment for a real ADIOS2 comparison benchmark (not checked
+# in). Shares the M4 stack's install_tree so already-built mpich/libfabric
+# etc. are reused rather than rebuilt, if the hash matches. Every optional
+# engine/compressor unrelated to a plain SST streaming benchmark is disabled
+# to keep the build small.
+#
+# cxxflags works around a real build break on this machine's GCC 15: ADIOS2
+# 2.10.2's bundled thirdparty/yaml-cpp is missing an explicit <cstdint>
+# include that older libstdc++ headers used to pull in transitively --
+# newer libstdc++ no longer does, so uint16_t/uint32_t go undeclared. Forcing
+# the include rather than patching vendored source.
+spack:
+  specs:
+  - adios2@2.10.2 +mpi +sst ~fortran ~python ~zfp ~hdf5 ~cuda ~rocm
+      ~mgard ~sz ~libcatalyst ~blosc2 ~png ~bzip2
+      cxxflags="-include cstdint"
+
+  view: true
+  concretizer:
+    unify: true
+  config:
+    install_tree:
+      root: /home/brtnfld/.spack-opt
+    source_cache: /home/brtnfld/.spack-cache
+    misc_cache: /home/brtnfld/.spack-misc-cache
+  modules:
+    default:
+      enable:: []

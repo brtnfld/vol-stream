@@ -1176,6 +1176,70 @@ every other test here only ever moves a scalar, small enough to stay on
   since the point was to measure the supported pattern honestly, not to
   benchmark an alternative nobody asked for yet.
 
+**A real, one-to-one comparison against ADIOS2 SST, same workload
+(2026-08-15).** `benchmark/adios2_compare/` -- kept for reproducibility,
+not part of this project's own build or CI, since ADIOS2 is not a
+dependency here. Built ADIOS2 2.10.2 from Spack (`+mpi +sst`, every
+unrelated engine/compressor off) specifically to answer this with real
+numbers rather than the design-plan.md-level argument alone. Same
+workload as the benchmark above, expressed idiomatically on each side
+rather than forced through one shared code path: ADIOS2 has a real
+mechanism vol-stream does not (`Variable::SetShape()`/`SetSelection()`
+before each `Put()`, no redefinition needed), so it is used, not
+vol-stream's forced recreate-each-step workaround. Same 50 steps, same
+409600-element/1.6 MiB final size, same total bytes moved (39.84 MiB) --
+the only thing that differs is which engine is doing the moving.
+
+| Metric | vol-stream (`ofi+tcp`) | ADIOS2 SST |
+|---|---|---|
+| Total bytes streamed (50 steps) | 39.84 MiB | 39.84 MiB (identical workload) |
+| Writer commit latency, mean | ~5.5-7 ms | ~0.2 ms |
+| Writer commit latency, max | up to 87 ms (outlier observed) | ~0.5 ms |
+| Start-to-receipt latency, mean | ~0.7-0.85 ms | ~0.6-2.7 ms (noisier run to run) |
+| Aggregate throughput | ~145-148 MiB/s | ~2800-3500 MiB/s |
+
+**The honest reading.** ADIOS2's writer-side commit is roughly 25-35x
+faster, and aggregate throughput roughly 19-24x higher. This is not a bug
+in vol-stream's benchmark or a tuning gap -- it is design-plan.md's own
+opening argument ("matching ADIOS2 is the floor, not the goal"), now with
+a number attached rather than left as a qualitative claim. SST's commit is
+cheap because it marshals a buffer and ships it; vol-stream's is layered
+on the full HDF5 data model faithfully -- `H5Tencode`/`H5Sencode2`/
+`H5Pencode2` re-run for a fresh `DsetCreate` every step (the recreate
+pattern this section's growing-array case forces), then a real
+`H5Dwrite()` into the underlying file via replay, not just a memory
+hand-off. That is the cost of what design-plan.md's differentiators are
+built on top of (full data model, VOL-level reuse, no new wire format for
+the parts HDF5 already encodes) -- worth stating in numbers, not just
+asserting the trade-off exists.
+
+**One metric did not go the way the aggregate numbers would predict.**
+Start-to-receipt latency -- from the writer beginning its step to the
+*other* process having decoded data in hand -- is roughly the same order
+of magnitude on both sides, and vol-stream's mean is if anything slightly
+lower across repeated runs. Plausible mechanism, not yet confirmed
+further: vol-stream's subscription push is issued mid-replay (measured
+above, 50/50 steps, ~4.8ms before the writer's own `H5Fend_step()`
+returns), so a subscriber can have the bytes before the *writer's* slower
+per-step bookkeeping (the manifest/replay cost the aggregate numbers
+above are dominated by) finishes -- the aggregate throughput gap is real
+and large, but it does not mean every dimension of "how fast does the
+other side see it" moves in the same direction.
+
+**What this does not claim.** No RDMA hardware exists on this machine, so
+both sides are measured on plain sockets/TCP, not the RDMA path either
+engine is actually designed for -- a facility with real RDMA could show a
+different gap. This is one workload (single writer, single reader, no
+M×N, no subscription narrowing, no predicate) -- several of design-plan.md's
+differentiators (subscription-based partial marshaling, predicate
+pushdown, per-subscriber precision) have no ADIOS2 equivalent to run this
+same head-to-head measurement against at all. `benchmark/adios2_compare/
+README.md` has the full build/run instructions, including a real GCC-15
+build break in ADIOS2 2.10.2's bundled `thirdparty/yaml-cpp` (missing
+`<cstdint>`, worked around with `-include cstdint` rather than patching
+vendored source) and the `ADIOS2_USE_MPI` application-side opt-in macro
+that a confusing compiler error gives no hint about needing.
+
 **VL and reference support (Decision #4) were never implemented, not just
 deferred.** The residual-risk plan here was "ship them behind a property
 defaulting to off" if M2 slipped — but no such property exists, and neither
