@@ -357,6 +357,32 @@ if(NOT VOL_STREAM_H5VL_VERSION_OK)
     "when H5VL_VERSION moved. See docs/dev-plan.md, CI matrix.")
 endif()
 
+# ---------------------------------------------------------------------------
+# VFD SWMR (optional, examples only)
+#
+# VFD SWMR is not in mainline HDF5 2.x -- it lives on the feature/vfd-swmr-port
+# branch. examples/vfd_swmr/ demonstrates that vol-stream stacks on top of it
+# (VOL over VFD) and that a second process can then read a live stream's file,
+# which is otherwise impossible. Nothing in the connector itself uses or needs
+# it, so this is a pure examples gate: absent, the example is skipped and
+# everything else builds exactly as before.
+#
+# See docs/user-guide.md's "Composing with VFD SWMR" section for the measured
+# results and the md_file_path/md_file_name trap.
+# ---------------------------------------------------------------------------
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+check_c_source_compiles("
+#include \"hdf5.h\"
+int probe(void) {
+    H5F_vfd_swmr_config_t cfg;
+    cfg.version = H5F__CURR_VFD_SWMR_CONFIG_VERSION;
+    (void)H5Pset_vfd_swmr_config(H5P_DEFAULT, &cfg);
+    (void)H5Fvfd_swmr_end_tick(H5I_INVALID_HID);
+    return 0;
+}
+" VOL_STREAM_HAVE_VFD_SWMR)
+unset(CMAKE_TRY_COMPILE_TARGET_TYPE)
+
 
 # ---------------------------------------------------------------------------
 # Plugin signing
@@ -411,6 +437,7 @@ message(STATUS "  HDF5:            ${HDF5_VERSION}")
 message(STATUS "  flatcc:          ${VOL_STREAM_FLATCC_EXE}")
 message(STATUS "  mercury:         ${VOL_STREAM_HAVE_MERCURY}")
 message(STATUS "  bake:            ${VOL_STREAM_HAVE_BAKE}")
+message(STATUS "  vfd swmr:        ${VOL_STREAM_HAVE_VFD_SWMR} (examples/vfd_swmr only)")
 message(STATUS "  logging:         ${VOL_STREAM_ENABLE_LOGGING}")
 message(STATUS "  tests:           ${VOL_STREAM_BUILD_TESTS}")
 message(STATUS "  examples:        ${VOL_STREAM_BUILD_EXAMPLES}")
