@@ -35,18 +35,31 @@
  * the previously-declined pattern now round-trips correctly, with the
  * earlier step still exactly as it was.
  *
- * Case 3 is the boundary this still has, found while building it: each
- * step's own synthesized copy is created fresh and populated only from
- * THIS step's own captured write, so a resize followed by a PARTIAL write
- * (only the new tail, the leaner ADIOS2-style append pattern used in
- * benchmark/adios2_compare/adios2_bench.cpp) leaves the carried-forward
- * portion at HDF5's own fill value rather than the previous step's real
- * values -- the connector does not (yet) copy the prior step's data
- * forward on resize. Not corruption (a different, earlier step's data is
- * never touched, and a well-defined, discoverable fill value is not
- * silently wrong data) -- but not a complete self-sufficient snapshot
- * either. Documented and pinned here rather than left to be rediscovered:
- * a full rewrite each step (case 1) is what to use until this is closed.
+ * Case 3 found a second gap while building the above, and closes it too:
+ * each step's own synthesized copy is created fresh and populated only
+ * from THIS step's own captured write, so a resize followed by a PARTIAL
+ * write (only the new tail, the leaner ADIOS2-style append pattern used
+ * in benchmark/adios2_compare/adios2_bench.cpp) used to leave the
+ * carried-forward portion at HDF5's own fill value rather than the
+ * previous step's real values. Not corruption (a different, earlier
+ * step's data was never touched, and a well-defined, discoverable fill
+ * value was not silently wrong data) -- but not a complete self-
+ * sufficient snapshot either.
+ *
+ * Closed by H5VL__stream_carry_forward_resized(), which runs once per
+ * synthesized create after the main replay loop finishes: it finds the
+ * previous step's own committed copy for the same path (H5VL__stream_
+ * path_index_resolve(), already populated by every writer-side replay for
+ * reference resolution -- no new bookkeeping needed) and reads its values
+ * forward into the region this step's own write does not cover. Gated by
+ * a zero-waste check (this step's total written elements must equal
+ * exactly the growth, new extent minus old) so a full rewrite (case 1,
+ * already complete) never pays for a copy it does not need. Consequence
+ * worth knowing, not just correctness: this is also what turns the
+ * O(N^2) total-bytes-per-run cost a full rewrite pays (case 1, and
+ * test/b_stream_grow.c's own benchmark) into O(N) for the tail-append
+ * pattern -- measured directly in docs/dev-plan.md's benchmark section,
+ * where the relative advantage grows with how long the stream runs.
  */
 
 #include <stdio.h>
@@ -323,14 +336,17 @@ case_recreate_each_step(hid_t vol_id)
 } /* end case_recreate_each_step() */
 
 /* --------------------------------------------------------------------
- * Case 3: the documented boundary. H5Dset_extent() + writing only the
- * NEW tail slice (not a full rewrite) through one live handle. Each
- * step's own synthesized copy is created fresh and populated only from
- * that step's own captured write, so the carried-forward portion lands
- * at HDF5's own fill value (0 for H5T_NATIVE_INT, the default), not the
- * previous step's real values. Asserted as the CURRENT, known behavior --
- * not a silent-corruption risk (a well-defined fill value, not another
- * step's data), but not a complete self-sufficient snapshot either.
+ * Case 3: H5Dset_extent() + writing only the NEW tail slice (not a full
+ * rewrite) through one live handle -- the O(N) alternative to case 1's
+ * O(N^2) full rewrite. Used to leave the carried-forward portion at
+ * HDF5's own fill value (each step's synthesized copy was created fresh,
+ * populated only from that step's own write); H5VL__stream_carry_
+ * forward_resized() now fills it in from the previous step's own
+ * committed copy, so this asserts the CLOSED state -- a complete,
+ * correct snapshot at every step, not just this step's own tail. The
+ * per-step print below still reports if the old gap ever reopens (a
+ * regression would show the old "documented gap" message instead of the
+ * "ALSO correct now" one, not a hard failure -- see its own comment).
  * -------------------------------------------------------------------- */
 static void
 case_resize_partial_write_gap(hid_t vol_id)
@@ -339,7 +355,7 @@ case_resize_partial_write_gap(hid_t vol_id)
     hsize_t dims = CHUNK, maxdims = H5S_UNLIMITED, chunk = CHUNK;
     int     s;
 
-    printf("case 3: H5Dset_extent() + a partial (tail-only) write -- the documented boundary\n");
+    printf("case 3: H5Dset_extent() + a partial (tail-only) write -- the O(N) pattern\n");
 
     unlink(FNAME_PARTIAL);
 
@@ -462,13 +478,17 @@ case_resize_partial_write_gap(hid_t vol_id)
                 head_carried = 0;
 
         if (head_carried)
-            printf("  ok    %s: carried-forward head is ALSO correct now -- case 3's documented gap has "
-                   "been closed; update this test's comment\n",
+            printf("  ok    %s: carried-forward head correct -- H5VL__stream_carry_forward_resized() "
+                   "filled it in from the previous step\n",
                    path);
-        else
-            printf("  ok    %s: new tail correct, carried-forward head at fill value (documented gap, "
-                   "not a failure)\n",
-                   path);
+        else {
+            /* This gap was real (and tolerated) once; it is now closed and
+             * shipped (H5VL__stream_carry_forward_resized()), so a
+             * reappearance here is a genuine regression, not the
+             * documented-boundary case this used to be. */
+            printf("  FAIL  %s: carried-forward head at fill value -- the closed gap has reopened\n", path);
+            nerrors++;
+        }
     }
     H5Fclose(nfid);
 } /* end case_resize_partial_write_gap() */

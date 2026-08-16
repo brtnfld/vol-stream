@@ -1172,6 +1172,74 @@ sides are no longer directly comparable on this specific axis until it
 closes). Full rewrite each step (case 1) or re-create each step (case 2)
 are both complete today.
 
+**Closed 2026-08-15, prompted by "is it still slower, how can we improve
+it" after the `.payload`-staging finding above.** Profiling had already
+shown the writer's own O(N^2) total-bytes-per-run cost (every step
+re-sending the whole cumulative array, not just what changed) as a real,
+separate lever from `.payload` compression -- closing the gap above was
+the way to actually use it, since a tail-only write was exactly what the
+gap left incomplete.
+
+`H5VL__stream_carry_forward_resized()` runs once per synthesized create,
+after the main replay loop finishes (every `replay_under[]` object
+exists, every entry's own write has already landed). It needed no new
+bookkeeping: `H5VL__stream_path_index_resolve()`, already populated by
+every writer-side replay for reference resolution, finds the previous
+step's own committed copy for the same path directly. It reads that
+copy's full values and writes them into the new (larger) object's
+matching `[0, old_extent)` region -- the region this step's own write
+does not cover.
+
+**Zero-waste by construction, not by a special case for case 1.** The
+gate is a single equality: this step's own written-element total must
+equal exactly the growth (new extent minus old). A full rewrite writes
+the *whole* new extent, not just the growth, so it fails this check and
+is correctly skipped -- case 1 pays nothing for a copy it does not need,
+verified by the unchanged, still-passing case 1 assertions rather than
+assumed. Best-effort throughout, matching every other opportunistic path
+in this connector: a failure to open the previous copy, a type/rank
+mismatch (scoped to 1-D, matching every real resize use case), or an
+allocation failure all just skip carry-forward for that path rather than
+failing the step's replay -- the gap this closes was never a correctness
+bug, so nothing here is allowed to become one. `test/t_dset_resize.c`'s
+case 3 is now a real regression guard (it FAILs if the gap reopens, not
+just reports which state it found) -- verified non-vacuous by disabling
+the call and confirming it fails with exactly the old message.
+
+**Measured at two scales to confirm the O(N) claim isn't just asserted.**
+Same benchmark shape as `test/b_stream_grow.c`, `VOL_STREAM_STAGE_
+PAYLOAD=0` (the finding above) on both variants for a fair comparison of
+this lever specifically:
+
+| Steps | Pattern | Total bytes | Writer commit, mean | Total wall time |
+|---|---|---|---|---|
+| 50 | Full rewrite (O(N^2)) | 39.84 MiB | ~0.87 ms | ~46 ms |
+| 50 | Tail-only (O(N)) | 1.56 MiB | ~0.62 ms | ~31-33 ms |
+| 200 | Full rewrite (O(N^2)) | 628.12 MiB | ~2.84 ms | ~642 ms |
+| 200 | Tail-only (O(N)) | 6.25 MiB | ~1.72 ms | ~341 ms |
+
+Total bytes drops exactly as the complexity classes predict (200-step
+tail-only moves 6.25 MiB regardless of run length's square; full rewrite
+moves the sum of every step's then-current size). **The relative
+advantage in total wall time grows with run length** -- roughly 1.4x at
+50 steps, roughly 1.9x at 200 -- exactly what O(N) vs. O(N^2) predicts:
+the gap should widen, not stay fixed, as the stream runs longer. A short
+benchmark understates the win; a long-running stream is where this
+matters most.
+
+**One metric that does NOT improve, and why it doesn't mean what it looks
+like it means: "aggregate throughput" (total bytes / wall time) is LOWER
+for the tail-only pattern** (18-55 MiB/s vs. 870-980 MiB/s for full
+rewrite at these scales) -- because total bytes shrank by design (25x at
+50 steps) while the FIXED per-step cost (Mercury/Margo/Argobots RPC and
+progress-engine overhead, ordinary HDF5 metadata operations -- the ~34%
+of self-time this section's own profiling found, independent of payload
+size) did not shrink proportionally. Throughput answers "how fast does
+data move once it's moving"; it is the wrong lens for a change whose
+entire point is moving less data in the first place. Total wall time and
+writer commit latency -- both of which improved -- are the metrics that
+answer "is the whole run faster," which is what was actually asked.
+
 **Benchmarked 2026-08-15: the growing time-series array, streamed for
 real.** ADIOS2 has no published benchmark for this exact case either --
 its own `testing/adios2/performance/` suite covers many-variable overhead

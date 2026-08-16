@@ -489,6 +489,8 @@ static herr_t H5VL__stream_build_manifest(H5VL_stream_file_state_t *fs, uint8_t 
 static herr_t H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_buf,
                              size_t manifest_len, const uint8_t *payload_buf,
                              H5VL_stream_pending_entry_t *pending_for_wiring, size_t n_pending_for_wiring);
+static herr_t H5VL__stream_carry_forward_resized(H5VL_stream_t *file_obj, vs_Entry_vec_t entries,
+                             size_t n_entries, void **replay_under, uint64_t physical_step);
 static herr_t H5VL__stream_replay_step(H5VL_stream_t *file_obj);
 /* M7: queue policy -- see H5VL__stream_apply_queue_policy()'s comment for
  * what each does and why they are safe to call instead of a full replay. */
@@ -4848,6 +4850,233 @@ H5VL__stream_gather_mem(const void *buf, hid_t mem_space, size_t elem_size, size
 } /* end H5VL__stream_gather_mem() */
 
 /*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_carry_forward_resized
+ *
+ * Purpose:     Closes test/t_dset_resize.c's case 3: a live object resized
+ *              (H5VL_stream_dataset_specific()'s deferred SET_EXTENT) and
+ *              then written with only the NEW tail, not a full rewrite --
+ *              the tail-append pattern benchmark/adios2_compare/
+ *              adios2_bench.cpp uses on the ADIOS2 side, and the one this
+ *              connector's O(N^2) total-bytes-per-run cost (docs/dev-plan.md's
+ *              benchmark section) can only drop to O(N) for.
+ *
+ *              Every step's synthesized copy (H5VL__stream_step_create_
+ *              index()) is created fresh and populated only from that
+ *              step's own captured write(s), so a tail-only write left the
+ *              carried-forward head at HDF5's fill value. This runs once
+ *              per DsetCreate entry, AFTER the main replay loop finishes
+ *              (every replay_under[] object exists and every entry's own
+ *              write has already landed), and reads the PREVIOUS step's
+ *              own committed copy -- found via H5VL__stream_path_index_
+ *              resolve(), which every writer-side replay already populates
+ *              for reference resolution, so no new bookkeeping was needed
+ *              -- to fill in the region this step never touched.
+ *
+ *              Zero-waste gate, not a set-difference computation: sums
+ *              this step's own DsetWrite entries for the same path and
+ *              only proceeds when that total exactly equals the growth
+ *              (new extent - old extent). A full rewrite (0..new-1) has a
+ *              total equal to the WHOLE new extent, not the growth alone,
+ *              so it fails this check and is skipped -- correctly, since
+ *              it already has no gap to fill and paying for a redundant
+ *              read-and-copy would only slow down case 1's already-
+ *              complete pattern. Anything else (multiple non-contiguous
+ *              writes, a write that does not start exactly at the old
+ *              extent's end) is left at today's documented gap rather
+ *              than risked: an imprecise partial copy landing at the
+ *              wrong indices would be worse than the fill-value absence
+ *              already documented and tested.
+ *
+ *              Best-effort throughout, matching every other opportunistic
+ *              path in this connector (payload compression, the zero-copy
+ *              refilter path): failing to open the previous step's copy,
+ *              a type/rank mismatch, or an allocation failure all just
+ *              skip carry-forward for that path rather than failing the
+ *              step's replay -- the gap this closes was never a
+ *              correctness bug, so nothing here is allowed to become one.
+ *
+ *              Scoped to 1-D, matching every resize-adjacent test and
+ *              real use case (an unlimited leading dimension is the
+ *              ordinary growing-array shape); an N-D resize is left at
+ *              today's gap rather than guessed at.
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_carry_forward_resized(H5VL_stream_t *file_obj, vs_Entry_vec_t entries, size_t n_entries,
+                                     void **replay_under, uint64_t physical_step)
+{
+    H5VL_stream_file_state_t *fs = file_obj->file_state;
+    size_t                     i;
+
+    if (physical_step == 0 || !entries)
+        return 0; /* nothing can precede the very first step */
+
+    for (i = 0; i < n_entries; i++) {
+        vs_Entry_table_t e    = vs_Entry_vec_at(entries, i);
+        const char        *path = vs_Entry_path(e);
+        uint64_t           prev_step;
+        hid_t              new_space = -1, prev_space = -1, dtype = -1;
+        void              *prev_ds = NULL;
+        hsize_t            new_dims[1] = {0}, old_dims[1] = {0};
+        hssize_t           written_total = 0;
+        size_t             j;
+
+        if (vs_Entry_kind(e) != vs_Kind_DsetCreate || !path || !replay_under[i])
+            continue;
+
+        /* No prior step ever had this path: either this is the path's
+         * very first materialization (nothing to carry forward from), or
+         * a lookup failure -- either way, correctly nothing to do. */
+        if (H5VL__stream_path_index_resolve(fs, path, physical_step - 1, &prev_step) < 0)
+            continue;
+
+        {
+            H5VL_dataset_get_args_t gargs;
+
+            memset(&gargs, 0, sizeof(gargs));
+            gargs.op_type = H5VL_DATASET_GET_SPACE;
+            if (H5VLdataset_get(replay_under[i], file_obj->under_vol_id, &gargs, H5P_DATASET_XFER_DEFAULT,
+                                  NULL) < 0)
+                continue;
+            new_space = gargs.args.get_space.space_id;
+        }
+        if (H5Sget_simple_extent_ndims(new_space) != 1) { /* 1-D only, documented scope */
+            H5Sclose(new_space);
+            continue;
+        }
+        H5Sget_simple_extent_dims(new_space, new_dims, NULL);
+        H5Sclose(new_space);
+
+        /* Sum this step's own write(s) for the same path -- the zero-waste
+         * gate below decides from this whether there is a gap to fill. */
+        for (j = 0; j < n_entries; j++) {
+            vs_Entry_table_t we    = vs_Entry_vec_at(entries, j);
+            const char        *wpath = vs_Entry_path(we);
+
+            if (vs_Entry_kind(we) != vs_Kind_DsetWrite || !wpath || strcmp(wpath, path) != 0)
+                continue;
+            {
+                flatbuffers_uint8_vec_t wspace_enc = vs_Entry_space_enc(we);
+                hid_t                    wspace     = wspace_enc ? H5Sdecode(wspace_enc) : -1;
+
+                if (wspace >= 0) {
+                    hssize_t np = H5Sget_select_npoints(wspace);
+
+                    if (np > 0)
+                        written_total += np;
+                    H5Sclose(wspace);
+                }
+            }
+        }
+
+        /* Open the previous step's own copy: what to carry forward from,
+         * and its real extent (old_dims[0]) for the zero-waste gate. */
+        {
+            char               *full_path;
+            size_t              full_len;
+            H5VL_loc_params_t  loc_params;
+            char                prev_root[32];
+
+            snprintf(prev_root, sizeof(prev_root), "/step/%llu", (unsigned long long)prev_step);
+            full_len = strlen(prev_root) + strlen(path) + 1;
+            if (NULL == (full_path = (char *)malloc(full_len)))
+                continue;
+            snprintf(full_path, full_len, "%s%s", prev_root, path);
+
+            memset(&loc_params, 0, sizeof(loc_params));
+            loc_params.obj_type = H5I_FILE;
+            loc_params.type     = H5VL_OBJECT_BY_SELF;
+
+            prev_ds = H5VLdataset_open(file_obj->under_object, &loc_params, file_obj->under_vol_id,
+                                        full_path, H5P_DATASET_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT,
+                                        NULL);
+            free(full_path);
+        }
+        if (!prev_ds)
+            continue; /* best-effort: leave the documented fill-value gap */
+
+        {
+            H5VL_dataset_get_args_t gargs;
+
+            memset(&gargs, 0, sizeof(gargs));
+            gargs.op_type = H5VL_DATASET_GET_SPACE;
+            if (H5VLdataset_get(prev_ds, file_obj->under_vol_id, &gargs, H5P_DATASET_XFER_DEFAULT, NULL) <
+                0) {
+                H5VLdataset_close(prev_ds, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+                continue;
+            }
+            prev_space = gargs.args.get_space.space_id;
+        }
+        if (H5Sget_simple_extent_ndims(prev_space) != 1) {
+            H5Sclose(prev_space);
+            H5VLdataset_close(prev_ds, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+            continue;
+        }
+        H5Sget_simple_extent_dims(prev_space, old_dims, NULL);
+
+        /* The zero-waste gate: only proceed when this step's own writes
+         * for the path cover EXACTLY the growth, no more, no less. A full
+         * rewrite's total equals new_dims[0] (the whole new extent), not
+         * new_dims[0] - old_dims[0], so it is correctly skipped here. */
+        if (new_dims[0] <= old_dims[0] || written_total != (hssize_t)(new_dims[0] - old_dims[0])) {
+            H5Sclose(prev_space);
+            H5VLdataset_close(prev_ds, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+            continue;
+        }
+
+        {
+            H5VL_dataset_get_args_t tgargs;
+
+            memset(&tgargs, 0, sizeof(tgargs));
+            tgargs.op_type = H5VL_DATASET_GET_TYPE;
+            if (H5VLdataset_get(prev_ds, file_obj->under_vol_id, &tgargs, H5P_DATASET_XFER_DEFAULT, NULL) >=
+                0)
+                dtype = tgargs.args.get_type.type_id;
+        }
+        if (dtype < 0) {
+            H5Sclose(prev_space);
+            H5VLdataset_close(prev_ds, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+            continue;
+        }
+
+        {
+            size_t elem_size = H5Tget_size(dtype);
+            void  *buf        = elem_size ? malloc((size_t)old_dims[0] * elem_size) : NULL;
+
+            if (buf) {
+                void *bufp = buf;
+
+                if (H5VLdataset_read(1, &prev_ds, file_obj->under_vol_id, &dtype, &prev_space, &prev_space,
+                                       H5P_DATASET_XFER_DEFAULT, &bufp, NULL) >= 0) {
+                    /* The destination selection is a hyperslab of the NEW
+                     * (larger) object's own dataspace, [0, old_dims[0]) --
+                     * prev_space's extent is the OLD, smaller size and
+                     * cannot be used as the destination file-space. */
+                    hid_t   dst_space = H5Screate_simple(1, new_dims, NULL);
+                    hsize_t start = 0;
+
+                    if (dst_space >= 0 &&
+                        H5Sselect_hyperslab(dst_space, H5S_SELECT_SET, &start, NULL, old_dims, NULL) >= 0) {
+                        const void *cbufp = buf;
+
+                        H5VLdataset_write(1, &replay_under[i], file_obj->under_vol_id, &dtype, &prev_space,
+                                            &dst_space, H5P_DATASET_XFER_DEFAULT, &cbufp, NULL);
+                    }
+                    if (dst_space >= 0)
+                        H5Sclose(dst_space);
+                }
+                free(buf);
+            }
+            H5Tclose(dtype);
+        }
+        H5Sclose(prev_space);
+        H5VLdataset_close(prev_ds, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+    }
+
+    return 0;
+} /* end H5VL__stream_carry_forward_resized() */
+
+/*-------------------------------------------------------------------------
  * Function:    H5VL__stream_replay_manifest
  *
  * Purpose:     The M2 core (M7: the second half of what was
@@ -5586,6 +5815,13 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
             if (ddcpl >= 0)
                 H5Pclose(ddcpl);
         }
+
+        /* Fills in a resized-and-tail-written object's carried-forward
+         * region (test/t_dset_resize.c case 3) -- must run after every
+         * entry above has replayed (every replay_under[] object exists
+         * and this step's own writes have already landed) and before any
+         * of them close below. */
+        H5VL__stream_carry_forward_resized(file_obj, entries, n_entries, replay_under, physical_step);
 
         /* Close every replayed dataset the application is not still holding
          * open via a placeholder handle -- see H5VL_stream_dataset_close(). */
