@@ -45,6 +45,7 @@ endif()
 
 option(VOL_STREAM_ENABLE_LOGGING "Log every VOL callback to stdout" OFF)
 option(VOL_STREAM_BUILD_TESTS "Build the test programs" ON)
+option(VOL_STREAM_BUILD_EXAMPLES "Build the example programs" ON)
 
 # ---------------------------------------------------------------------------
 # flatcc -- manifest framing (M2)
@@ -397,6 +398,10 @@ if(VOL_STREAM_BUILD_TESTS)
   add_subdirectory(test)
 endif()
 
+if(VOL_STREAM_BUILD_EXAMPLES)
+  add_subdirectory(examples)
+endif()
+
 install(TARGETS vol_stream LIBRARY DESTINATION lib)
 install(FILES src/H5VLstream.h DESTINATION include)
 
@@ -408,5 +413,6 @@ message(STATUS "  mercury:         ${VOL_STREAM_HAVE_MERCURY}")
 message(STATUS "  bake:            ${VOL_STREAM_HAVE_BAKE}")
 message(STATUS "  logging:         ${VOL_STREAM_ENABLE_LOGGING}")
 message(STATUS "  tests:           ${VOL_STREAM_BUILD_TESTS}")
+message(STATUS "  examples:        ${VOL_STREAM_BUILD_EXAMPLES}")
 message(STATUS "  h5sign:          ${H5SIGN_EXECUTABLE}")
 message(STATUS "")

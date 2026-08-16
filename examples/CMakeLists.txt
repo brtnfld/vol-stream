@@ -1,0 +1,7 @@
+# Real use cases, not tests -- see each subdirectory's own README.md.
+# Requires the transport (subscription push has no non-transport fallback),
+# same gate as the transport-dependent targets in test/CMakeLists.txt.
+if(VOL_STREAM_HAVE_MERCURY)
+  add_subdirectory(heat_diffusion)
+  add_subdirectory(reaction_diffusion)
+endif()
