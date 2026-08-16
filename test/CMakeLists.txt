@@ -66,6 +66,18 @@ if(VOL_STREAM_HAVE_MERCURY)
     TIMEOUT 60
   )
 
+  # Benchmark, not a correctness gate in the usual sense: the growing
+  # time-series array (t_dset_resize.c's supported re-create-each-step
+  # pattern) streamed for real over na+sm, reporting commit latency,
+  # end-to-end latency, and throughput. See its own top comment.
+  add_executable(b_stream_grow b_stream_grow.c)
+  target_link_libraries(b_stream_grow PRIVATE vol_stream)
+  add_test(NAME stream_grow_benchmark COMMAND b_stream_grow)
+  set_tests_properties(stream_grow_benchmark PROPERTIES
+    ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
+    TIMEOUT 120
+  )
+
   # Every test above registers the connector explicitly, which leaves the
   # process default VOL native -- and that is exactly what hid the connector's
   # own scratch files inheriting vol-stream as their VOL and recursing back

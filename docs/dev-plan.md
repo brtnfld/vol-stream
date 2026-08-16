@@ -1116,6 +1116,66 @@ the earlier step's data surviving every declined resize attempt untouched,
 and the re-create-each-step alternative round-tripping correctly at four
 different sizes.
 
+**Benchmarked 2026-08-15: the growing time-series array, streamed for
+real.** ADIOS2 has no published benchmark for this exact case either --
+its own `testing/adios2/performance/` suite covers many-variable overhead
+and metadata composition/installation/traversal cost, neither of which is
+a resizable array -- so `test/b_stream_grow.c` reports vol-stream's own
+numbers rather than a head-to-head. Same two-process shape as
+`test/t_transport.c` (a real writer and reader in separate OS processes
+over Mercury), `/series` re-created and rewritten in full each step,
+growing from 8192 to 409600 elements (32 KiB to 1.6 MiB) across 50 steps.
+
+Two things worth stating plainly rather than leaving to be inferred from
+one aggregate number:
+
+- **The end-to-end read path could not use `H5Fwait_step_ready()` +
+  `H5Fbegin_step()` + `H5Dopen2()`** -- `test/t_manypaths.c`'s pattern,
+  which works for a *finished* stream. `H5Fbegin_step()`'s reader-index
+  build is a one-time scan of the underlying file's own group listing
+  (`H5VL__stream_reader_build_index()`), the same class of native metadata
+  read that leaves `h5ls`/`h5dump` reporting `**NOT FOUND**` against a live
+  writer (this document's own "existing tools on a live stream" finding) --
+  a second process's file handle simply does not see it while the writer
+  still holds the file open. The benchmark's reader uses
+  `H5Fsubscribe()`/`H5Fget_subscribed_data()` instead, which rides the same
+  Mercury RPC round trip `H5Fwait_step_ready()` uses and never touches the
+  underlying file's metadata at all -- confirming M8's subscription
+  protocol is not just the differentiator (design-plan.md's ranking) but
+  the *only* mechanism this connector has for a second process to observe
+  live data, notification aside.
+- **The subscriber routinely has the data before the writer's own
+  `H5Fend_step()` call returns.** Measured 50/50 steps, mean 4.8ms early:
+  the push is issued mid-replay, as pending entries are processed, not
+  after the step finishes committing. Reporting "end-to-end latency" against
+  `H5Fend_step()`'s return would have produced a negative number purely from
+  measuring against the wrong reference point -- the benchmark instead times
+  from `H5Fbegin_step()`, which is always well-defined.
+
+Measured (`ofi+tcp`; `na+sm`'s zero-copy path needs `process_vm_readv()`
+cross-memory attach, which this machine's `kernel.yama.ptrace_scope`
+denies for a transfer this size even between `fork()`-related processes --
+every other test here only ever moves a scalar, small enough to stay on
+`na+sm`'s inline path and never trip this):
+
+- start-to-receipt latency (`H5Fbegin_step()` to the subscriber's decoded
+  data in hand): 0.2-2.0ms across the run, growing with the array itself.
+- writer-side commit latency (`H5Fbegin_step()`..`H5Fend_step()` return):
+  0.8ms at the first, smallest step to 9-12ms at the last, largest one --
+  linear in the step's own size, as expected for a full re-encode and
+  replay of the whole cumulative array.
+- aggregate throughput over the whole run: ~145 MiB/s.
+- **total bytes moved across the run (39.8 MiB) versus the final step
+  alone (1.6 MiB, 3.9% of the total)**: the O(N^2) cost, made concrete, of
+  the self-sufficient-snapshot convention re-creating each step gives you
+  for free -- every step resends everything written so far, not just what
+  changed since the last one. A tail-only-append variant (write just the
+  new slice, accept that a single step's own copy is incomplete on its
+  own) would trade that for O(N) total at the cost of the "state of group
+  G as of step N" forward-fill already documented above -- not built here,
+  since the point was to measure the supported pattern honestly, not to
+  benchmark an alternative nobody asked for yet.
+
 **VL and reference support (Decision #4) were never implemented, not just
 deferred.** The residual-risk plan here was "ship them behind a property
 defaulting to off" if M2 slipped — but no such property exists, and neither
