@@ -1,13 +1,24 @@
 # vol-stream vs. ADIOS2 SST: growing time-series array, streamed
 
 A one-to-one comparison of `test/b_stream_grow.c`'s workload (an
-unlimited-dimension array extended by a fixed chunk each step, re-created and
-rewritten in full every step) run for real against ADIOS2's SST engine, its
-streaming engine and the fair counterpart to vol-stream's Mercury transport
-(not BP file staging). vol-stream can now also express this growth via a
-real `H5Dset_extent()` on a persistent handle instead of re-creating the
-dataset each step (see `docs/dev-plan.md` and `test/t_dset_resize.c`) --
-either pattern moves the same bytes and measures the same here.
+unlimited-dimension array extended by a fixed chunk each step) run for real
+against ADIOS2's SST engine, its streaming engine and the fair counterpart to
+vol-stream's Mercury transport (not BP file staging). Two patterns, each
+with its own vol-stream/ADIOS2 pair, since they move genuinely different
+amounts of data, not just different API paths to the same bytes:
+
+- **Full rewrite** (`adios2_bench.cpp` / `test/b_stream_grow.c`): every step
+  re-sends the WHOLE cumulative array, 0..n-1. O(N^2) total bytes across the
+  run. This is what `adios2_bench.cpp` actually does, on both sides equally
+  -- an earlier version of this README claimed it used ADIOS2's tail-only
+  idiom; it did not, and that was a real documentation error, now fixed here
+  and in the pair below.
+- **Tail-only** (`adios2_bench_tail.cpp` / `test/b_stream_grow_tail.c`):
+  every step sends only the NEW tail slice. O(N) total bytes. ADIOS2's own
+  idiomatic use of `SetSelection()` for a streaming append; vol-stream's
+  counterpart needed `H5VL__stream_carry_forward_resized()` (see
+  `docs/dev-plan.md` and `test/t_dset_resize.c`'s case 3) before it produced
+  complete snapshots instead of a fill-value gap.
 
 Same workload on both sides: 50 steps, `/series` growing by 8192 elements
 (32 KiB) per step to 409600 elements (1.6 MiB) at the final step, streamed
@@ -18,6 +29,8 @@ one-off comparison, kept here for reproducibility.
 ## Results (measured 2026-08-15, this machine, `ofi`/`sockets` fabric --
 no RDMA hardware present on either side of the comparison)
 
+### Full-rewrite pattern (O(N^2) total bytes)
+
 | Metric | vol-stream, staging ON (default) | vol-stream, staging OFF | ADIOS2 SST |
 |---|---|---|---|
 | Total bytes streamed (50 steps) | 39.84 MiB | 39.84 MiB | 39.84 MiB (identical workload) |
@@ -25,6 +38,33 @@ no RDMA hardware present on either side of the comparison)
 | Writer commit latency, max | up to 87 ms (outlier observed) | ~1.9 ms | ~0.5 ms |
 | Start-to-receipt latency, mean | ~0.7-0.85 ms | (not separately measured) | ~0.6-2.7 ms (noisier run to run) |
 | Aggregate throughput | ~140-145 MiB/s | ~865-880 MiB/s | ~2800-3500 MiB/s |
+| Total wall time, 50 steps | ~280 ms | ~46 ms | ~13 ms |
+
+### Tail-only pattern (O(N) total bytes) -- the fairer, final comparison
+
+| Metric | vol-stream, staging OFF | ADIOS2 SST |
+|---|---|---|
+| Total bytes streamed (50 steps) | 1.56 MiB | 1.56 MiB (identical workload) |
+| Writer commit latency, mean | ~0.62-0.69 ms | ~0.021 ms |
+| Total wall time, 50 steps | ~30-33 ms | ~2.05 ms |
+
+**The gap does not close the way closing the O(N^2)-vs-O(N) gap inside
+vol-stream itself might suggest -- it widens, relatively.** vol-stream's own
+total wall time improved 1.4-1.5x moving to the tail-only pattern (46ms ->
+~31.7ms), a real win measured and documented in `docs/dev-plan.md`. But
+ADIOS2's total wall time improved far more (~13ms -> ~2.05ms, roughly 6x),
+because ADIOS2's per-step cost scales down with less data far more than
+vol-stream's does. The full-rewrite-vs-full-rewrite gap is ~3.6x; the
+tail-only-vs-tail-only gap is ~15.5x. This is consistent with this
+project's own profiling (`docs/dev-plan.md`'s `.payload`-staging section):
+once payload-proportional costs are minimized, what's left on vol-stream's
+side is a largely FIXED per-step cost (Mercury/Margo/Argobots RPC and
+progress-engine overhead, real HDF5 metadata operations for a genuine
+per-step object) that does not shrink with a smaller payload the way
+ADIOS2's lighter-weight marshal-and-ship does. Closing *that* gap is a
+different, harder problem than the O(N^2) one this session closed -- see
+`docs/dev-plan.md`'s still-open options (async subscriber push, Margo
+progress-engine tuning).
 
 "Staging OFF" is `VOL_STREAM_STAGE_PAYLOAD=0` -- an existing, already-
 documented, already-tested vol-stream knob (`H5VL__stream_stage_payload()`),
@@ -61,15 +101,23 @@ engine/compressor variant off, and shares this project's own
 ENV=/some/scratch/adios2-spack-env
 ADIOS2_PREFIX=$(spack -e "$ENV" location -i adios2)
 LIBFABRIC_PREFIX=$(spack -e "$ENV" location -i libfabric)
-/home/brtnfld/packages/mpich/bin/mpicxx -std=c++14 -o adios2_bench adios2_bench.cpp \
-  -I"$ADIOS2_PREFIX/include" \
-  -L"$ADIOS2_PREFIX/lib64" -Wl,-rpath,"$ADIOS2_PREFIX/lib64" \
-  -L"$LIBFABRIC_PREFIX/lib" -Wl,-rpath,"$LIBFABRIC_PREFIX/lib" \
-  -ladios2_cxx11_mpi -ladios2_cxx11 -ladios2_core_mpi -ladios2_core
+for name in adios2_bench adios2_bench_tail; do
+  /home/brtnfld/packages/mpich/bin/mpicxx -std=c++14 -o "$name" "$name.cpp" \
+    -I"$ADIOS2_PREFIX/include" \
+    -L"$ADIOS2_PREFIX/lib64" -Wl,-rpath,"$ADIOS2_PREFIX/lib64" \
+    -L"$LIBFABRIC_PREFIX/lib" -Wl,-rpath,"$LIBFABRIC_PREFIX/lib" \
+    -ladios2_cxx11_mpi -ladios2_cxx11 -ladios2_core_mpi -ladios2_core
+done
 
-./run_adios2_bench.sh
-python3 report.py
+./run_adios2_bench.sh && python3 report.py            # full-rewrite, O(N^2)
+./run_adios2_bench_tail.sh && python3 report_tail.py   # tail-only, O(N)
 ```
+
+The vol-stream side of each pair is `test/b_stream_grow.c` (full-rewrite)
+and `test/b_stream_grow_tail.c` (tail-only) -- both built and run as part
+of vol-stream's own test suite (`ctest -R stream_grow`), not this
+directory; run them directly (`build/test/b_stream_grow[_tail]`) or via
+`ctest` for the vol-stream-side numbers.
 
 `ADIOS2_USE_MPI` must be `#define`d to `1` by the *application* before
 including `adios2.h` -- the library is built with MPI support
@@ -80,20 +128,22 @@ for call") gives no hint that this is the cause.
 
 ## Design notes -- what makes this a fair comparison, and where it isn't
 
-**Growing shape, expressed idiomatically per side.** At the time this
-comparison was first built, vol-stream had no supported way to resize a
-dataset across steps (see `test/t_dset_resize.c`'s history); its only
-working pattern was re-creating the object each step, and ADIOS2's own
-real mechanism (`Variable::SetShape()`/`SetSelection()` before each
-`Put()`, no redefinition needed) was used on its side rather than forcing
-ADIOS2 through vol-stream's workaround. vol-stream has since grown a real
-`H5Dset_extent()` on a persistent handle too (same file, same test) --
-both patterns are legitimate now, and this benchmark still uses the
-recreate-each-step form since that is what it originally measured; the
-comparison is unaffected either way, since both produce the same bytes on
-the wire. Each side still uses its own idiomatic API for the *same data
-volume and growth pattern*, not a shared
-code path.
+**Growing shape, expressed idiomatically per side -- and now in both of
+its genuinely different forms.** At the time this comparison was first
+built, vol-stream had no supported way to resize a dataset across steps
+(see `test/t_dset_resize.c`'s history); the only working pattern was
+re-creating the object each step (O(N^2) total bytes), so `adios2_bench.cpp`
+used ADIOS2's own full-rewrite equivalent for a fair comparison at that
+pattern -- not, as an earlier version of this README incorrectly claimed,
+ADIOS2's tail-only idiom. vol-stream has since grown a real
+`H5Dset_extent()` (`docs/dev-plan.md`) and, this same session, the
+carry-forward mechanism that makes a tail-only write (O(N)) produce a
+complete snapshot instead of a fill-value gap -- so `adios2_bench_tail.cpp`
+now exists as the genuinely fair O(N)-vs-O(N) pair, using ADIOS2's real
+`SetSelection()`-to-the-new-region idiom on one side and vol-stream's
+matching tail-only pattern on the other. Each side still uses its own
+idiomatic API, not a shared code path -- but now for both of the two
+genuinely different amounts of data a growing array can be streamed as.
 
 **Timestamps, not shared memory.** vol-stream's writer and reader are
 `fork()` children of one process (a shared `mmap`), matching

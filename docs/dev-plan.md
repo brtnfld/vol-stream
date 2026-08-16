@@ -1152,25 +1152,19 @@ rewrite) leaves the carried-forward portion at HDF5's own fill value.**
 Each step's own synthesized copy is still created fresh
 (`H5VL__stream_step_create_index()`'s existing design, unchanged) and
 populated only from that step's own captured write -- a resize changes
-*how large* the fresh copy is, not *what already has real data in it*.
-The connector does not (yet) copy the previous step's actual values
-forward into the newly-grown region. This is `test/t_dset_resize.c`'s
-case 3, deliberately named the boundary rather than silently omitted:
-not corruption (a different, earlier step's own data is never touched,
-and HDF5's own well-defined fill value is not silently wrong data,
-merely absent), but not a complete self-sufficient snapshot either.
-Closing it would need the writer side to track, per path, where the
-most recently replayed copy lives (the reader side already has exactly
-this via `H5VL__stream_path_index_resolve()`; the writer has no
-equivalent yet) and have replay copy that prior extent's values forward
-before applying this step's own write -- real, well-scoped follow-on
-work, not attempted here since the tail-only pattern this closes is a
-genuine but different use case from the one that prompted this fix
-(`benchmark/adios2_compare/adios2_bench.cpp` uses exactly this partial-
-write idiom on the ADIOS2 side, which is what surfaced the gap: the two
-sides are no longer directly comparable on this specific axis until it
-closes). Full rewrite each step (case 1) or re-create each step (case 2)
-are both complete today.
+*how large* the fresh copy is, not *what already has real data in it* --
+at the time this was written, the connector did not copy the previous
+step's actual values forward into the newly-grown region. This was
+`test/t_dset_resize.c`'s case 3, deliberately named the boundary rather
+than silently omitted: not corruption (a different, earlier step's own
+data was never touched, and HDF5's own well-defined fill value was not
+silently wrong data, merely absent), but not a complete self-sufficient
+snapshot either. **Closed the same day -- see "Closed 2026-08-15" below**,
+prompted by the performance investigation that followed the ADIOS2
+comparison, not by this correctness gap alone; the two turned out to be
+the same fix. Full rewrite each step (case 1) and re-create each step
+(case 2) were already complete before this; the tail-only pattern (case
+3) is now complete too.
 
 **Closed 2026-08-15, prompted by "is it still slower, how can we improve
 it" after the `.payload`-staging finding above.** Profiling had already
@@ -1239,6 +1233,40 @@ data move once it's moving"; it is the wrong lens for a change whose
 entire point is moving less data in the first place. Total wall time and
 writer commit latency -- both of which improved -- are the metrics that
 answer "is the whole run faster," which is what was actually asked.
+
+**The genuinely fair O(N)-vs-O(N) ADIOS2 comparison, once the carry-forward
+fix made it possible: the RELATIVE gap widens, not closes.**
+`benchmark/adios2_compare/adios2_bench_tail.cpp` (ADIOS2's own
+`SetSelection()`-to-the-new-region idiom) against `test/b_stream_grow_tail.c`
+(the tail-only pattern this section just closed), both O(N), same 50-step
+workload:
+
+| Pattern | vol-stream total wall (staging off) | ADIOS2 total wall | Gap |
+|---|---|---|---|
+| Full rewrite, O(N^2) | ~46 ms | ~13 ms | ~3.6x |
+| Tail-only, O(N) | ~30-33 ms | ~2.05 ms | ~15.5x |
+
+vol-stream's own total wall time improved a real 1.4-1.5x moving to the
+tail-only pattern -- the win this section measured is real. But ADIOS2's
+improved roughly 6x over the same change, because its per-step cost scales
+down with less data far more than vol-stream's does. Once payload-
+proportional costs are minimized (the point of this whole section), what
+remains on vol-stream's side is a largely FIXED per-step cost -- Mercury/
+Margo/Argobots RPC and progress-engine overhead, real HDF5 metadata
+operations for a genuine per-step object -- that does not shrink with a
+smaller payload the way ADIOS2's lighter-weight marshal-and-ship does. So a
+smaller payload makes vol-stream's fixed cost *relatively* more dominant,
+not less, which is exactly why the ratio moves the wrong way even though
+the absolute numbers on vol-stream's own side improved. Closing that gap is
+a different, harder problem than this section's O(N^2)-to-O(N) fix -- the
+two options this session identified but did not build (making the
+subscriber push asynchronous rather than blocking on `margo_forward_timed()`;
+Margo/Argobots progress-engine tuning) are what it would take, and both need
+their own investigation before assuming either actually helps. An earlier
+version of `benchmark/adios2_compare/README.md` claimed `adios2_bench.cpp`
+already used the tail-only idiom -- it did not (it writes a full rewrite
+every step, same as `test/b_stream_grow.c`); that was a real documentation
+error, corrected here and in `adios2_bench_tail.cpp`'s introduction.
 
 **Benchmarked 2026-08-15: the growing time-series array, streamed for
 real.** ADIOS2 has no published benchmark for this exact case either --

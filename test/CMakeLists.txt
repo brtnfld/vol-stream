@@ -78,6 +78,17 @@ if(VOL_STREAM_HAVE_MERCURY)
     TIMEOUT 120
   )
 
+  # The O(N) counterpart: same growing array, but H5Dset_extent() + a
+  # tail-only write through one persistent handle (t_dset_resize.c's case
+  # 3) instead of a full rewrite every step. See its own top comment.
+  add_executable(b_stream_grow_tail b_stream_grow_tail.c)
+  target_link_libraries(b_stream_grow_tail PRIVATE vol_stream)
+  add_test(NAME stream_grow_tail_benchmark COMMAND b_stream_grow_tail)
+  set_tests_properties(stream_grow_tail_benchmark PROPERTIES
+    ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
+    TIMEOUT 120
+  )
+
   # Every test above registers the connector explicitly, which leaves the
   # process default VOL native -- and that is exactly what hid the connector's
   # own scratch files inheriting vol-stream as their VOL and recursing back

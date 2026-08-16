@@ -38,12 +38,14 @@
  * Case 3 found a second gap while building the above, and closes it too:
  * each step's own synthesized copy is created fresh and populated only
  * from THIS step's own captured write, so a resize followed by a PARTIAL
- * write (only the new tail, the leaner ADIOS2-style append pattern used
- * in benchmark/adios2_compare/adios2_bench.cpp) used to leave the
- * carried-forward portion at HDF5's own fill value rather than the
- * previous step's real values. Not corruption (a different, earlier
- * step's data was never touched, and a well-defined, discoverable fill
- * value was not silently wrong data) -- but not a complete self-
+ * write (only the new tail -- the leaner, ADIOS2-idiomatic append pattern;
+ * benchmark/adios2_compare/adios2_bench.cpp does not actually use it
+ * itself, it writes a full rewrite each step too, but this is the shape
+ * of variable ADIOS2's own SetShape()/SetSelection() is meant for) used
+ * to leave the carried-forward portion at HDF5's own fill value rather
+ * than the previous step's real values. Not corruption (a different,
+ * earlier step's data was never touched, and a well-defined, discoverable
+ * fill value was not silently wrong data) -- but not a complete self-
  * sufficient snapshot either.
  *
  * Closed by H5VL__stream_carry_forward_resized(), which runs once per
