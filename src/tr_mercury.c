@@ -365,6 +365,69 @@ struct vs_tr_t {
  * vs_tr_writer_push_data()'s helpers; declared here for vs_tr_stop(). */
 static void vs_tr_drain_pushes(vs_tr_t *tr);
 
+/* Capture the group's current members as stable IDs, for any loop that then
+ * does blocking work per member.
+ *
+ * An SSG *rank* is a position in a list that is re-sorted whenever a member
+ * joins or leaves -- it is not an identity. Reading ssg_get_group_size()
+ * once and then walking ranks 0..N-1 with a blocking RPC in the body is
+ * therefore a time-of-check/time-of-use bug: a member departing mid-loop
+ * shrinks the group, the top ranks stop existing, and
+ * ssg_get_group_member_id_from_rank() correctly fails for them -- silently
+ * skipping members that had nothing to do with the departure. That is not
+ * hypothetical; it cost real, reproducible data loss in
+ * vs_tr_writer_push_data() (see its comment and docs/dev-plan.md), found
+ * only because test/b_push_fanout.c had eight subscribers closing while the
+ * writer was still pushing.
+ *
+ * An ssg_member_id_t, by contrast, stays valid whether or not that member is
+ * still present, so resolving it later fails for that member alone. Taking
+ * the whole snapshot in one tight pass with no blocking work in it is what
+ * shrinks the vulnerable window to nothing.
+ *
+ * Returns the number of members captured (excluding self, which every
+ * caller skips anyway) and stores a malloc'd array in *out, or returns -1
+ * with *out NULL. A 0 return with *out NULL just means "nobody else here",
+ * which is not an error for any caller. */
+static int
+vs_tr_snapshot_members(vs_tr_t *tr, ssg_member_id_t self_id, ssg_member_id_t **out)
+{
+    ssg_member_id_t *members;
+    int               group_size, i, n = 0;
+
+    *out = NULL;
+
+    if (tr->group_id == SSG_GROUP_ID_INVALID)
+        return -1;
+    if (SSG_SUCCESS != ssg_get_group_size(tr->group_id, &group_size))
+        return -1;
+    if (group_size <= 0)
+        return 0;
+    if (NULL == (members = (ssg_member_id_t *)malloc((size_t)group_size * sizeof(*members))))
+        return -1;
+
+    for (i = 0; i < group_size; i++) {
+        ssg_member_id_t member_id;
+
+        /* A failure here is now benign in a way it was not before: the loop
+         * body is pure bookkeeping, so nothing has blocked yet and the view
+         * cannot have moved much. A member missed here is picked up by the
+         * next call. */
+        if (SSG_SUCCESS != ssg_get_group_member_id_from_rank(tr->group_id, i, &member_id))
+            continue;
+        if (member_id == self_id)
+            continue;
+        members[n++] = member_id;
+    }
+
+    if (n == 0) {
+        free(members);
+        return 0;
+    }
+    *out = members;
+    return n;
+} /* end vs_tr_snapshot_members() */
+
 /*-------------------------------------------------------------------------
  * Small helpers
  *-------------------------------------------------------------------------
@@ -1090,7 +1153,8 @@ int
 vs_tr_reader_get_current_step(vs_tr_t *tr, uint64_t *physical_step, uint64_t *wall_time_ns)
 {
     ssg_member_id_t self_id;
-    int              group_size, i;
+    ssg_member_id_t *members;
+    int              n_members, i;
     vs_get_current_step_in_t in;
     int              ret = -1;
 
@@ -1098,7 +1162,7 @@ vs_tr_reader_get_current_step(vs_tr_t *tr, uint64_t *physical_step, uint64_t *wa
         return -1;
     if (SSG_SUCCESS != ssg_get_self_id(tr->mid, &self_id))
         return -1;
-    if (SSG_SUCCESS != ssg_get_group_size(tr->group_id, &group_size))
+    if ((n_members = vs_tr_snapshot_members(tr, self_id, &members)) <= 0)
         return -1;
 
     memset(&in, 0, sizeof(in));
@@ -1111,15 +1175,11 @@ vs_tr_reader_get_current_step(vs_tr_t *tr, uint64_t *physical_step, uint64_t *wa
      * fellow reader answers status < 0, the same "nothing committed yet"
      * response a genuinely fresh writer gives), and there is exactly one
      * writer per group in this connector's model. */
-    for (i = 0; i < group_size && ret != 0; i++) {
-        ssg_member_id_t member_id;
+    for (i = 0; i < n_members && ret != 0; i++) {
+        ssg_member_id_t member_id = members[i];
         hg_addr_t        addr;
         hg_handle_t       handle;
 
-        if (SSG_SUCCESS != ssg_get_group_member_id_from_rank(tr->group_id, i, &member_id))
-            continue;
-        if (member_id == self_id)
-            continue;
         if (SSG_SUCCESS != ssg_get_group_member_addr(tr->group_id, member_id, &addr))
             continue;
 
@@ -1148,6 +1208,7 @@ vs_tr_reader_get_current_step(vs_tr_t *tr, uint64_t *physical_step, uint64_t *wa
         margo_addr_free(tr->mid, addr);
     }
 
+    free(members);
     return ret;
 }
 
@@ -1155,7 +1216,8 @@ int
 vs_tr_writer_broadcast_step_ready(vs_tr_t *tr, uint64_t physical_step, uint64_t wall_time_ns)
 {
     ssg_member_id_t     self_id;
-    int                 group_size, i;
+    ssg_member_id_t    *members;
+    int                  n_members, i;
     vs_step_ready_in_t  in;
 
     if (!tr)
@@ -1190,21 +1252,21 @@ vs_tr_writer_broadcast_step_ready(vs_tr_t *tr, uint64_t physical_step, uint64_t 
         return 0;
     if (SSG_SUCCESS != ssg_get_self_id(tr->mid, &self_id))
         return 0;
-    if (SSG_SUCCESS != ssg_get_group_size(tr->group_id, &group_size))
+    /* Stable member IDs, not ranks -- a reader closing mid-broadcast would
+     * otherwise cost *other* readers their step_ready notification, leaving
+     * them blocked in H5Fwait_step_ready(). Same defect the data push had;
+     * see vs_tr_snapshot_members(). */
+    if ((n_members = vs_tr_snapshot_members(tr, self_id, &members)) <= 0)
         return 0;
 
     in.physical_step = physical_step;
     in.wall_time_ns   = wall_time_ns;
 
-    for (i = 0; i < group_size; i++) {
-        ssg_member_id_t member_id;
+    for (i = 0; i < n_members; i++) {
+        ssg_member_id_t member_id = members[i];
         hg_addr_t        addr;
         hg_handle_t       handle;
 
-        if (SSG_SUCCESS != ssg_get_group_member_id_from_rank(tr->group_id, i, &member_id))
-            continue;
-        if (member_id == self_id)
-            continue;
         if (SSG_SUCCESS != ssg_get_group_member_addr(tr->group_id, member_id, &addr))
             continue;
 
@@ -1225,6 +1287,7 @@ vs_tr_writer_broadcast_step_ready(vs_tr_t *tr, uint64_t physical_step, uint64_t 
         margo_addr_free(tr->mid, addr);
     }
 
+    free(members);
     return 0;
 }
 
@@ -1331,20 +1394,21 @@ vs_tr_reader_ack_step(vs_tr_t *tr, uint64_t physical_step)
      * ack, racing a join whose seed query has not resolved). Same
      * probe-every-member approach vs_tr_reader_get_current_step() uses. */
     if (ret != 0) {
-        int group_size, i;
+        /* Stable member IDs, not ranks -- see vs_tr_snapshot_members(). A
+         * member leaving while this probe is forwarding would otherwise
+         * skip the tail of the list, which can include the writer this is
+         * hunting for. */
+        ssg_member_id_t *members;
+        int               n_members, i;
 
-        if (SSG_SUCCESS != ssg_get_group_size(tr->group_id, &group_size))
+        if ((n_members = vs_tr_snapshot_members(tr, self_id, &members)) <= 0)
             return ret;
 
-        for (i = 0; i < group_size && ret != 0; i++) {
-            ssg_member_id_t member_id;
+        for (i = 0; i < n_members && ret != 0; i++) {
+            ssg_member_id_t member_id = members[i];
             hg_addr_t         addr;
             hg_handle_t        handle;
 
-            if (SSG_SUCCESS != ssg_get_group_member_id_from_rank(tr->group_id, i, &member_id))
-                continue;
-            if (member_id == self_id)
-                continue;
             if (SSG_SUCCESS != ssg_get_group_member_addr(tr->group_id, member_id, &addr))
                 continue;
 
@@ -1365,6 +1429,7 @@ vs_tr_reader_ack_step(vs_tr_t *tr, uint64_t physical_step)
             }
             margo_addr_free(tr->mid, addr);
         }
+        free(members);
     }
 
     return ret;
@@ -1373,7 +1438,6 @@ vs_tr_reader_ack_step(vs_tr_t *tr, uint64_t physical_step)
 int
 vs_tr_writer_min_acked_step(vs_tr_t *tr, uint64_t *min_acked_step)
 {
-    int    group_size = 0;
     size_t i;
     int    found = 0;
     uint64_t min = 0;
@@ -1381,9 +1445,14 @@ vs_tr_writer_min_acked_step(vs_tr_t *tr, uint64_t *min_acked_step)
     if (!tr)
         return 0;
 
-    /* No group at all -- nothing to be behind. */
-    if (tr->group_id != SSG_GROUP_ID_INVALID)
-        ssg_get_group_size(tr->group_id, &group_size);
+    /* Deliberately NOT in the rank-snapshot class vs_tr_snapshot_members()
+     * exists for: this walks lag_table, which is already keyed by
+     * ssg_member_id_t, and does no blocking work per entry --
+     * ssg_get_group_member_rank() below is only a liveness predicate whose
+     * rank value is discarded. Correct by construction rather than by
+     * snapshotting. (It previously also read ssg_get_group_size() into a
+     * variable it never used, which read like rank logic that was not
+     * there.) */
 
     pthread_mutex_lock(&tr->lag_lock);
     for (i = 0; i < tr->n_lag; i++) {
@@ -1398,8 +1467,6 @@ vs_tr_writer_min_acked_step(vs_tr_t *tr, uint64_t *min_acked_step)
         found = 1;
     }
     pthread_mutex_unlock(&tr->lag_lock);
-
-    (void)group_size;
 
     if (found && min_acked_step)
         *min_acked_step = min;
@@ -1448,20 +1515,21 @@ vs_send_subscribe(vs_tr_t *tr, ssg_member_id_t self_id, vs_subscribe_in_t *in, i
     }
 
     if (ret != 0) {
-        int group_size, i;
+        /* Stable member IDs, not ranks -- see vs_tr_snapshot_members(). A
+         * member leaving while this probe is forwarding would otherwise
+         * skip the tail of the list, which can include the writer this is
+         * hunting for. */
+        ssg_member_id_t *members;
+        int               n_members, i;
 
-        if (SSG_SUCCESS != ssg_get_group_size(tr->group_id, &group_size))
+        if ((n_members = vs_tr_snapshot_members(tr, self_id, &members)) <= 0)
             return ret;
 
-        for (i = 0; i < group_size && ret != 0; i++) {
-            ssg_member_id_t member_id;
+        for (i = 0; i < n_members && ret != 0; i++) {
+            ssg_member_id_t member_id = members[i];
             hg_addr_t         addr;
             hg_handle_t        handle;
 
-            if (SSG_SUCCESS != ssg_get_group_member_id_from_rank(tr->group_id, i, &member_id))
-                continue;
-            if (member_id == self_id)
-                continue;
             if (SSG_SUCCESS != ssg_get_group_member_addr(tr->group_id, member_id, &addr))
                 continue;
 
@@ -1484,6 +1552,7 @@ vs_send_subscribe(vs_tr_t *tr, ssg_member_id_t self_id, vs_subscribe_in_t *in, i
             }
             margo_addr_free(tr->mid, addr);
         }
+        free(members);
     }
 
     return ret;

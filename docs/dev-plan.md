@@ -1466,6 +1466,37 @@ variant where it fires most reliably. `b_push_fanout` is now registered as
 a ctest (every subscriber verifies every value it receives, so it guards
 this directly), and the suite is 43/43 across three consecutive runs.
 
+**The whole class, not just the instance.** The push loop was one of *five*
+rank-indexed loops in `tr_mercury.c`, and four of them had the identical
+shape — read `ssg_get_group_size()` once, walk ranks 0..N-1, block on an
+RPC in the body:
+
+- `vs_tr_writer_broadcast_step_ready()` — same severity as the push bug. A
+  reader closing mid-broadcast would cost *other* readers their step_ready
+  notification, leaving them blocked in `H5Fwait_step_ready()`.
+- `vs_tr_reader_get_current_step()`, `vs_tr_reader_ack_step()`'s fallback
+  probe, and `vs_send_subscribe()`'s probe — all three hunt for the writer
+  by asking every member in turn. Skipping the tail of the list can skip
+  the writer itself, so a subscribe or ack fails for no visible reason.
+
+All four now go through one helper, `vs_tr_snapshot_members()`, which
+captures the member IDs in a single tight pass with no blocking work in it
+and hands back a stable array. Rank indexing survives in exactly one place
+— inside that helper, where the window it opens is empty.
+
+The fifth, `vs_tr_writer_min_acked_step()`, was already safe and is left
+alone: it walks `lag_table`, which is keyed by `ssg_member_id_t` already,
+and its `ssg_get_group_member_rank()` call is only a liveness predicate
+whose rank value is discarded. It did carry a `group_size` variable it
+never used, removed here because it read like rank logic that was not
+there.
+
+Only the push path has a reproducer today — a departure has to land inside
+a specific loop to matter, and `b_push_fanout` is the only test with enough
+subscribers leaving at once to make that likely. The other three are fixed
+by construction rather than by demonstration, which is worth stating
+plainly rather than implying all four were caught red-handed.
+
 **Benchmarked 2026-08-15: the growing time-series array, streamed for
 real.** ADIOS2 has no published benchmark for this exact case either --
 its own `testing/adios2/performance/` suite covers many-variable overhead
