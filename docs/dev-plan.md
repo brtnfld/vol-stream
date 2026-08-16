@@ -1102,19 +1102,75 @@ retroactively rewriting history that had already landed on disk, discovered
 by actually running the pattern rather than reading the capture code and
 assuming dataset-specific ops were out of scope.
 
-Fixed the same way every other unsafe case in this connector is handled:
-decline rather than silently corrupt. `H5VL_stream_dataset_specific()` now
-refuses whenever `H5VL__stream_dset_capture()` -- the exact predicate
-`H5VL_stream_dataset_write()` already uses -- says this object's write
-would be captured, i.e. a live dataset materialized by an earlier step,
-called from inside a later open step. The working alternative already
-exists and needs no new code: re-create the dataset each step at its new
-size, exactly dev-plan.md decision #2's model (successive versions of one
-named object, landing group-based at `/step/<n>/`) applied to a shape that
-grows instead of staying fixed. `test/t_dset_resize.c` pins both halves --
-the earlier step's data surviving every declined resize attempt untouched,
-and the re-create-each-step alternative round-tripping correctly at four
-different sizes.
+First fixed the same way every other unsafe case in this connector is
+handled: decline rather than silently corrupt. `H5VL_stream_dataset_
+specific()` refused whenever `H5VL__stream_dset_capture()` -- the exact
+predicate `H5VL_stream_dataset_write()` already uses -- said this object's
+write would be captured. The working alternative needed no new code:
+re-create the dataset each step at its new size, exactly dev-plan.md
+decision #2's model (successive versions of one named object, landing
+group-based at `/step/<n>/`) applied to a shape that grows instead of
+staying fixed.
+
+**Built for real, 2026-08-15, after the ADIOS2 comparison above prompted
+the question directly: why does vol-stream not have ADIOS2's own
+`Variable::SetShape()`/`SetSelection()`, and can it?** It can, and the
+fix is the same idiom `H5VL_stream_dataset_write()` already uses for
+plain writes to a live cross-step object -- defer, don't touch the real
+object -- extended to cover the dataset-specific op that write-capture
+never reached. `H5VL_stream_dataset_specific()`'s `SET_EXTENT` handling
+now records the requested new shape on the handle itself
+(`H5VL_stream_t::pending_resize_space`, a new field) instead of declining
+or touching `under_object`. Two more places had to agree with it, since
+"a resize that only vol-stream's own bookkeeping knows about" is not a
+real resize from the application's point of view:
+
+- `H5VL_stream_dataset_get()`'s `GET_SPACE` case returns the pending
+  override when one is set, so `H5Dget_space()` reflects the resize
+  immediately -- matching plain HDF5's contract for `H5Dset_extent()`,
+  and exactly the existing idiom this function already uses for a
+  *placeholder* dataset (answering from the pending entry's own copy
+  rather than a nonexistent real object), now extended to a *live*
+  one with a pending resize.
+- `H5VL__stream_step_create_index()` -- the function that synthesizes
+  this step's own copy when a write captures a live object -- reads the
+  pending override instead of querying the real (never-actually-resized)
+  object's own space, so the new step's replayed copy is created at the
+  new size, not the old one.
+
+`test/t_dset_resize.c`'s case 1 is the new exit gate: `H5Dset_extent()` +
+a full rewrite (`0..n-1`) every step, through one persistent handle,
+round-trips correctly at every size, `H5Dget_space()` reflects each
+resize immediately, and the earlier step stays exactly as it was --
+verified non-vacuous by reverting the fix and confirming the same case
+fails. The re-create-each-step alternative (case 2) still round-trips
+too, unaffected.
+
+**A second, narrower gap found by building this, not assumed away: a
+resize followed by a PARTIAL write (only the new tail, not a full
+rewrite) leaves the carried-forward portion at HDF5's own fill value.**
+Each step's own synthesized copy is still created fresh
+(`H5VL__stream_step_create_index()`'s existing design, unchanged) and
+populated only from that step's own captured write -- a resize changes
+*how large* the fresh copy is, not *what already has real data in it*.
+The connector does not (yet) copy the previous step's actual values
+forward into the newly-grown region. This is `test/t_dset_resize.c`'s
+case 3, deliberately named the boundary rather than silently omitted:
+not corruption (a different, earlier step's own data is never touched,
+and HDF5's own well-defined fill value is not silently wrong data,
+merely absent), but not a complete self-sufficient snapshot either.
+Closing it would need the writer side to track, per path, where the
+most recently replayed copy lives (the reader side already has exactly
+this via `H5VL__stream_path_index_resolve()`; the writer has no
+equivalent yet) and have replay copy that prior extent's values forward
+before applying this step's own write -- real, well-scoped follow-on
+work, not attempted here since the tail-only pattern this closes is a
+genuine but different use case from the one that prompted this fix
+(`benchmark/adios2_compare/adios2_bench.cpp` uses exactly this partial-
+write idiom on the ADIOS2 side, which is what surfaced the gap: the two
+sides are no longer directly comparable on this specific axis until it
+closes). Full rewrite each step (case 1) or re-create each step (case 2)
+are both complete today.
 
 **Benchmarked 2026-08-15: the growing time-series array, streamed for
 real.** ADIOS2 has no published benchmark for this exact case either --

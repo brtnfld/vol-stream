@@ -417,6 +417,21 @@ struct H5VL_stream_t {
                                                            * a reference this request object
                                                            * owns, dropped in request_free()/
                                                            * on resolution. */
+
+    /* A deferred H5Dset_extent() on a LIVE dataset captured into an open
+     * step -- see H5VL_stream_dataset_specific()'s SET_EXTENT handling.
+     * H5I_INVALID_HID unless set. Once set, stays set (replaced by a later
+     * resize, never cleared back to "unset") for this handle's whole
+     * lifetime: the real under_object is never actually resized (doing so
+     * would silently mutate an earlier step's already-committed storage --
+     * under_object is not "the dataset" in any current sense once a
+     * placeholder has materialized), so this override is the only place
+     * the new extent exists until the next captured write bakes it into a
+     * manifest entry. Consulted by H5VL_stream_dataset_get()'s GET_SPACE
+     * (so H5Dget_space() reflects the resize, matching plain HDF5's
+     * contract) and H5VL__stream_step_create_index() (so a later step's
+     * own synthesized copy is created at the new size, not the old one). */
+    hid_t pending_resize_space;
 } /* H5VL_stream_t -- see forward-declared typedef above */;
 
 /* The pass through VOL wrapper context */
@@ -1091,6 +1106,8 @@ H5VL_stream_new_obj(void *under_obj, hid_t under_vol_id)
 
     new_obj->under_object = under_obj;
     new_obj->under_vol_id = under_vol_id;
+    /* calloc() zeroes this to 0, a live hid_t value, not "unset". */
+    new_obj->pending_resize_space = H5I_INVALID_HID;
 
     H5Iinc_ref(new_obj->under_vol_id);
 
@@ -1122,6 +1139,8 @@ H5VL_stream_free_obj(H5VL_stream_t *obj)
     H5Eset_current_stack(err_id);
 
     free(obj->path);
+    if (obj->pending_resize_space > 0)
+        H5Sclose(obj->pending_resize_space);
     if (obj->file_state)
         H5VL__stream_file_state_decref(obj->file_state);
     free(obj);
@@ -8545,13 +8564,28 @@ H5VL__stream_step_create_index(H5VL_stream_t *o, size_t *out_index)
         return -1;
     ce.type_id = gargs.args.get_type.type_id;
 
-    memset(&gargs, 0, sizeof(gargs));
-    gargs.op_type = H5VL_DATASET_GET_SPACE;
-    if (H5VLdataset_get(o->under_object, o->under_vol_id, &gargs, H5P_DATASET_XFER_DEFAULT, NULL) < 0) {
+    /* A deferred H5Dset_extent() (H5VL_stream_dataset_specific()) means the
+     * real object's own extent is stale -- under_object was never actually
+     * resized, to avoid mutating an earlier step's committed storage.
+     * Synthesizing this step's create from the override, not the real
+     * object, is what makes the resize actually land: this step's own
+     * replayed copy is created at the NEW size, exactly as if the
+     * application had re-created the dataset at that size itself. */
+    if (o->pending_resize_space > 0)
+        ce.space_id = H5Scopy(o->pending_resize_space);
+    else {
+        memset(&gargs, 0, sizeof(gargs));
+        gargs.op_type = H5VL_DATASET_GET_SPACE;
+        if (H5VLdataset_get(o->under_object, o->under_vol_id, &gargs, H5P_DATASET_XFER_DEFAULT, NULL) < 0) {
+            H5VL__stream_pending_entry_clear(&ce);
+            return -1;
+        }
+        ce.space_id = gargs.args.get_space.space_id;
+    }
+    if (ce.space_id < 0) {
         H5VL__stream_pending_entry_clear(&ce);
         return -1;
     }
-    ce.space_id = gargs.args.get_space.space_id;
 
     memset(&gargs, 0, sizeof(gargs));
     gargs.op_type = H5VL_DATASET_GET_DCPL;
@@ -8838,6 +8872,15 @@ H5VL_stream_dataset_get(void *dset, H5VL_dataset_get_args_t *args, hid_t dxpl_id
         }
     }
 
+    /* A deferred H5Dset_extent() (see H5VL_stream_dataset_specific()) --
+     * under_object itself was never actually resized, so answering from
+     * it here would show the caller's own H5Dset_extent() as having had
+     * no effect. Only GET_SPACE is overridden: GET_STORAGE_SIZE and
+     * GET_SPACE_STATUS still answer from the real (unresized) object,
+     * a known, narrower gap than the one this override closes. */
+    if (o->pending_resize_space > 0 && args->op_type == H5VL_DATASET_GET_SPACE)
+        return (args->args.get_space.space_id = H5Scopy(o->pending_resize_space)) < 0 ? -1 : 0;
+
     ret_value = H5VLdataset_get(o->under_object, o->under_vol_id, args, dxpl_id, req);
 
     /* Check for async request */
@@ -8874,8 +8917,8 @@ H5VL_stream_dataset_specific(void *obj, H5VL_dataset_specific_args_t *args, hid_
     if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER)
         return -1;
 
-    /* Nor against a LIVE dataset while it is being captured into an open
-     * step -- the same predicate H5VL_stream_dataset_write() uses to decide
+    /* H5Dset_extent() on a LIVE dataset being captured into an open step --
+     * the same predicate H5VL_stream_dataset_write() uses to decide
      * whether a write belongs to the step. under_object here is not "the
      * dataset" in any general sense: once a placeholder first materializes,
      * H5VL__stream_replay_manifest() rewires under_object to point at THAT
@@ -8884,22 +8927,76 @@ H5VL_stream_dataset_specific(void *obj, H5VL_dataset_specific_args_t *args, hid_
      * (H5VL__stream_step_create_index()), leaving the original handle
      * permanently aimed at the first step's committed storage.
      *
-     * dataset_specific (H5Dset_extent chief among them) has no capture path
-     * of its own -- it is the unconditional passthrough just below -- so
-     * calling it here reaches straight through to that first step's real
-     * object and mutates it in place, silently, after the fact. Measured
-     * directly: a dataset extended and appended to across N steps through
-     * one handle (the ordinary ADIOS2-style growing-array pattern) left
-     * step 0's own copy holding the FINAL extent rather than the extent it
-     * had when step 0 committed, because every later H5Dset_extent() landed
-     * on it instead of on that step's own snapshot. Declining is the same
-     * rule as the placeholder case above and everywhere else in this
-     * connector: an error the caller can act on beats a file that looks
-     * right and is not. Re-creating the dataset each step (already
-     * supported) is the working pattern for a shape that changes over
-     * time. */
-    if (H5VL__stream_dset_capture(o))
-        return -1;
+     * Calling H5Dset_extent() straight through -- the unconditional
+     * passthrough this function used to be -- reaches that first step's
+     * real object and mutates it in place, silently, after the fact.
+     * Measured directly: a dataset extended and appended to across N steps
+     * through one handle (the ordinary ADIOS2-style growing-array pattern)
+     * left step 0's own copy holding the FINAL extent rather than the
+     * extent it had when step 0 committed. Fixed the same way a write to
+     * this same live object already is: defer, don't touch the real
+     * object. This handle's own pending_resize_space records the new shape
+     * instead; H5VL_stream_dataset_get()'s GET_SPACE override makes
+     * H5Dget_space() reflect it immediately (matching plain HDF5's
+     * contract for H5Dset_extent), and H5VL__stream_step_create_index()
+     * uses it -- instead of querying the real, never-actually-resized
+     * object -- when this step's own write synthesizes its own copy. */
+    if (H5VL__stream_dset_capture(o)) {
+        if (args->op_type != H5VL_DATASET_SET_EXTENT)
+            /* H5Dflush/H5Drefresh: still declined here. Neither mutates
+             * shape or values, so passing them through to under_object
+             * (an earlier step's real, already-fully-committed object)
+             * would not corrupt anything the way an unguarded
+             * H5Dset_extent did -- but it would be a no-op or a refresh
+             * against the wrong (stale) object, not a documented gap this
+             * connector claims to fill, so it is left declined rather than
+             * quietly doing something a caller did not ask for. */
+            return -1;
+
+        {
+            hid_t   cur_space, new_space;
+            hsize_t dims[H5S_MAX_RANK], maxdims[H5S_MAX_RANK];
+            int     rank;
+
+            if (o->pending_resize_space > 0)
+                cur_space = o->pending_resize_space; /* a prior deferred resize -- build on
+                                                       * it, not on the real (stale) object */
+            else {
+                H5VL_dataset_get_args_t gargs;
+
+                memset(&gargs, 0, sizeof(gargs));
+                gargs.op_type = H5VL_DATASET_GET_SPACE;
+                if (H5VLdataset_get(o->under_object, o->under_vol_id, &gargs, dxpl_id, NULL) < 0)
+                    return -1;
+                cur_space = gargs.args.get_space.space_id; /* owned here; closed below */
+            }
+
+            if ((rank = H5Sget_simple_extent_ndims(cur_space)) < 0 ||
+                H5Sget_simple_extent_dims(cur_space, dims, maxdims) < 0) {
+                if (cur_space != o->pending_resize_space)
+                    H5Sclose(cur_space);
+                return -1;
+            }
+            /* maxdims carries forward (e.g. H5S_UNLIMITED) so a later query
+             * for "can this be resized again" still answers correctly; only
+             * dims -- this call's actual new extent -- changes. */
+            new_space = H5Scopy(cur_space);
+            if (cur_space != o->pending_resize_space)
+                H5Sclose(cur_space);
+            if (new_space < 0 ||
+                H5Sset_extent_simple(new_space, rank, args->args.set_extent.size, maxdims) < 0) {
+                if (new_space >= 0)
+                    H5Sclose(new_space);
+                return -1;
+            }
+
+            if (o->pending_resize_space > 0)
+                H5Sclose(o->pending_resize_space);
+            o->pending_resize_space = new_space;
+
+            return 0;
+        }
+    }
 
     /* Save copy of underlying VOL connector ID, in case of
      * 'refresh' operation destroying the current object

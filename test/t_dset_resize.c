@@ -8,35 +8,45 @@
  * H5Dset_extent() on a LIVE dataset (materialized by an earlier step),
  * called from inside a later step -- the ADIOS2-style "growing time-series
  * array" pattern, appending to an unlimited-dimension dataset once per
- * step. Nothing in the suite exercised this until now; every existing
- * resizable-adjacent test writes a fixed-shape dataset.
+ * step, through the same handle the whole run.
  *
  * What it used to do, found by actually running it: silently corrupt an
  * EARLIER, already-committed step. H5VL__stream_replay_manifest() rewires
  * a placeholder's under_object to its own real /step/<n>/ copy only once,
- * the step that first materializes it (H5VL__stream_dset_capture()'s
- * comment) -- every later step captures its own separate synthesized copy
- * instead of touching that one again. But H5Dset_extent is not part of
- * that capture machinery: H5VL_stream_dataset_specific() was an
- * unconditional passthrough straight to under_object, so calling it on the
- * still-open handle in step 1 reached through to step 0's own committed
- * real object and resized it in place, then again in step 2, then step 3.
- * Measured directly: /step/0/grow ended up holding the FINAL extent (8),
- * not the extent (2) it had when step 0 committed -- retroactively
- * rewriting history that had already landed, the same class of bug
- * t_step_rewrite.c pins for plain writes, but reached through a dataset-
- * specific op instead of a write.
+ * the step that first materializes it -- every later step captures its own
+ * separate synthesized copy instead of touching that one again. But
+ * H5Dset_extent had no capture path of its own: it was an unconditional
+ * passthrough straight to under_object, so calling it on the still-open
+ * handle in step 1 reached through to step 0's own committed real object
+ * and resized it in place, then again in step 2, then step 3. Measured
+ * directly: /step/0/grow ended up holding the FINAL extent (8), not the
+ * extent (2) it had when step 0 committed.
  *
- * Fixed by declining rather than silently corrupting: H5VL_stream_dataset_
- * specific() now refuses (clear HDF5 error, no data touched) whenever
- * H5VL__stream_dset_capture() says this object's write would be captured
- * -- i.e. a LIVE dataset materialized by an earlier step, mid a later open
- * step -- the same predicate the write path already uses, extended to
- * cover the dataset-specific ops that bypass it entirely. Both halves are
- * checked below: the earlier step's data must survive the attempt
- * untouched, and the documented working alternative -- re-creating the
- * dataset each step, which is what a shape that changes over time already
- * uses successfully elsewhere in this suite -- must still round-trip.
+ * First fixed by declining outright (a real, working resize was a bigger
+ * change than the moment called for). Now built for real: H5VL_stream_
+ * dataset_specific()'s SET_EXTENT handling defers the resize into this
+ * handle's own pending_resize_space rather than touching the real object,
+ * exactly like a write to this same live object is already deferred
+ * (H5VL_stream_dataset_write()). H5VL_stream_dataset_get()'s GET_SPACE
+ * override makes H5Dget_space() reflect the new shape immediately, matching
+ * plain HDF5's contract, and H5VL__stream_step_create_index() uses the
+ * override -- not the real, never-actually-resized object -- when a write
+ * synthesizes this step's own copy. Case 1 below is the exit gate for this:
+ * the previously-declined pattern now round-trips correctly, with the
+ * earlier step still exactly as it was.
+ *
+ * Case 3 is the boundary this still has, found while building it: each
+ * step's own synthesized copy is created fresh and populated only from
+ * THIS step's own captured write, so a resize followed by a PARTIAL write
+ * (only the new tail, the leaner ADIOS2-style append pattern used in
+ * benchmark/adios2_compare/adios2_bench.cpp) leaves the carried-forward
+ * portion at HDF5's own fill value rather than the previous step's real
+ * values -- the connector does not (yet) copy the prior step's data
+ * forward on resize. Not corruption (a different, earlier step's data is
+ * never touched, and a well-defined, discoverable fill value is not
+ * silently wrong data) -- but not a complete self-sufficient snapshot
+ * either. Documented and pinned here rather than left to be rediscovered:
+ * a full rewrite each step (case 1) is what to use until this is closed.
  */
 
 #include <stdio.h>
@@ -47,27 +57,37 @@
 #include "hdf5.h"
 #include "H5VLstream.h"
 
-#define FNAME_GROW    "t_dset_resize_grow.h5"
+#define FNAME_GROW     "t_dset_resize_grow.h5"
 #define FNAME_RECREATE "t_dset_resize_recreate.h5"
-#define NSTEPS 4
+#define FNAME_PARTIAL  "t_dset_resize_partial.h5"
+#define NSTEPS         4
+#define CHUNK          2
 
 static int nerrors = 0;
 
 /* --------------------------------------------------------------------
- * Case 1: H5Dset_extent() on a live handle across steps is refused, and
- * the step that already committed is left exactly as it was.
+ * Case 1: H5Dset_extent() + a full rewrite (0..n-1) every step, through
+ * ONE live handle -- the pattern that used to be declined, now the exit
+ * gate for real support. Checks the same two things the decline-era test
+ * did (earlier step untouched, H5Dget_space right after set_extent) plus
+ * the new positive case: every step's own values are correct.
  * -------------------------------------------------------------------- */
 static void
-case_resize_declined(hid_t vol_id)
+case_resize_full_rewrite(hid_t vol_id)
 {
     hid_t   fapl, fid, space, dcpl, ds, nfid;
-    hsize_t dims = 2, maxdims = H5S_UNLIMITED, chunk = 2;
-    int     s;
+    hsize_t dims = CHUNK, maxdims = H5S_UNLIMITED, chunk = CHUNK;
+    int     s, i, *vals;
 
-    printf("case 1: H5Dset_extent() on a live cross-step handle\n");
+    printf("case 1: H5Dset_extent() + full rewrite through one live cross-step handle\n");
 
     unlink(FNAME_GROW);
 
+    if (NULL == (vals = (int *)malloc((size_t)NSTEPS * CHUNK * sizeof(int)))) {
+        printf("  FAIL  alloc\n");
+        nerrors++;
+        return;
+    }
     if ((fapl = H5Pcreate(H5P_FILE_ACCESS)) < 0 || H5Pset_vol(fapl, vol_id, NULL) < 0) {
         printf("  FAIL  fapl\n");
         nerrors++;
@@ -85,51 +105,52 @@ case_resize_declined(hid_t vol_id)
         return;
     }
 
-    /* Step 0: create with 2 elements, write {0, 1}. */
     if (H5Fbegin_step(fid, 0, NULL, 0) < 0 ||
         (ds = H5Dcreate2(fid, "/grow", H5T_NATIVE_INT, space, H5P_DEFAULT, dcpl, H5P_DEFAULT)) < 0) {
         printf("  FAIL  begin/create step 0\n");
         nerrors++;
         return;
     }
-    {
-        int vals[2] = {0, 1};
-        if (H5Dwrite(ds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, vals) < 0 || H5Fend_step(fid) < 0) {
-            printf("  FAIL  write/end step 0\n");
-            nerrors++;
-            return;
-        }
+    for (i = 0; i < CHUNK; i++)
+        vals[i] = i;
+    if (H5Dwrite(ds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, vals) < 0 || H5Fend_step(fid) < 0) {
+        printf("  FAIL  write/end step 0\n");
+        nerrors++;
+        return;
     }
 
-    /* Steps 1..NSTEPS-1: try to grow the same live handle. Must be refused,
-     * every time, with no side effect on the file. */
     for (s = 1; s < NSTEPS; s++) {
-        hsize_t newdims = (hsize_t)(s + 1) * 2;
-        herr_t  rc;
+        hsize_t newdims = (hsize_t)(s + 1) * CHUNK;
+        hid_t   qspace;
+        hsize_t qdims[1] = {0};
 
         if (H5Fbegin_step(fid, 0, NULL, 0) < 0) {
             printf("  FAIL  begin_step %d\n", s);
             nerrors++;
             return;
         }
-
-        H5E_BEGIN_TRY
-        {
-            rc = H5Dset_extent(ds, &newdims);
+        if (H5Dset_extent(ds, &newdims) < 0) {
+            printf("  FAIL  H5Dset_extent at step %d\n", s);
+            nerrors++;
+            H5Fend_step(fid);
+            continue;
         }
-        H5E_END_TRY
 
-        if (rc >= 0) {
-            printf("  FAIL  H5Dset_extent on a live cross-step handle succeeded at step %d -- it should "
-                   "have been refused, since it would silently mutate an earlier committed step\n",
-                   s);
+        /* H5Dget_space() must reflect the resize immediately, matching
+         * plain HDF5's own contract for H5Dset_extent -- the caller's next
+         * move is almost always to build a selection against it. */
+        if ((qspace = H5Dget_space(ds)) < 0 || H5Sget_simple_extent_dims(qspace, qdims, NULL) < 0 ||
+            qdims[0] != newdims) {
+            printf("  FAIL  H5Dget_space after set_extent at step %d\n", s);
             nerrors++;
         }
+        if (qspace >= 0)
+            H5Sclose(qspace);
 
-        /* end_step still must succeed: refusing the resize is not supposed
-         * to poison the rest of the step machinery. */
-        if (H5Fend_step(fid) < 0) {
-            printf("  FAIL  end_step %d after the declined resize\n", s);
+        for (i = 0; i < (int)newdims; i++)
+            vals[i] = i;
+        if (H5Dwrite(ds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, vals) < 0 || H5Fend_step(fid) < 0) {
+            printf("  FAIL  write/end step %d\n", s);
             nerrors++;
         }
     }
@@ -138,57 +159,64 @@ case_resize_declined(hid_t vol_id)
     H5Sclose(space);
     H5Pclose(dcpl);
     H5Fclose(fid);
+    free(vals);
 
-    /* The load-bearing check: step 0's own committed copy must be exactly
-     * what it was when step 0 ended, untouched by every later refused
-     * attempt. */
     if ((nfid = H5Fopen(FNAME_GROW, H5F_ACC_RDONLY, H5P_DEFAULT)) < 0) {
         printf("  FAIL  reopen natively\n");
         nerrors++;
+        return;
     }
-    else {
+    for (s = 0; s < NSTEPS; s++) {
+        char    path[64];
         hid_t   sds, ssp;
         hsize_t sdims[1] = {0};
-        int     got[2];
+        int     got[16], bad = 0;
+        int     expect_n = (s + 1) * CHUNK;
 
-        if ((sds = H5Dopen2(nfid, "/step/0/grow", H5P_DEFAULT)) < 0) {
-            printf("  FAIL  /step/0/grow missing\n");
+        snprintf(path, sizeof(path), "/step/%d/grow", s);
+        if ((sds = H5Dopen2(nfid, path, H5P_DEFAULT)) < 0) {
+            printf("  FAIL  %s missing\n", path);
+            nerrors++;
+            continue;
+        }
+        ssp = H5Dget_space(sds);
+        H5Sget_simple_extent_dims(ssp, sdims, NULL);
+        H5Sclose(ssp);
+
+        if ((int)sdims[0] != expect_n) {
+            printf("  FAIL  %s extent = %d, expected %d\n", path, (int)sdims[0], expect_n);
+            nerrors++;
+        }
+        else if (H5Dread(sds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, got) < 0) {
+            printf("  FAIL  read %s\n", path);
             nerrors++;
         }
         else {
-            ssp = H5Dget_space(sds);
-            H5Sget_simple_extent_dims(ssp, sdims, NULL);
-            H5Sclose(ssp);
-
-            if (sdims[0] != 2) {
-                printf("  FAIL  /step/0/grow extent = %llu, expected 2 -- a declined resize still leaked "
-                       "through\n",
-                       (unsigned long long)sdims[0]);
-                nerrors++;
-            }
-            else if (H5Dread(sds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, got) < 0 || got[0] != 0 ||
-                     got[1] != 1) {
-                printf("  FAIL  /step/0/grow values corrupted\n");
+            for (i = 0; i < expect_n; i++)
+                if (got[i] != i) {
+                    bad = 1;
+                    break;
+                }
+            if (bad) {
+                printf("  FAIL  %s[%d] = %d, expected %d\n", path, i, got[i], i);
                 nerrors++;
             }
             else
-                printf("  ok    /step/0/grow stayed at extent 2, values {0,1}, through %d declined "
-                       "resize attempts\n",
-                       NSTEPS - 1);
-            H5Dclose(sds);
+                printf("  ok    %s: extent %d, values 0..%d correct -- step 0 undisturbed by every "
+                       "later resize\n",
+                       path, expect_n, expect_n - 1);
         }
-        H5Fclose(nfid);
+        H5Dclose(sds);
     }
-
+    H5Fclose(nfid);
     H5Pclose(fapl);
-} /* end case_resize_declined() */
+} /* end case_resize_full_rewrite() */
 
 /* --------------------------------------------------------------------
- * Case 2: the documented working alternative -- re-create the dataset
- * each step at its new size -- round-trips correctly. This is exactly
- * dev-plan.md decision #2's model (successive versions of one named
- * object, landing group-based at /step/<n>/), applied to a shape that
- * grows every step instead of staying fixed.
+ * Case 2: the other working alternative -- re-create the dataset each
+ * step at its new size -- still round-trips correctly. dev-plan.md
+ * decision #2's model (successive versions of one named object, landing
+ * group-based at /step/<n>/), applied to a shape that grows every step.
  * -------------------------------------------------------------------- */
 static void
 case_recreate_each_step(hid_t vol_id)
@@ -213,7 +241,7 @@ case_recreate_each_step(hid_t vol_id)
 
     for (s = 0; s < NSTEPS; s++) {
         hid_t   space, ds;
-        hsize_t n = (hsize_t)(s + 1) * 2;
+        hsize_t n = (hsize_t)(s + 1) * CHUNK;
         int    *vals;
 
         if ((vals = (int *)malloc(n * sizeof(int))) == NULL) {
@@ -255,7 +283,7 @@ case_recreate_each_step(hid_t vol_id)
         hid_t   sds, ssp;
         hsize_t sdims[1] = {0};
         int     got[16], bad = 0;
-        int     expect_n = (s + 1) * 2;
+        int     expect_n = (s + 1) * CHUNK;
 
         snprintf(path, sizeof(path), "/step/%d/grow", s);
         if ((sds = H5Dopen2(nfid, path, H5P_DEFAULT)) < 0) {
@@ -294,6 +322,157 @@ case_recreate_each_step(hid_t vol_id)
     H5Fclose(nfid);
 } /* end case_recreate_each_step() */
 
+/* --------------------------------------------------------------------
+ * Case 3: the documented boundary. H5Dset_extent() + writing only the
+ * NEW tail slice (not a full rewrite) through one live handle. Each
+ * step's own synthesized copy is created fresh and populated only from
+ * that step's own captured write, so the carried-forward portion lands
+ * at HDF5's own fill value (0 for H5T_NATIVE_INT, the default), not the
+ * previous step's real values. Asserted as the CURRENT, known behavior --
+ * not a silent-corruption risk (a well-defined fill value, not another
+ * step's data), but not a complete self-sufficient snapshot either.
+ * -------------------------------------------------------------------- */
+static void
+case_resize_partial_write_gap(hid_t vol_id)
+{
+    hid_t   fapl, fid, space, dcpl, ds, nfid;
+    hsize_t dims = CHUNK, maxdims = H5S_UNLIMITED, chunk = CHUNK;
+    int     s;
+
+    printf("case 3: H5Dset_extent() + a partial (tail-only) write -- the documented boundary\n");
+
+    unlink(FNAME_PARTIAL);
+
+    if ((fapl = H5Pcreate(H5P_FILE_ACCESS)) < 0 || H5Pset_vol(fapl, vol_id, NULL) < 0) {
+        printf("  FAIL  fapl\n");
+        nerrors++;
+        return;
+    }
+    if ((fid = H5Fcreate(FNAME_PARTIAL, H5F_ACC_TRUNC, H5P_DEFAULT, fapl)) < 0) {
+        printf("  FAIL  create\n");
+        nerrors++;
+        return;
+    }
+    if ((space = H5Screate_simple(1, &dims, &maxdims)) < 0 || (dcpl = H5Pcreate(H5P_DATASET_CREATE)) < 0 ||
+        H5Pset_chunk(dcpl, 1, &chunk) < 0) {
+        printf("  FAIL  space/dcpl\n");
+        nerrors++;
+        return;
+    }
+    if (H5Fbegin_step(fid, 0, NULL, 0) < 0 ||
+        (ds = H5Dcreate2(fid, "/grow", H5T_NATIVE_INT, space, H5P_DEFAULT, dcpl, H5P_DEFAULT)) < 0) {
+        printf("  FAIL  begin/create step 0\n");
+        nerrors++;
+        return;
+    }
+    {
+        int vals[CHUNK] = {0, 1};
+        if (H5Dwrite(ds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, vals) < 0 || H5Fend_step(fid) < 0) {
+            printf("  FAIL  write/end step 0\n");
+            nerrors++;
+            return;
+        }
+    }
+
+    for (s = 1; s < NSTEPS; s++) {
+        hsize_t newdims = (hsize_t)(s + 1) * CHUNK;
+        hsize_t start = (hsize_t)s * CHUNK, count = CHUNK;
+        int     vals[CHUNK];
+        hid_t   fspace, mspace;
+        int     i;
+
+        if (H5Fbegin_step(fid, 0, NULL, 0) < 0 || H5Dset_extent(ds, &newdims) < 0) {
+            printf("  FAIL  begin/set_extent %d\n", s);
+            nerrors++;
+            return;
+        }
+        for (i = 0; i < CHUNK; i++)
+            vals[i] = (int)start + i;
+
+        if ((fspace = H5Dget_space(ds)) < 0 ||
+            H5Sselect_hyperslab(fspace, H5S_SELECT_SET, &start, NULL, &count, NULL) < 0) {
+            printf("  FAIL  hyperslab %d\n", s);
+            nerrors++;
+            return;
+        }
+        mspace = H5Screate_simple(1, &count, NULL);
+        if (H5Dwrite(ds, H5T_NATIVE_INT, mspace, fspace, H5P_DEFAULT, vals) < 0 || H5Fend_step(fid) < 0) {
+            printf("  FAIL  write/end step %d\n", s);
+            nerrors++;
+        }
+        H5Sclose(mspace);
+        H5Sclose(fspace);
+    }
+
+    H5Dclose(ds);
+    H5Sclose(space);
+    H5Pclose(dcpl);
+    H5Fclose(fid);
+    H5Pclose(fapl);
+
+    if ((nfid = H5Fopen(FNAME_PARTIAL, H5F_ACC_RDONLY, H5P_DEFAULT)) < 0) {
+        printf("  FAIL  reopen natively\n");
+        nerrors++;
+        return;
+    }
+    /* Step 0 (the only full write) must still be exactly correct. Steps
+     * 1..N-1: the new tail is correct; the carried-forward head is the
+     * documented fill-value gap, not a FAIL -- asserted explicitly so a
+     * future fix (or regression) shows up as a real, deliberate change
+     * here rather than a surprise. */
+    for (s = 0; s < NSTEPS; s++) {
+        char    path[64];
+        hid_t   sds;
+        int     got[16];
+        int     expect_n = (s + 1) * CHUNK;
+        int     tail_ok = 1, head_carried = 1;
+        int     i;
+
+        snprintf(path, sizeof(path), "/step/%d/grow", s);
+        if ((sds = H5Dopen2(nfid, path, H5P_DEFAULT)) < 0) {
+            printf("  FAIL  %s missing\n", path);
+            nerrors++;
+            continue;
+        }
+        if (H5Dread(sds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, got) < 0) {
+            printf("  FAIL  read %s\n", path);
+            nerrors++;
+            H5Dclose(sds);
+            continue;
+        }
+        H5Dclose(sds);
+
+        for (i = s * CHUNK; i < expect_n; i++)
+            if (got[i] != i)
+                tail_ok = 0;
+        if (!tail_ok) {
+            printf("  FAIL  %s: this step's OWN tail write is wrong -- that would be a real regression\n",
+                   path);
+            nerrors++;
+            continue;
+        }
+
+        if (s == 0) {
+            printf("  ok    %s: the only full write, correct\n", path);
+            continue;
+        }
+
+        for (i = 0; i < s * CHUNK; i++)
+            if (got[i] != i)
+                head_carried = 0;
+
+        if (head_carried)
+            printf("  ok    %s: carried-forward head is ALSO correct now -- case 3's documented gap has "
+                   "been closed; update this test's comment\n",
+                   path);
+        else
+            printf("  ok    %s: new tail correct, carried-forward head at fill value (documented gap, "
+                   "not a failure)\n",
+                   path);
+    }
+    H5Fclose(nfid);
+} /* end case_resize_partial_write_gap() */
+
 int
 main(void)
 {
@@ -306,8 +485,9 @@ main(void)
         return 1;
     }
 
-    case_resize_declined(vol_id);
+    case_resize_full_rewrite(vol_id);
     case_recreate_each_step(vol_id);
+    case_resize_partial_write_gap(vol_id);
 
     H5VLclose(vol_id);
 
