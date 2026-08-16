@@ -310,6 +310,18 @@ main(void)
             printf("  FAIL  reopen for payload byte-order check\n");
             return 1;
         }
+        /* Both of these inspect the .payload staging dataset, which
+         * VOL_STREAM_STAGE_PAYLOAD=0 legitimately removes (it duplicates data
+         * the replayed objects already hold, at a measured ~2x file size, and
+         * nothing reads it back). Skip rather than fail so the whole suite
+         * stays runnable under either setting -- the real assertions above,
+         * about the data itself, have already run. */
+        if (getenv("VOL_STREAM_STAGE_PAYLOAD") && getenv("VOL_STREAM_STAGE_PAYLOAD")[0] == '0') {
+            printf("  skip  .payload checks (VOL_STREAM_STAGE_PAYLOAD=0)\n");
+            H5Fclose(nfid);
+            goto payload_done;
+        }
+
         if ((pds = H5Dopen2(nfid, "/step/0/.payload", H5P_DEFAULT)) < 0) {
             printf("  FAIL  /step/0/.payload missing\n");
             H5Fclose(nfid);
@@ -363,6 +375,7 @@ main(void)
         free(raw);
         H5Dclose(pds);
         H5Fclose(nfid);
+payload_done:;
     }
 
     if (nerrors) {

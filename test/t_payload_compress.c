@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "hdf5.h"
@@ -113,6 +114,18 @@ main(void)
             printf("  FAIL  reopen with the native connector\n");
             return 1;
         }
+        /* Both of these inspect the .payload staging dataset, which
+         * VOL_STREAM_STAGE_PAYLOAD=0 legitimately removes (it duplicates data
+         * the replayed objects already hold, at a measured ~2x file size, and
+         * nothing reads it back). Skip rather than fail so the whole suite
+         * stays runnable under either setting -- the real assertions above,
+         * about the data itself, have already run. */
+        if (getenv("VOL_STREAM_STAGE_PAYLOAD") && getenv("VOL_STREAM_STAGE_PAYLOAD")[0] == '0') {
+            printf("  skip  .payload checks (VOL_STREAM_STAGE_PAYLOAD=0)\n");
+            H5Fclose(nfid);
+            goto payload_done;
+        }
+
         if ((pds = H5Dopen2(nfid, "/step/0/.payload", H5P_DEFAULT)) < 0) {
             printf("  FAIL  /step/0/.payload is not in the file\n");
             H5Fclose(nfid);
@@ -170,6 +183,100 @@ main(void)
         }
 
         H5Fclose(nfid);
+payload_done:;
+    }
+
+    /* The other half of the trade: staging can be turned off entirely.
+     *
+     * .payload duplicates data the replayed objects already hold, and nothing
+     * reads it back -- the reader index decodes only .manifest, and h5stream
+     * skips "."-prefixed names. Measured on incompressible data, where the
+     * deflate above cannot help: a 4.00 MB write produced an 8.22 MB file,
+     * 4.22 MB of it .payload. With VOL_STREAM_STAGE_PAYLOAD=0 the same write
+     * produces 4.00 MB.
+     *
+     * Checked in a forked child so the setenv() cannot disturb the rest of
+     * this test. That only works because the connector reads the variable per
+     * step rather than caching it -- a cached value is inherited across fork()
+     * already resolved, and this assertion failed exactly that way first.
+     */
+    {
+        pid_t pid = fork();
+
+        if (pid == 0) {
+            hid_t   cvol, cfapl, cfid, csp, cds;
+            hsize_t cdims[1] = {NELEM};
+            int    *cbuf     = (int *)calloc(NELEM, sizeof(int));
+            int     j;
+
+            setenv("VOL_STREAM_STAGE_PAYLOAD", "0", 1);
+            for (j = 0; j < NELEM; j++)
+                cbuf[j] = j;
+
+            if ((cvol = H5VL_stream_register()) < 0)
+                _exit(2);
+            cfapl = H5Pcreate(H5P_FILE_ACCESS);
+            H5Pset_vol(cfapl, cvol, NULL);
+            if ((cfid = H5Fcreate("t_payload_nostage.h5", H5F_ACC_TRUNC, H5P_DEFAULT, cfapl)) < 0)
+                _exit(2);
+            csp = H5Screate_simple(1, cdims, NULL);
+            H5Fbegin_step(cfid, 0, NULL, 0);
+            cds = H5Dcreate2(cfid, "plain", H5T_NATIVE_INT, csp, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            H5Dwrite(cds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, cbuf);
+            H5Dclose(cds);
+            H5Fend_step(cfid);
+            H5Sclose(csp);
+            H5Fclose(cfid);
+            H5Pclose(cfapl);
+            free(cbuf);
+            _exit(0);
+        }
+        else if (pid > 0) {
+            int   status = 0;
+            hid_t nf, rf;
+
+            waitpid(pid, &status, 0);
+            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                printf("  FAIL  writing with VOL_STREAM_STAGE_PAYLOAD=0 failed\n");
+                nerrors++;
+            }
+            else {
+                nf = H5Pcreate(H5P_FILE_ACCESS);
+                rf = H5Fopen("t_payload_nostage.h5", H5F_ACC_RDONLY, nf);
+                if (rf < 0) {
+                    printf("  FAIL  reopen the un-staged file\n");
+                    nerrors++;
+                }
+                else {
+                    htri_t has_payload, has_manifest, has_data;
+
+                    H5E_BEGIN_TRY
+                    {
+                        has_payload  = H5Lexists(rf, "/step/0/.payload", H5P_DEFAULT);
+                        has_manifest = H5Lexists(rf, "/step/0/.manifest", H5P_DEFAULT);
+                        has_data     = H5Lexists(rf, "/step/0/plain", H5P_DEFAULT);
+                    }
+                    H5E_END_TRY
+
+                    if (has_payload > 0) {
+                        printf("  FAIL  .payload written despite VOL_STREAM_STAGE_PAYLOAD=0\n");
+                        nerrors++;
+                    }
+                    if (has_manifest <= 0) {
+                        printf("  FAIL  .manifest missing -- the step is unreadable without it\n");
+                        nerrors++;
+                    }
+                    if (has_data <= 0) {
+                        printf("  FAIL  the replayed dataset is missing\n");
+                        nerrors++;
+                    }
+                    if (has_payload == 0 && has_manifest > 0 && has_data > 0)
+                        printf("  ok    VOL_STREAM_STAGE_PAYLOAD=0 drops .payload, keeps the real data\n");
+                    H5Fclose(rf);
+                }
+                H5Pclose(nf);
+            }
+        }
     }
 
     if (nerrors) {

@@ -11,3 +11,4 @@ keystore/
 # test artifacts
 *.h5
 api-suite-results/
+parallel-test-results/

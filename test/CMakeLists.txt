@@ -1,5 +1,5 @@
 foreach(t t_smoke t_step t_replay t_reader t_deferred t_vl_reject t_manifest_cache t_ref_path t_ref_roundtrip
-           t_vl_roundtrip t_attr_convert t_payload_compress t_step_rewrite t_reregister)
+           t_vl_roundtrip t_attr_convert t_payload_compress t_step_rewrite t_reregister t_memspace t_manypaths)
   add_executable(${t} ${t}.c)
   target_link_libraries(${t} PRIVATE vol_stream)
 endforeach()
@@ -18,6 +18,15 @@ add_test(NAME attr_convert COMMAND t_attr_convert)
 add_test(NAME payload_compress COMMAND t_payload_compress)
 add_test(NAME step_rewrite COMMAND t_step_rewrite)
 add_test(NAME reregister COMMAND t_reregister)
+# Guards the capture path against ignoring mem_space_id -- see t_memspace.c's
+# own comment. Asserts bracketed and unbracketed writes agree, which is the
+# same equivalence t_step.c's byte-identity gate makes, extended to the axis
+# the suite was uniform in.
+add_test(NAME memspace COMMAND t_memspace)
+# Exercises the path -> index hash map (H5VL_stream_pathmap_t) past its
+# initial capacity, with colliding long-common-prefix keys. Every other test
+# uses a handful of paths, so the map never grows or collides in them.
+add_test(NAME manypaths COMMAND t_manypaths)
 
 # M4 exit gate: the two-process Mercury round trip. M5 exit gate: SSG
 # rendezvous, late joiners, and a departing reader that does not stall the
@@ -49,6 +58,17 @@ if(VOL_STREAM_HAVE_MERCURY)
     ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
     TIMEOUT 60
   )
+
+  # Every test above registers the connector explicitly, which leaves the
+  # process default VOL native -- and that is exactly what hid the connector's
+  # own scratch files inheriting vol-stream as their VOL and recursing back
+  # into a replay in progress. This runs one of them the other way, through
+  # HDF5_VOL_CONNECTOR, and asserts on the artifacts. See the script's own
+  # comment.
+  add_test(NAME plugin_scratch
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/run_plugin_scratch_test.sh
+            $<TARGET_FILE:t_precision> $<TARGET_FILE_DIR:vol_stream>)
+  set_tests_properties(plugin_scratch PROPERTIES TIMEOUT 90)
   # t_precision_dual.c meets the M8/M8.5 exit gate's literal wording (two
   # simultaneous subscribers, different precisions, one end_step) with three
   # real OS processes -- see its own top comment for the two real bugs found
@@ -122,6 +142,57 @@ if(MPI_C_FOUND AND MPIEXEC_EXECUTABLE)
             --reader-ranks 3
   )
   set_tests_properties(parallel_7x3 PROPERTIES TIMEOUT 180)
+
+  # A parallel writer with a queue policy set -- the combination end_step()
+  # used to ignore outright, dispatching to the parallel replay without ever
+  # consulting the policy, so M7's backpressure was serial-only.
+  #
+  # Making it work required reducing the whole decision across the
+  # communicator (H5VL__stream_queue_lag_view()/_agree_and()), and the failure
+  # mode of getting that wrong is a HANG, not wrong data: one rank skipping an
+  # MPI_Allreduce its peers are blocked in. So the assertion is that the run
+  # completes at all and stays byte-exact -- a divergence surfaces as this
+  # test's own timeout, which is why the timeout is deliberately tight.
+  #
+  # Scope, stated plainly: this covers the no-pressure path only. The transport
+  # comes up (the .vsgroup sidecar proves it) so the policy region and both of
+  # its collectives execute on every rank every step, which is what pins the
+  # lockstep property. But with no reader attached, no rank has a tracked
+  # reader, so the ranks cannot disagree about lag here even if the reduction
+  # were removed. Covering the case that actually applies backpressure needs a
+  # lagging reader acking to a single writer rank -- the configuration where
+  # per-rank views genuinely diverge -- and is not built yet.
+  if(VOL_STREAM_HAVE_MERCURY)
+    # The case parallel_queue_policy below cannot reach: a real reader, so the
+    # lag view is genuinely asymmetric across ranks (a reader acks to exactly
+    # one of them). Without the reduction the un-acked ranks race ahead and the
+    # run HANGS rather than answering wrongly, which is why the timeout is
+    # tight and the writer asserts its own per-rank stall.
+    add_executable(t_parallel_lag t_parallel_lag.c)
+    target_link_libraries(t_parallel_lag PRIVATE vol_stream)
+    add_test(NAME parallel_lag
+      COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/run_parallel_lag_test.sh
+              --mpirun       ${MPIEXEC_EXECUTABLE}
+              --bin          $<TARGET_FILE:t_parallel_lag>
+              --plugin-dir   $<TARGET_FILE_DIR:vol_stream>
+              --writer-ranks 3
+    )
+    set_tests_properties(parallel_lag PROPERTIES TIMEOUT 90)
+
+    add_test(NAME parallel_queue_policy
+      COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/run_parallel_test.sh
+              --mpirun       ${MPIEXEC_EXECUTABLE}
+              --bin          $<TARGET_FILE:t_parallel>
+              --plugin-dir   $<TARGET_FILE_DIR:vol_stream>
+              --writer-ranks 3
+              --reader-ranks 2
+              --queue-policy block
+    )
+    set_tests_properties(parallel_queue_policy PROPERTIES
+      ENVIRONMENT "VOL_STREAM_NA=na+sm"
+      TIMEOUT 120
+    )
+  endif()
 endif()
 
 # M9: h5stream's `list`, checked by running the tool and parsing what a user

@@ -148,6 +148,45 @@ do_write(const char *fname, int global_size)
         return 1;
     }
 
+    /* A queue policy on a PARALLEL writer, which until recently was silently
+     * ignored: end_step() dispatched straight to the parallel replay and
+     * never consulted the policy at all, so M7's backpressure existed only
+     * for serial writers.
+     *
+     * Making it work means the whole decision -- is there pressure, how far
+     * behind is the furthest reader, is any placeholder open -- has to be
+     * reduced across the communicator, because each rank only ever sees the
+     * readers that acked to it. What this test guards is the property that
+     * failure mode would violate: every rank must traverse the same
+     * collectives in the same order. A rank that decided differently would
+     * not produce wrong data, it would hang. So the assertion is simply that
+     * the run completes and stays byte-exact -- a divergence shows up as the
+     * test's own timeout.
+     *
+     * Set from the environment rather than argv so the existing write/read
+     * command contract is unchanged. */
+    {
+        const char *pol = getenv("VOL_STREAM_TEST_QUEUE_POLICY");
+
+        if (pol && *pol) {
+            H5VL_stream_queue_policy_t p = H5VL_STREAM_QUEUE_BLOCK;
+
+            if (strcmp(pol, "discard") == 0)
+                p = H5VL_STREAM_QUEUE_DISCARD;
+            else if (strcmp(pol, "spill") == 0)
+                p = H5VL_STREAM_QUEUE_SPILL;
+
+            /* Every rank sets the same policy, the convention
+             * H5Fset_stream_queue_policy() documents. */
+            if (H5Fset_stream_queue_policy(fid, p, 2) < 0) {
+                fprintf(stderr, "rank %d: FAIL set queue policy\n", world_rank);
+                return 1;
+            }
+            if (world_rank == 0)
+                printf("queue policy '%s' set on a %d-rank parallel writer\n", pol, world_size);
+        }
+    }
+
     /* Every rank creates the same dataset from the same global dataspace --
      * the standard parallel-HDF5 collective-create pattern this increment
      * relies on (see H5VL__stream_replay_step()'s comment). */

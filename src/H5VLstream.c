@@ -157,6 +157,31 @@ typedef struct H5VL_stream_pending_entry_t {
     H5VL_stream_t *owner_wrapper; /* still-open placeholder handle, or NULL */
 } H5VL_stream_pending_entry_t;
 
+/* A path -> array-index map, the lookup side of the three growable arrays
+ * keyed by object path (fs->path_index and the two type caches).
+ *
+ * Those were each a strcmp() scan of a flat array, run once per manifest
+ * entry per step, with the arrays holding one element per distinct path in
+ * the file. Cost therefore grew as O(steps x paths^2) -- at the step cadence
+ * this connector exists for (thousands of steps, hundreds of objects) that
+ * becomes the dominant cost of end_step(), and all of it is bookkeeping
+ * rather than I/O.
+ *
+ * The arrays stay authoritative: order carries meaning (path_index's per-path
+ * step lists are built in ascending scan order and read from the end), and
+ * callers hold indices into them. This only replaces the scan, so it is a
+ * pure lookup accelerator with no ownership of its own beyond the key copies.
+ *
+ * Open addressing with linear probing, power-of-two capacity, grown at 70%
+ * load. Deletion is never needed -- entries are only ever added, and the
+ * whole map is cleared with its array. */
+typedef struct H5VL_stream_pathmap_t {
+    char   **keys; /* NULL slot == empty; owned copies */
+    size_t  *vals;
+    size_t   cap;  /* power of two, 0 until first insert */
+    size_t   n;
+} H5VL_stream_pathmap_t;
+
 /* M3: one logical id's authoritative (largest / most recent) physical step,
  * built by H5VL__stream_reader_build_index() scanning steps in ascending
  * order and overwriting on each occurrence -- a later restart write always
@@ -249,6 +274,9 @@ struct H5VL_stream_file_state_t {
     H5VL_stream_pending_entry_t *pending;        /* growable array */
     size_t                       n_pending;
     size_t                       cap_pending;
+    size_t                       pending_bytes;  /* captured payload in this step, for the
+                                                   * VOL_STREAM_MAX_PENDING_BYTES guard -- see
+                                                   * H5VL__stream_pending_limit() */
 
     /* M4: the open step's shared completion cell (NULL outside IN_STEP/
      * COMMITTING), and the transport used to announce a committed step to
@@ -271,6 +299,7 @@ struct H5VL_stream_file_state_t {
     int                          queue_policy_set;
     H5VL_stream_queue_policy_t   queue_policy;
     uint64_t                     reserve_slots;
+    int                          warned_parallel_spill; /* H5VL__stream_warn_once() latch */
 #ifdef VOL_STREAM_HAVE_BAKE
     vs_bake_t                   *spill_bake;
     char                         *spill_dir;
@@ -304,8 +333,14 @@ struct H5VL_stream_file_state_t {
      * through the file root rather than through some other resolved
      * object's under_object -- see the M3 plan's "Critical finding #1". Set
      * once at file_create()/file_open() time, never reassigned. */
+    /* BORROWED, not owned: this is the file wrapper's own under_object, and
+     * the file wrapper is what closes it. Every path below therefore has to
+     * go through H5VL__stream_file_under() rather than reading the field
+     * directly -- see that function for the lifetime rule and how it used to
+     * be violated. */
     void  *file_under_object;
     hid_t  file_under_vol_id;
+    int    file_under_closed; /* set once the file wrapper has closed it */
 
     unsigned is_reader;      /* set at file_open() from flags */
     int      index_built;    /* built lazily, on first reader begin_step */
@@ -322,6 +357,7 @@ struct H5VL_stream_file_state_t {
     H5VL_stream_path_steps_t *path_index;
     size_t                     n_path_index;
     size_t                     cap_path_index;
+    H5VL_stream_pathmap_t      path_index_map; /* path -> index into path_index */
 
     /* Dictionary caching for DsetWrite's type_enc, see H5VL__stream_type_
      * cache_entry_t's comment. write_type_cache is consulted/updated by
@@ -333,9 +369,11 @@ struct H5VL_stream_file_state_t {
     H5VL_stream_type_cache_entry_t *write_type_cache;
     size_t                           n_write_type_cache;
     size_t                           cap_write_type_cache;
+    H5VL_stream_pathmap_t            write_type_map;
     H5VL_stream_type_cache_entry_t *replay_type_cache;
     size_t                           n_replay_type_cache;
     size_t                           cap_replay_type_cache;
+    H5VL_stream_pathmap_t            replay_type_map;
 };
 
 /* Whether a wrapped object is a real, opened/created underlying object, a
@@ -417,13 +455,22 @@ static hid_t  H5VL__stream_resolve_space(hid_t space_id, hid_t fallback_space_id
 
 static htri_t H5VL__stream_type_unsafe_to_capture(hid_t type_id);
 static int    H5VL__stream_type_vl_kind(hid_t type_id);
-static const uint8_t *H5VL__stream_type_cache_lookup(H5VL_stream_type_cache_entry_t *arr, size_t n,
-                             const char *path, size_t *out_len);
+/* Path -> array-index map backing the three path-keyed arrays; see the
+ * H5VL_stream_pathmap_t typedef. Declared here because file_state_decref()
+ * and the type caches both use it well before its definition. */
+static herr_t H5VL__stream_pathmap_find(const H5VL_stream_pathmap_t *m, const char *key, size_t *out_index);
+static herr_t H5VL__stream_pathmap_set(H5VL_stream_pathmap_t *m, const char *key, size_t index);
+static void   H5VL__stream_pathmap_clear(H5VL_stream_pathmap_t *m);
+
+static const uint8_t *H5VL__stream_type_cache_lookup(H5VL_stream_type_cache_entry_t *arr,
+                             H5VL_stream_pathmap_t *map, const char *path, size_t *out_len);
 static herr_t H5VL__stream_type_cache_upsert(H5VL_stream_type_cache_entry_t **arr, size_t *n, size_t *cap,
-                             const char *path, const uint8_t *type_enc, size_t type_enc_len);
+                             H5VL_stream_pathmap_t *map, const char *path, const uint8_t *type_enc,
+                             size_t type_enc_len);
 static void   H5VL__stream_type_cache_clear(H5VL_stream_type_cache_entry_t *arr, size_t n);
 static herr_t H5VL__stream_build_manifest(H5VL_stream_file_state_t *fs, uint8_t **out_manifest_buf,
-                             size_t *out_manifest_len, uint8_t **out_payload_buf, size_t *out_payload_len);
+                             size_t *out_manifest_len, uint8_t **out_payload_buf, size_t *out_payload_len,
+                             int want_payload_buf);
 static herr_t H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_buf,
                              size_t manifest_len, const uint8_t *payload_buf,
                              H5VL_stream_pending_entry_t *pending_for_wiring, size_t n_pending_for_wiring);
@@ -506,11 +553,30 @@ static int H5VL__stream_eval_predicate(const void *raw_buf, uint64_t elem_size, 
                              uint64_t type_enc_len, vs_tr_run_t *runs, int max_runs);
 static herr_t H5VL__stream_encode_predicate(H5VL_stream_pred_op_t op, hid_t type_id, const void *value,
                              uint8_t **buf, size_t *len);
+/* M8.5 follow-up: vs_tr_selection_fn's implementation -- see
+ * H5VL__stream_selection_runs()'s comment. */
+static int H5VL__stream_selection_runs(const uint8_t *sub_space_enc, uint64_t sub_space_enc_len,
+                             const uint8_t *write_space_enc, uint64_t write_space_enc_len,
+                             uint64_t range_start, uint64_t range_count, vs_tr_run_t *runs, int max_runs);
+/* M8.5 precision / M9 predicate: a scratch in-memory file this connector builds
+ * for itself. See the function's own comment for why it cannot use a bare
+ * H5Pcreate(H5P_FILE_ACCESS). */
+static hid_t H5VL__stream_scratch_fapl(void);
+static void  H5VL__stream_scratch_name(const char *role, char *out, size_t out_len);
+#endif
+
 /* Flat-run decomposition of a selection. Declared up here rather than beside
- * its definition because both the write path (which splits a write into
- * truthfully-labelled pushes) and the subscription path (which narrows a
- * push to a subscriber's own selection) need it, and they sit on opposite
- * sides of this file. */
+ * its definition because three call sites on opposite sides of this file need
+ * it: the write path (which splits a write into truthfully-labelled pushes),
+ * the subscription path (which narrows a push to a subscriber's own
+ * selection), and the capture path (which gathers a write's memory selection
+ * into packed bytes -- see H5VL__stream_gather_mem()).
+ *
+ * Deliberately OUTSIDE the VOL_STREAM_HAVE_MERCURY guard above: the capture
+ * path needs it in every build, and only the two push-side callers are
+ * transport-specific. While these lived inside the guard, a non-Mercury build
+ * compiled H5VL__stream_space_flat_runs()'s definition (which was never
+ * guarded) with no declaration and no caller at all. */
 #define H5VL_STREAM_MAX_PUSH_RUNS 256
 
 typedef struct H5VL_stream_flat_run_t {
@@ -518,14 +584,11 @@ typedef struct H5VL_stream_flat_run_t {
     uint64_t count; /* elements in the run                          */
 } H5VL_stream_flat_run_t;
 
-static int H5VL__stream_space_flat_runs(hid_t space_id, H5VL_stream_flat_run_t *runs, int max_runs);
+static int    H5VL__stream_space_flat_runs(hid_t space_id, H5VL_stream_flat_run_t *runs, int max_runs);
+static int    H5VL__stream_mem_sel_is_packed(hid_t mem_space, size_t n_elem);
+static herr_t H5VL__stream_gather_mem(const void *buf, hid_t mem_space, size_t elem_size, size_t n_elem,
+                             uint8_t *out);
 
-/* M8.5 follow-up: vs_tr_selection_fn's implementation -- see
- * H5VL__stream_selection_runs()'s comment. */
-static int H5VL__stream_selection_runs(const uint8_t *sub_space_enc, uint64_t sub_space_enc_len,
-                             const uint8_t *write_space_enc, uint64_t write_space_enc_len,
-                             uint64_t range_start, uint64_t range_count, vs_tr_run_t *runs, int max_runs);
-#endif
 #ifdef H5_HAVE_PARALLEL
 static void H5VL__stream_detect_mpi_comm(H5VL_stream_file_state_t *fs, hid_t fapl_id);
 #endif
@@ -693,6 +756,82 @@ static herr_t H5VL_stream_optional(void *obj, H5VL_optional_args_t *args, hid_t 
 
 /* Connector ID, set by H5VL_stream_register() or by the plugin loader. */
 hid_t H5VL_STREAM_g = H5I_INVALID_HID;
+
+/*-------------------------------------------------------------------------
+ * Error reporting.
+ *
+ * Until this existed the connector never pushed a single frame: every failure
+ * returned a bare -1, so H5Eprint() after a failed H5Fend_step() showed
+ * HDF5's own generic "dataset write failed" frames and nothing about which
+ * connector rule was broken or why. The existing H5Eget_current_stack()/
+ * H5Eset_current_stack() discipline around quiet probes carefully *preserves*
+ * the stack; this is the other half, actually contributing to it.
+ *
+ * Registered once per process and deliberately never unregistered, for the
+ * same reason H5VL__stream_register_op() recovers an already-registered
+ * operation instead of unregistering in term(): HDF5's registries outlive any
+ * one registration of this connector, and tearing these down on the first
+ * close would pull them out from under a registration still using them.
+ *-------------------------------------------------------------------------
+ */
+static hid_t H5VL_stream_err_class_g    = H5I_INVALID_HID;
+static hid_t H5VL_stream_err_maj_g      = H5I_INVALID_HID;
+static hid_t H5VL_stream_err_step_g     = H5I_INVALID_HID; /* step state machine   */
+static hid_t H5VL_stream_err_capture_g  = H5I_INVALID_HID; /* write capture        */
+static hid_t H5VL_stream_err_manifest_g = H5I_INVALID_HID; /* encode/decode/replay */
+static hid_t H5VL_stream_err_transport_g = H5I_INVALID_HID; /* Mercury/SSG          */
+
+/* Push one frame, if the class came up. Evaluates to the caller's own error
+ * value so it can be used inline in a return, keeping the diagnostic beside
+ * the failure it describes rather than in a separate statement that a later
+ * edit can drift away from. */
+#define H5VL_STREAM_ERR(minor, msg)                                                                          \
+    do {                                                                                                     \
+        if (H5VL_stream_err_class_g >= 0)                                                                    \
+            H5Epush2(H5E_DEFAULT, __FILE__, __func__, __LINE__, H5VL_stream_err_class_g,                     \
+                     H5VL_stream_err_maj_g, (minor), msg);                                                   \
+    } while (0)
+
+#define H5VL_STREAM_GOTO_ERR(minor, msg, ret)                                                                \
+    do {                                                                                                     \
+        H5VL_STREAM_ERR(minor, msg);                                                                         \
+        return (ret);                                                                                        \
+    } while (0)
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_init_error_class
+ *
+ * Purpose:     Register the error class and its messages, once. Idempotent:
+ *              H5VL_stream_init() runs on every registration of the
+ *              connector, and re-registering would leak a fresh class each
+ *              time.
+ *
+ *              Failure here is deliberately not fatal to init -- a connector
+ *              that cannot report errors nicely is still a working connector,
+ *              and every H5VL_STREAM_ERR() site checks the class first.
+ *-------------------------------------------------------------------------
+ */
+static void
+H5VL__stream_init_error_class(void)
+{
+    if (H5VL_stream_err_class_g >= 0)
+        return;
+
+    if ((H5VL_stream_err_class_g = H5Eregister_class(H5VL_STREAM_NAME, H5VL_STREAM_NAME, "0.0.1")) < 0) {
+        H5VL_stream_err_class_g = H5I_INVALID_HID;
+        return;
+    }
+
+    H5VL_stream_err_maj_g = H5Ecreate_msg(H5VL_stream_err_class_g, H5E_MAJOR, "vol-stream connector");
+    H5VL_stream_err_step_g =
+        H5Ecreate_msg(H5VL_stream_err_class_g, H5E_MINOR, "step state");
+    H5VL_stream_err_capture_g =
+        H5Ecreate_msg(H5VL_stream_err_class_g, H5E_MINOR, "write capture");
+    H5VL_stream_err_manifest_g =
+        H5Ecreate_msg(H5VL_stream_err_class_g, H5E_MINOR, "step manifest");
+    H5VL_stream_err_transport_g =
+        H5Ecreate_msg(H5VL_stream_err_class_g, H5E_MINOR, "transport");
+} /* end H5VL__stream_init_error_class() */
 
 /* Values assigned by H5VLregister_opt_operation() during init.  H5I_INVALID_HID
  * is not meaningful for an int op value, so -1 marks "not yet registered".
@@ -942,7 +1081,14 @@ H5VL_stream_new_obj(void *under_obj, hid_t under_vol_id)
 {
     H5VL_stream_t *new_obj;
 
-    new_obj               = (H5VL_stream_t *)calloc(1, sizeof(H5VL_stream_t));
+    /* The template this is derived from dereferenced calloc()'s result
+     * unchecked. Roughly thirty call sites here already test the return for
+     * NULL and several have real cleanup paths that depend on it, so the one
+     * place that decides whether NULL is possible has to be the one place
+     * that checks. */
+    if (NULL == (new_obj = (H5VL_stream_t *)calloc(1, sizeof(H5VL_stream_t))))
+        return NULL;
+
     new_obj->under_object = under_obj;
     new_obj->under_vol_id = under_vol_id;
 
@@ -1026,6 +1172,45 @@ H5VL__stream_file_state_incref(H5VL_stream_file_state_t *fs)
 } /* end H5VL__stream_file_state_incref() */
 
 /*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_file_under
+ *
+ * Purpose:     The file's underlying object, or NULL once it has been closed.
+ *
+ *              file_under_object is the FILE wrapper's own under_object,
+ *              borrowed by file_state so a wrapper several levels deep can
+ *              route an absolute "/step/<k>/<path>" open through the file
+ *              root (the M3 plan's "Critical finding #1"). The borrow has a
+ *              lifetime the code did not previously respect:
+ *              H5VL_stream_file_close() calls H5VLfile_close() on that object
+ *              and then drops file_state's reference, but if any child
+ *              wrapper is still open the refcount stays positive and
+ *              file_state outlives the object it points at. Every reader
+ *              resolution path then routed through freed memory.
+ *
+ *              It has not bitten in practice because the native connector's
+ *              default weak close degree keeps the H5F_t alive until the last
+ *              object closes -- but that is the *under* connector's policy,
+ *              not a promise this connector is entitled to rely on, and a
+ *              connector that frees eagerly would turn every one of those
+ *              paths into a use-after-free.
+ *
+ *              Returning NULL rather than a dangling pointer converts that
+ *              into a clean, reportable failure at the one place the borrow
+ *              is consumed.
+ *
+ * Return:      The underlying file object, or NULL if it is gone.
+ *-------------------------------------------------------------------------
+ */
+static void *
+H5VL__stream_file_under(H5VL_stream_file_state_t *fs)
+{
+    if (!fs || fs->file_under_closed)
+        return NULL;
+
+    return fs->file_under_object;
+} /* end H5VL__stream_file_under() */
+
+/*-------------------------------------------------------------------------
  * Function:    H5VL__stream_pending_entry_clear
  *
  * Purpose:     Release everything a pending entry owns: its live hid_t
@@ -1068,9 +1253,10 @@ H5VL__stream_pending_discard_all(H5VL_stream_file_state_t *fs)
         H5VL__stream_pending_entry_clear(&fs->pending[i]);
 
     free(fs->pending);
-    fs->pending     = NULL;
-    fs->n_pending   = 0;
-    fs->cap_pending = 0;
+    fs->pending       = NULL;
+    fs->n_pending     = 0;
+    fs->cap_pending   = 0;
+    fs->pending_bytes = 0;
 } /* end H5VL__stream_pending_discard_all() */
 
 /*-------------------------------------------------------------------------
@@ -1103,9 +1289,12 @@ H5VL__stream_file_state_decref(H5VL_stream_file_state_t *fs)
         free(fs->path_index[i].steps);
     }
     free(fs->path_index);
+    H5VL__stream_pathmap_clear(&fs->path_index_map);
 
     H5VL__stream_type_cache_clear(fs->write_type_cache, fs->n_write_type_cache);
     H5VL__stream_type_cache_clear(fs->replay_type_cache, fs->n_replay_type_cache);
+    H5VL__stream_pathmap_clear(&fs->write_type_map);
+    H5VL__stream_pathmap_clear(&fs->replay_type_map);
 
     /* M4: an unclosed step at file_close() leaves current_completion set --
      * same "no partial-step state worth preserving" reasoning as an unclosed
@@ -1369,7 +1558,7 @@ H5VL__stream_transport_start_writer(H5VL_stream_file_state_t *fs, const char *na
         flush_args.op_type            = H5VL_FILE_FLUSH;
         flush_args.args.flush.obj_type = H5I_FILE;
         flush_args.args.flush.scope    = H5F_SCOPE_GLOBAL;
-        H5VLfile_specific(fs->file_under_object, fs->file_under_vol_id, &flush_args,
+        H5VLfile_specific(H5VL__stream_file_under(fs), fs->file_under_vol_id, &flush_args,
                            H5P_DATASET_XFER_DEFAULT, NULL);
     }
 
@@ -1585,11 +1774,67 @@ H5VL__stream_new_child_obj(void *under_obj, hid_t under_vol_id, H5VL_stream_file
 } /* end H5VL__stream_new_child_obj() */
 
 /*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_pending_limit
+ *
+ * Purpose:     How many bytes of captured payload one open step may buffer
+ *              before a further capture is refused, or 0 for no limit.
+ *
+ *              A step buffers every byte it captures until end_step()
+ *              replays it, and nothing else bounds that: the array doubles
+ *              indefinitely and each entry holds a full private copy. A step
+ *              that writes 40 GB buffers 40 GB before the file is touched,
+ *              and the process meets the OOM killer rather than an error it
+ *              can report.
+ *
+ *              M7's Spill answers a different question -- it triggers on
+ *              reader lag, never on memory pressure, and only at a step
+ *              boundary, which is precisely when the buffer is already at
+ *              its peak. So it is not the guard this needs.
+ *
+ *              Opt-in via VOL_STREAM_MAX_PENDING_BYTES, same convention as
+ *              VOL_STREAM_NA and VOL_STREAM_SPILL_DIR, and unset by default:
+ *              a limit low enough to protect a small node would break a
+ *              large one, and the connector cannot know which it is on.
+ *              Failing the write loudly is far better than the OOM killer,
+ *              and gives an application a signal to size its steps against.
+ *
+ * Return:      Byte limit, or 0 for unlimited.
+ *-------------------------------------------------------------------------
+ */
+static size_t
+H5VL__stream_pending_limit(void)
+{
+    static int    resolved = 0;
+    static size_t limit    = 0;
+
+    if (!resolved) {
+        const char *s = getenv("VOL_STREAM_MAX_PENDING_BYTES");
+
+        if (s && *s) {
+            char             *end;
+            unsigned long long v = strtoull(s, &end, 10);
+
+            if (end != s && *end == '\0')
+                limit = (size_t)v;
+        }
+        resolved = 1;
+    }
+
+    return limit;
+} /* end H5VL__stream_pending_limit() */
+
+/*-------------------------------------------------------------------------
  * Function:    H5VL__stream_pending_append
  *
  * Purpose:     Append a pending entry (by value -- the caller hands off
  *              ownership of entry->path/payload/hid_t copies) to a file's
  *              step buffer, growing it as needed.
+ *
+ *              Refuses once this step's captured payload would exceed
+ *              H5VL__stream_pending_limit(), if one is configured -- see
+ *              that function's comment. The caller treats a refusal exactly
+ *              like an allocation failure, which is what it is standing in
+ *              for.
  *
  * Return:      Success:    Index of the newly appended entry
  *              Failure:    (size_t)-1
@@ -1598,6 +1843,26 @@ H5VL__stream_new_child_obj(void *under_obj, hid_t under_vol_id, H5VL_stream_file
 static size_t
 H5VL__stream_pending_append(H5VL_stream_file_state_t *fs, const H5VL_stream_pending_entry_t *entry)
 {
+    size_t limit = H5VL__stream_pending_limit();
+
+    if (limit > 0 && entry->payload_len > 0) {
+        /* Both halves matter. The second is the running total; the first
+         * catches a single payload already larger than the whole limit, where
+         * "limit - payload_len" would wrap and silently admit it. */
+        if (entry->payload_len > limit || fs->pending_bytes > limit - entry->payload_len) {
+            char msg[224];
+
+            snprintf(msg, sizeof(msg),
+                     "this step would buffer %llu bytes, over the %llu-byte "
+                     "VOL_STREAM_MAX_PENDING_BYTES limit -- refusing the capture. Raise the limit, or "
+                     "call H5Fend_step() more often so the step's data reaches the file sooner",
+                     (unsigned long long)fs->pending_bytes + (unsigned long long)entry->payload_len,
+                     (unsigned long long)limit);
+            H5VL_STREAM_ERR(H5VL_stream_err_capture_g, msg);
+            return (size_t)-1;
+        }
+    }
+
     if (fs->n_pending == fs->cap_pending) {
         size_t                        new_cap = fs->cap_pending ? fs->cap_pending * 2 : 8;
         H5VL_stream_pending_entry_t *grown;
@@ -1611,6 +1876,7 @@ H5VL__stream_pending_append(H5VL_stream_file_state_t *fs, const H5VL_stream_pend
     }
 
     fs->pending[fs->n_pending] = *entry;
+    fs->pending_bytes += entry->payload_len;
 
     return fs->n_pending++;
 } /* end H5VL__stream_pending_append() */
@@ -1992,6 +2258,14 @@ H5VL__stream_vl_deserialize(const uint8_t *bytes, size_t len, size_t count, hid_
         if ((size_t)(end - p) < nbytes)
             goto error;
 
+        /* A well-formed manifest always has nbytes as an exact multiple of
+         * base_size -- H5VL__stream_vl_serialize() only ever writes whole
+         * elements. A remainder here means the manifest bytes are corrupt;
+         * reject rather than silently dropping the trailing partial element
+         * from v->len while still holding all nbytes bytes in v->p. */
+        if (kind == H5VL_STREAM_VL_SEQ && (nbytes % base_size != 0))
+            goto error;
+
         if (kind == H5VL_STREAM_VL_SEQ) {
             hvl_t *v = &((hvl_t *)arr)[i];
 
@@ -2111,6 +2385,122 @@ H5VL__stream_encode_dcpl(hid_t dcpl_id, uint8_t **buf, size_t *len)
 } /* end H5VL__stream_encode_dcpl() */
 
 #ifdef VOL_STREAM_HAVE_MERCURY
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_scratch_fapl
+ *
+ * Purpose:     A FAPL for one of this connector's own throwaway in-memory
+ *              files -- the temporary datasets the precision paths build to
+ *              run a filter pipeline (H5VL__stream_refilter_for_subscriber()
+ *              and H5VL__stream_unfilter_pushed_data()).
+ *
+ *              The H5Pset_vol() is the load-bearing line, and its absence was
+ *              a real bug rather than a missing nicety. H5Pset_fapl_core()
+ *              sets the VFD; it says nothing about the VOL, and a fresh
+ *              H5P_FILE_ACCESS carries whatever HDF5 installed as the process
+ *              default at library init -- which is vol-stream itself whenever
+ *              the connector was loaded through HDF5_VOL_CONNECTOR, the
+ *              plugin usage README.md documents as the no-application-changes
+ *              path. Measured directly, not reasoned about: a fresh FAPL
+ *              reports VOL value 0 (native) with the variable unset and 1091
+ *              (this connector) with it set.
+ *
+ *              Without the pin, these scratch files recursed straight back
+ *              into this connector from inside a replay already in progress:
+ *              a second H5VL_stream_file_state_t, and -- since this path is
+ *              only reachable with the transport up, so VOL_STREAM_NA is
+ *              necessarily set -- a second vs_tr_start()/margo_init() per
+ *              refilter call plus a real "<name>.vsgroup" sidecar written to
+ *              the working directory, which is precisely what
+ *              backing_store = false is supposed to make impossible.
+ *
+ *              Invisible to the test suite because almost every test program
+ *              registers the connector explicitly (H5VL_stream_register() +
+ *              H5Pset_vol()), which leaves the process default native.
+ *
+ * Return:      Success:    New FAPL (caller closes it)
+ *              Failure:    H5I_INVALID_HID
+ *-------------------------------------------------------------------------
+ */
+static hid_t
+H5VL__stream_scratch_fapl(void)
+{
+    hid_t fapl;
+
+    if ((fapl = H5Pcreate(H5P_FILE_ACCESS)) < 0)
+        return H5I_INVALID_HID;
+
+    if (H5Pset_vol(fapl, H5VL_NATIVE, NULL) < 0 || H5Pset_fapl_core(fapl, 1 << 20, false) < 0) {
+        H5Pclose(fapl);
+        return H5I_INVALID_HID;
+    }
+
+    return fapl;
+} /* end H5VL__stream_scratch_fapl() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_scratch_name
+ *
+ * Purpose:     A name for one of those scratch files that no other live
+ *              scratch file in this process can collide with.
+ *
+ *              backing_store = false keeps the bytes off disk, but the NAME
+ *              is still registered in HDF5's open-file table, so a fixed
+ *              string means a second H5Fcreate() of it while the first is
+ *              still open simply fails. Reachable today: a process that is
+ *              both writer and reader, or a reader draining
+ *              H5Fget_subscribed_data() from more than one thread. The
+ *              failure was silent and worse on the receiving side, where a
+ *              failed unfilter hands back raw filtered bytes while reporting
+ *              success -- breaking H5Fget_subscribed_data()'s documented
+ *              promise that it always returns decoded values.
+ *
+ *              pid + a monotone counter is enough: the file never outlives
+ *              the call, so uniqueness only has to hold among concurrently
+ *              open ones.
+ *-------------------------------------------------------------------------
+ */
+static void
+H5VL__stream_scratch_name(const char *role, char *out, size_t out_len)
+{
+    static unsigned long counter = 0;
+
+    snprintf(out, out_len, "vol_stream_%s_tmp_%ld_%lu.h5", role, (long)getpid(), counter++);
+} /* end H5VL__stream_scratch_name() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_debug_refilter / H5VL__stream_debug_predicate
+ *
+ * Purpose:     The two opt-in diagnostics, resolved once instead of on every
+ *              call. Both used to call getenv() from inside the
+ *              per-subscriber, per-run push loop -- a environment scan per
+ *              element batch, on the writer's critical path, to decide
+ *              whether to print nothing.
+ *-------------------------------------------------------------------------
+ */
+static int
+H5VL__stream_debug_refilter(void)
+{
+    static int resolved = 0, on = 0;
+
+    if (!resolved) {
+        on       = (getenv("VOL_STREAM_DEBUG_REFILTER") != NULL);
+        resolved = 1;
+    }
+    return on;
+} /* end H5VL__stream_debug_refilter() */
+
+static int
+H5VL__stream_debug_predicate(void)
+{
+    static int resolved = 0, on = 0;
+
+    if (!resolved) {
+        on       = (getenv("VOL_STREAM_DEBUG_PREDICATE") != NULL);
+        resolved = 1;
+    }
+    return on;
+} /* end H5VL__stream_debug_predicate() */
+
 /*-------------------------------------------------------------------------
  * Function:    H5VL__stream_refilter_zero_copy
  *
@@ -2254,7 +2644,7 @@ H5VL__stream_refilter_zero_copy(const void *raw_buf, uint64_t elem_size, uint64_
     /* Same diagnostic the slow path emits, so a test can tell the two apart
      * (and confirm the fast path is the one that ran) rather than only
      * seeing that some re-filtering happened. */
-    if (getenv("VOL_STREAM_DEBUG_REFILTER"))
+    if (H5VL__stream_debug_refilter())
         fprintf(stderr, "  refilter  raw=%llu filtered=%llu bytes (zero-copy)\n",
                 (unsigned long long)(elem_size * count), (unsigned long long)chunk_size);
 
@@ -2317,6 +2707,7 @@ H5VL__stream_refilter_for_subscriber(const void *raw_buf, uint64_t elem_size, ui
     unsigned chunk_filter_mask = 0;
     haddr_t  addr;
     hsize_t  chunk_size = 0;
+    char     scratch[64];
     int      ret_value = -1;
 
     if (count == 0 || !dcpl_enc || dcpl_enc_len == 0 || !type_enc || type_enc_len == 0)
@@ -2346,9 +2737,10 @@ H5VL__stream_refilter_for_subscriber(const void *raw_buf, uint64_t elem_size, ui
     if (H5Pset_chunk(dcpl, 1, dims) < 0)
         goto done;
 
-    if ((fapl = H5Pcreate(H5P_FILE_ACCESS)) < 0 || H5Pset_fapl_core(fapl, 1 << 20, false) < 0)
+    if ((fapl = H5VL__stream_scratch_fapl()) < 0)
         goto done;
-    if ((fid = H5Fcreate("vol_stream_refilter_tmp.h5", H5F_ACC_TRUNC, H5P_DEFAULT, fapl)) < 0)
+    H5VL__stream_scratch_name("refilter", scratch, sizeof(scratch));
+    if ((fid = H5Fcreate(scratch, H5F_ACC_TRUNC, H5P_DEFAULT, fapl)) < 0)
         goto done;
     if ((ds = H5Dcreate2(fid, "d", type, space, H5P_DEFAULT, dcpl, H5P_DEFAULT)) < 0)
         goto done;
@@ -2378,7 +2770,7 @@ H5VL__stream_refilter_for_subscriber(const void *raw_buf, uint64_t elem_size, ui
      * changed the wire size, since H5Fget_subscribed_data() itself always
      * hands back decoded values regardless -- transparent by design, so
      * there is no other way for a caller to see this happened. */
-    if (getenv("VOL_STREAM_DEBUG_REFILTER"))
+    if (H5VL__stream_debug_refilter())
         fprintf(stderr, "  refilter  raw=%llu filtered=%llu bytes\n", (unsigned long long)(elem_size * count),
                 (unsigned long long)chunk_size);
 
@@ -2695,7 +3087,7 @@ H5VL__stream_eval_predicate(const void *raw_buf, uint64_t elem_size, uint64_t co
      * sees only what arrives, and "fewer bytes" is indistinguishable from
      * "the writer wrote less" -- so a test needs this to tell the two apart.
      * Same reasoning as VOL_STREAM_DEBUG_REFILTER above. */
-    if (getenv("VOL_STREAM_DEBUG_PREDICATE")) {
+    if (H5VL__stream_debug_predicate()) {
         uint64_t matched = 0;
         int      r;
 
@@ -2849,6 +3241,7 @@ H5VL__stream_unfilter_pushed_data(const void *filtered_buf, uint64_t filtered_le
     hsize_t chunk_offset[1] = {0};
     void   *decoded = NULL;
     size_t  elem_size;
+    char    scratch[64];
     int     ret_value = -1;
 
     if (count == 0 || !dcpl_enc || dcpl_enc_len == 0 || !type_enc || type_enc_len == 0)
@@ -2867,9 +3260,10 @@ H5VL__stream_unfilter_pushed_data(const void *filtered_buf, uint64_t filtered_le
     if (H5Pset_chunk(dcpl, 1, dims) < 0)
         goto done;
 
-    if ((fapl = H5Pcreate(H5P_FILE_ACCESS)) < 0 || H5Pset_fapl_core(fapl, 1 << 20, false) < 0)
+    if ((fapl = H5VL__stream_scratch_fapl()) < 0)
         goto done;
-    if ((fid = H5Fcreate("vol_stream_unfilter_tmp.h5", H5F_ACC_TRUNC, H5P_DEFAULT, fapl)) < 0)
+    H5VL__stream_scratch_name("unfilter", scratch, sizeof(scratch));
+    if ((fid = H5Fcreate(scratch, H5F_ACC_TRUNC, H5P_DEFAULT, fapl)) < 0)
         goto done;
     if ((ds = H5Dcreate2(fid, "d", type, space, H5P_DEFAULT, dcpl, H5P_DEFAULT)) < 0)
         goto done;
@@ -2935,22 +3329,22 @@ done:
  *-------------------------------------------------------------------------
  */
 static const uint8_t *
-H5VL__stream_type_cache_lookup(H5VL_stream_type_cache_entry_t *arr, size_t n, const char *path, size_t *out_len)
+H5VL__stream_type_cache_lookup(H5VL_stream_type_cache_entry_t *arr, H5VL_stream_pathmap_t *map,
+                                const char *path, size_t *out_len)
 {
     size_t i;
 
-    for (i = 0; i < n; i++) {
-        if (0 == strcmp(arr[i].path, path)) {
-            *out_len = arr[i].type_enc_len;
-            return arr[i].type_enc;
-        }
-    }
-    return NULL;
+    if (0 != H5VL__stream_pathmap_find(map, path, &i))
+        return NULL;
+
+    *out_len = arr[i].type_enc_len;
+    return arr[i].type_enc;
 } /* end H5VL__stream_type_cache_lookup() */
 
 static herr_t
-H5VL__stream_type_cache_upsert(H5VL_stream_type_cache_entry_t **arr, size_t *n, size_t *cap, const char *path,
-                                const uint8_t *type_enc, size_t type_enc_len)
+H5VL__stream_type_cache_upsert(H5VL_stream_type_cache_entry_t **arr, size_t *n, size_t *cap,
+                                H5VL_stream_pathmap_t *map, const char *path, const uint8_t *type_enc,
+                                size_t type_enc_len)
 {
     size_t i;
     uint8_t *copy;
@@ -2960,13 +3354,11 @@ H5VL__stream_type_cache_upsert(H5VL_stream_type_cache_entry_t **arr, size_t *n, 
     if (type_enc_len > 0)
         memcpy(copy, type_enc, type_enc_len);
 
-    for (i = 0; i < *n; i++) {
-        if (0 == strcmp((*arr)[i].path, path)) {
-            free((*arr)[i].type_enc);
-            (*arr)[i].type_enc     = copy;
-            (*arr)[i].type_enc_len = type_enc_len;
-            return 0;
-        }
+    if (0 == H5VL__stream_pathmap_find(map, path, &i)) {
+        free((*arr)[i].type_enc);
+        (*arr)[i].type_enc     = copy;
+        (*arr)[i].type_enc_len = type_enc_len;
+        return 0;
     }
 
     if (*n == *cap) {
@@ -2987,6 +3379,8 @@ H5VL__stream_type_cache_upsert(H5VL_stream_type_cache_entry_t **arr, size_t *n, 
     }
     (*arr)[*n].type_enc     = copy;
     (*arr)[*n].type_enc_len = type_enc_len;
+    if (H5VL__stream_pathmap_set(map, path, *n) < 0)
+        return -1;
     (*n)++;
     return 0;
 } /* end H5VL__stream_type_cache_upsert() */
@@ -3002,6 +3396,170 @@ H5VL__stream_type_cache_clear(H5VL_stream_type_cache_entry_t *arr, size_t n)
     }
     free(arr);
 } /* end H5VL__stream_type_cache_clear() */
+
+/*-------------------------------------------------------------------------
+ * H5VL_stream_pathmap_t -- see its typedef's comment.
+ *
+ * FNV-1a over the path bytes. Chosen for being short enough to read at a
+ * glance and well-behaved on the strings actually used as keys here (HDF5
+ * object paths, which share long common prefixes -- "/mesh/block00/rho",
+ * "/mesh/block01/rho" -- and so punish hashes that fold weakly on the tail).
+ *-------------------------------------------------------------------------
+ */
+static size_t
+H5VL__stream_pathmap_hash(const char *s)
+{
+    size_t h = (size_t)1469598103934665603ULL; /* FNV offset basis */
+
+    while (*s) {
+        h ^= (size_t)(unsigned char)*s++;
+        h *= (size_t)1099511628211ULL; /* FNV prime */
+    }
+    return h;
+}
+
+/* Returns the slot holding key, or the empty slot where it belongs. Requires
+ * cap > 0 and at least one empty slot, both of which the grow policy keeps
+ * true. */
+static size_t
+H5VL__stream_pathmap_slot(const H5VL_stream_pathmap_t *m, const char *key)
+{
+    size_t mask = m->cap - 1;
+    size_t i    = H5VL__stream_pathmap_hash(key) & mask;
+
+    while (m->keys[i] && strcmp(m->keys[i], key) != 0)
+        i = (i + 1) & mask;
+
+    return i;
+}
+
+static herr_t
+H5VL__stream_pathmap_grow(H5VL_stream_pathmap_t *m)
+{
+    H5VL_stream_pathmap_t bigger;
+    size_t                i;
+
+    memset(&bigger, 0, sizeof(bigger));
+    bigger.cap = m->cap ? m->cap * 2 : 16;
+
+    if (NULL == (bigger.keys = (char **)calloc(bigger.cap, sizeof(char *))))
+        return -1;
+    if (NULL == (bigger.vals = (size_t *)calloc(bigger.cap, sizeof(size_t)))) {
+        free(bigger.keys);
+        return -1;
+    }
+
+    /* Rehash by moving the key pointers, not copying the strings. */
+    for (i = 0; i < m->cap; i++)
+        if (m->keys[i]) {
+            size_t j = H5VL__stream_pathmap_slot(&bigger, m->keys[i]);
+
+            bigger.keys[j] = m->keys[i];
+            bigger.vals[j] = m->vals[i];
+            bigger.n++;
+        }
+
+    free(m->keys);
+    free(m->vals);
+    *m = bigger;
+    return 0;
+}
+
+/* 0 and *out_index set if key is present, -1 if not. */
+static herr_t
+H5VL__stream_pathmap_find(const H5VL_stream_pathmap_t *m, const char *key, size_t *out_index)
+{
+    size_t i;
+
+    if (m->cap == 0)
+        return -1;
+
+    i = H5VL__stream_pathmap_slot(m, key);
+    if (!m->keys[i])
+        return -1;
+
+    *out_index = m->vals[i];
+    return 0;
+}
+
+/* Insert or overwrite. Copies key. */
+static herr_t
+H5VL__stream_pathmap_set(H5VL_stream_pathmap_t *m, const char *key, size_t index)
+{
+    size_t i;
+
+    if (m->cap == 0 || (m->n + 1) * 10 >= m->cap * 7) /* keep load under 70% */
+        if (H5VL__stream_pathmap_grow(m) < 0)
+            return -1;
+
+    i = H5VL__stream_pathmap_slot(m, key);
+    if (!m->keys[i]) {
+        if (NULL == (m->keys[i] = strdup(key)))
+            return -1;
+        m->n++;
+    }
+    m->vals[i] = index;
+    return 0;
+}
+
+static void
+H5VL__stream_pathmap_clear(H5VL_stream_pathmap_t *m)
+{
+    size_t i;
+
+    for (i = 0; i < m->cap; i++)
+        free(m->keys[i]);
+    free(m->keys);
+    free(m->vals);
+    memset(m, 0, sizeof(*m));
+}
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_stage_payload
+ *
+ * Purpose:     Whether to persist each step's "/step/<n>/.payload" staging
+ *              dataset. Default on, matching every release so far; set
+ *              VOL_STREAM_STAGE_PAYLOAD=0 to leave it out.
+ *
+ *              It is worth knowing what it costs before choosing. .payload
+ *              holds the step's raw bytes, and the real objects replayed
+ *              beside it hold the same data, so a stream file is a little
+ *              over twice the size of the data in it: measured at 8.22 MB for
+ *              a 4.00 MB write, with .payload accounting for 4.22 MB of that.
+ *              Deflating it (see the DCPL below) recovers most of the
+ *              duplication for compressible data and none of it otherwise,
+ *              which is why the multiplier survives on the incompressible
+ *              case that measurement used.
+ *
+ *              Nothing in this connector reads it back. The reader index
+ *              decodes only .manifest (H5VL__stream_reader_index_one_step()),
+ *              spilled steps come from BAKE rather than the file, and
+ *              h5stream skips any "."-prefixed name as bookkeeping. It exists
+ *              for inspectability and for a future transport that could reuse
+ *              staged bytes -- both real, neither free.
+ *
+ *              Left ON by default deliberately: it is long-standing,
+ *              documented, and asserted by test/t_payload_compress.c, so
+ *              flipping the default silently is not this knob's job. Deciding
+ *              that 2x is the wrong trade for a given deployment is the
+ *              caller's call, and this is the lever for it.
+ *-------------------------------------------------------------------------
+ */
+static int
+H5VL__stream_stage_payload(void)
+{
+    /* Deliberately not cached in a static, unlike the two DEBUG flags: those
+     * are read inside the per-subscriber, per-run push loop, while this is
+     * read once per H5Fend_step(). A cached value is also inherited across
+     * fork() already resolved, which silently ignores a setenv() in the
+     * child -- exactly how the test for this knob first failed. */
+    const char *s = getenv("VOL_STREAM_STAGE_PAYLOAD");
+
+    if (s && (s[0] == '0' || s[0] == 'n' || s[0] == 'N' || s[0] == 'f' || s[0] == 'F'))
+        return 0;
+
+    return 1;
+} /* end H5VL__stream_stage_payload() */
 
 /*-------------------------------------------------------------------------
  * Function:    H5VL__stream_replay_ensure_group
@@ -3053,6 +3611,17 @@ H5VL__stream_replay_ensure_group(void *file_under, hid_t under_vol_id, const cha
         hid_t       err_id;
 
         if (seg_len == 0 || seg_len >= sizeof(seg)) {
+            /* HDF5 imposes no such limit of its own, so a legitimate path can
+             * reach this. Say which path and how long, rather than failing the
+             * whole replay with no indication of what was rejected. */
+            char msg[192];
+
+            snprintf(msg, sizeof(msg),
+                     "path component of %llu bytes in \"%s\" is empty or exceeds this connector's "
+                     "%llu-byte limit for a single name",
+                     (unsigned long long)seg_len, abs_path, (unsigned long long)(sizeof(seg) - 1));
+            H5VL_STREAM_ERR(H5VL_stream_err_manifest_g, msg);
+
             if (!cur_is_file)
                 H5VLgroup_close(cur, under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
             return NULL;
@@ -3209,14 +3778,11 @@ H5VL__stream_logical_map_set(H5VL_stream_file_state_t *fs, uint64_t logical_id, 
 static herr_t
 H5VL__stream_path_index_add(H5VL_stream_file_state_t *fs, const char *path, uint64_t physical_step)
 {
-    size_t                     i;
+    size_t                     idx;
     H5VL_stream_path_steps_t *e = NULL;
 
-    for (i = 0; i < fs->n_path_index; i++)
-        if (strcmp(fs->path_index[i].path, path) == 0) {
-            e = &fs->path_index[i];
-            break;
-        }
+    if (0 == H5VL__stream_pathmap_find(&fs->path_index_map, path, &idx))
+        e = &fs->path_index[idx];
 
     if (!e) {
         if (fs->n_path_index == fs->cap_path_index) {
@@ -3229,9 +3795,12 @@ H5VL__stream_path_index_add(H5VL_stream_file_state_t *fs, const char *path, uint
             fs->path_index     = grown;
             fs->cap_path_index = new_cap;
         }
-        e = &fs->path_index[fs->n_path_index++];
+        idx = fs->n_path_index++;
+        e   = &fs->path_index[idx];
         memset(e, 0, sizeof(*e));
         if (NULL == (e->path = strdup(path)))
+            return -1;
+        if (H5VL__stream_pathmap_set(&fs->path_index_map, path, idx) < 0)
             return -1;
     }
 
@@ -3263,18 +3832,17 @@ static herr_t
 H5VL__stream_path_index_resolve(H5VL_stream_file_state_t *fs, const char *path, uint64_t current_step,
                                  uint64_t *resolved_step)
 {
-    size_t i, j;
+    size_t                     i, j;
+    H5VL_stream_path_steps_t *e;
 
-    for (i = 0; i < fs->n_path_index; i++)
-        if (strcmp(fs->path_index[i].path, path) == 0) {
-            H5VL_stream_path_steps_t *e = &fs->path_index[i];
+    if (0 != H5VL__stream_pathmap_find(&fs->path_index_map, path, &i))
+        return -1;
 
-            for (j = e->n_steps; j-- > 0;)
-                if (e->steps[j] <= current_step) {
-                    *resolved_step = e->steps[j];
-                    return 0;
-                }
-            return -1;
+    e = &fs->path_index[i];
+    for (j = e->n_steps; j-- > 0;)
+        if (e->steps[j] <= current_step) {
+            *resolved_step = e->steps[j];
+            return 0;
         }
 
     return -1;
@@ -3349,6 +3917,9 @@ H5VL__stream_reader_index_one_step(H5VL_stream_file_state_t *fs, size_t p)
     vs_Step_table_t    step;
     herr_t             ret_value = -1;
 
+    if (!H5VL__stream_file_under(fs))
+        return -1;
+
     snprintf(path, sizeof(path), "/step/%zu/.manifest", p);
 
     memset(&loc_params, 0, sizeof(loc_params));
@@ -3356,7 +3927,7 @@ H5VL__stream_reader_index_one_step(H5VL_stream_file_state_t *fs, size_t p)
     loc_params.type     = H5VL_OBJECT_BY_SELF; /* ignored by dataset_open; name
                                                  * does all the work */
 
-    if (NULL == (mds = H5VLdataset_open(fs->file_under_object, &loc_params, fs->file_under_vol_id, path,
+    if (NULL == (mds = H5VLdataset_open(H5VL__stream_file_under(fs), &loc_params, fs->file_under_vol_id, path,
                                          H5P_DATASET_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL)))
         return -1;
 
@@ -3459,6 +4030,9 @@ H5VL__stream_reader_build_index(H5VL_stream_file_state_t *fs)
     hsize_t                       idx = 0;
     size_t                        p;
 
+    if (!H5VL__stream_file_under(fs))
+        return -1;
+
     memset(&coll, 0, sizeof(coll));
     memset(&loc_params, 0, sizeof(loc_params));
     loc_params.obj_type                     = H5I_FILE;
@@ -3486,7 +4060,7 @@ H5VL__stream_reader_build_index(H5VL_stream_file_state_t *fs)
         H5Eget_auto2(H5E_DEFAULT, &old_func, &old_data);
         H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
         err_id = H5Eget_current_stack();
-        r = H5VLlink_specific(fs->file_under_object, &loc_params, fs->file_under_vol_id, &largs,
+        r = H5VLlink_specific(H5VL__stream_file_under(fs), &loc_params, fs->file_under_vol_id, &largs,
                                H5P_DATASET_XFER_DEFAULT, NULL);
         H5Eset_current_stack(err_id);
         H5Eset_auto2(H5E_DEFAULT, old_func, old_data);
@@ -3588,6 +4162,16 @@ H5VL__stream_reader_open_dataset(H5VL_stream_t *o, const char *name, hid_t dapl_
     H5VL_stream_t             *dset;
     H5VL_loc_params_t          loc_params;
 
+    /* Resolution routes through the file root, which is gone once the file
+     * wrapper closed -- see H5VL__stream_file_under(). */
+    if (!H5VL__stream_file_under(fs)) {
+        H5VL_STREAM_ERR(H5VL_stream_err_step_g,
+                        "cannot resolve an object against a step: the file has been closed, and a "
+                        "reader resolves every open through the file root rather than through the "
+                        "handle it was asked on");
+        return NULL;
+    }
+
     if (NULL == (abs_path = H5VL__stream_child_path(o->path, name)))
         return NULL;
 
@@ -3607,7 +4191,7 @@ H5VL__stream_reader_open_dataset(H5VL_stream_t *o, const char *name, hid_t dapl_
     loc_params.obj_type = H5I_FILE;
     loc_params.type     = H5VL_OBJECT_BY_SELF;
 
-    under = H5VLdataset_open(fs->file_under_object, &loc_params, fs->file_under_vol_id, resolved, dapl_id,
+    under = H5VLdataset_open(H5VL__stream_file_under(fs), &loc_params, fs->file_under_vol_id, resolved, dapl_id,
                               dxpl_id, req);
     free(resolved);
     if (!under) {
@@ -3663,6 +4247,13 @@ H5VL__stream_reader_open_attr(H5VL_stream_t *o, const char *name, hid_t aapl_id,
     H5VL_stream_t             *attr;
     H5VL_loc_params_t          loc_params;
 
+    /* Same file-root routing as the dataset path above. */
+    if (!H5VL__stream_file_under(fs)) {
+        H5VL_STREAM_ERR(H5VL_stream_err_step_g,
+                        "cannot resolve an attribute against a step: the file has been closed");
+        return NULL;
+    }
+
     if (NULL == (abs_path = H5VL__stream_attr_path(o->path, name)))
         return NULL;
 
@@ -3687,7 +4278,7 @@ H5VL__stream_reader_open_attr(H5VL_stream_t *o, const char *name, hid_t aapl_id,
     loc_params.loc_data.loc_by_name.name    = full_parent;
     loc_params.loc_data.loc_by_name.lapl_id = H5P_LINK_ACCESS_DEFAULT;
 
-    under = H5VLattr_open(fs->file_under_object, &loc_params, fs->file_under_vol_id, at + 1, aapl_id, dxpl_id,
+    under = H5VLattr_open(H5VL__stream_file_under(fs), &loc_params, fs->file_under_vol_id, at + 1, aapl_id, dxpl_id,
                           req);
     free(full_parent);
     if (!under) {
@@ -3731,7 +4322,8 @@ H5VL__stream_reader_open_attr(H5VL_stream_t *o, const char *name, hid_t aapl_id,
  */
 static herr_t
 H5VL__stream_build_manifest(H5VL_stream_file_state_t *fs, uint8_t **out_manifest_buf,
-                              size_t *out_manifest_len, uint8_t **out_payload_buf, size_t *out_payload_len)
+                              size_t *out_manifest_len, uint8_t **out_payload_buf, size_t *out_payload_len,
+                              int want_payload_buf)
 {
     flatcc_builder_t B;
     int               builder_ready = 0;
@@ -3789,7 +4381,7 @@ H5VL__stream_build_manifest(H5VL_stream_file_state_t *fs, uint8_t **out_manifest
         if (pe->kind == vs_Kind_DsetWrite) {
             size_t          cached_len = 0;
             const uint8_t *cached     = H5VL__stream_type_cache_lookup(fs->write_type_cache,
-                                                                        fs->n_write_type_cache, pe->path,
+                                                                        &fs->write_type_map, pe->path,
                                                                         &cached_len);
 
             if (cached && cached_len == type_len && (type_len == 0 || 0 == memcmp(cached, type_enc, type_len))) {
@@ -3798,8 +4390,8 @@ H5VL__stream_build_manifest(H5VL_stream_file_state_t *fs, uint8_t **out_manifest
                 type_len = 0;
             }
             else if (H5VL__stream_type_cache_upsert(&fs->write_type_cache, &fs->n_write_type_cache,
-                                                      &fs->cap_write_type_cache, pe->path, type_enc,
-                                                      type_len) < 0) {
+                                                      &fs->cap_write_type_cache, &fs->write_type_map,
+                                                      pe->path, type_enc, type_len) < 0) {
                 free(type_enc);
                 free(space_enc);
                 free(dcpl_enc);
@@ -3808,7 +4400,14 @@ H5VL__stream_build_manifest(H5VL_stream_file_state_t *fs, uint8_t **out_manifest
             }
         }
 
-        if (pe->payload_len > 0) {
+        if (pe->payload_len > 0 && !want_payload_buf) {
+            /* Nobody needs the concatenated copy -- just keep the running
+             * offset so each Entry still records a truthful payload_off, and
+             * let replay read the bytes from the pending entry itself. See
+             * this function's comment. */
+            payload_len += pe->payload_len;
+        }
+        else if (pe->payload_len > 0) {
             if (payload_len + pe->payload_len > payload_cap) {
                 size_t   new_cap = payload_cap ? payload_cap * 2 : 4096;
                 uint8_t *grown;
@@ -4102,6 +4701,109 @@ H5VL__stream_space_flat_runs(hid_t space_id, H5VL_stream_flat_run_t *runs, int m
 } /* end H5VL__stream_space_flat_runs() */
 
 /*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_mem_sel_is_packed
+ *
+ * Purpose:     Whether mem_space selects exactly "the first n_elem elements,
+ *              contiguous from the buffer's start" -- the one shape a plain
+ *              memcpy out of the caller's buffer already captures correctly.
+ *
+ *              H5S_ALL and a simple dataspace with no selection applied are
+ *              the common cases and both answer yes, so the ordinary capture
+ *              path stays a single memcpy with no decomposition work.
+ *
+ * Return:      Non-zero if packed, 0 if it must be gathered (or cannot be
+ *              described, which the caller treats the same way).
+ *-------------------------------------------------------------------------
+ */
+static int
+H5VL__stream_mem_sel_is_packed(hid_t mem_space, size_t n_elem)
+{
+    H5VL_stream_flat_run_t run;
+
+    if (mem_space == H5S_ALL)
+        return 1;
+    if (H5Sget_select_type(mem_space) == H5S_SEL_ALL)
+        return 1;
+    if (H5VL__stream_space_flat_runs(mem_space, &run, 1) != 1)
+        return 0;
+
+    return (run.start == 0 && run.count == (uint64_t)n_elem);
+} /* end H5VL__stream_mem_sel_is_packed() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_gather_mem
+ *
+ * Purpose:     Pack the elements mem_space selects out of buf into out, in
+ *              HDF5's own row-major element order -- which is exactly the
+ *              order replay hands them back, since replay writes through a
+ *              simple n_elem-element memory space (see
+ *              H5VL__stream_replay_manifest()'s DsetWrite branch).
+ *
+ *              The capture path used to memcpy the leading n_elem elements
+ *              unconditionally, never reading mem_space_id at all. That is
+ *              right only for a memory selection that IS the leading n_elem
+ *              elements -- which every test in the suite happened to build
+ *              (H5Screate_simple() sized to match the file selection, no
+ *              selection applied), and which the ordinary ghosted-array idiom
+ *              -- a large buffer with a hyperslab over its interior, how
+ *              every stencil code hands HDF5 its data -- is not. Against that
+ *              idiom the connector captured the halo instead of the data and
+ *              returned success: an 8-element dataset written from offset 4
+ *              of a 16-element buffer replayed as elements 0..7. The same
+ *              write produced correct bytes unbracketed and wrong bytes
+ *              inside a step, which inverts M1's own byte-identity promise --
+ *              bracketing the write was what corrupted it. Found by writing
+ *              the ghosted-array case, not by reading the code.
+ *
+ *              A selection this cannot describe run by run (point or
+ *              irregular selections, or more runs than the cap) fails rather
+ *              than falling back to the old memcpy. That inverts the routing
+ *              code's over-send-rather-than-under-send rule, deliberately:
+ *              over-sending on the wire is inefficiency a subscriber absorbs,
+ *              but guessing here writes wrong values into the file, where
+ *              nothing downstream can detect or undo it.
+ *
+ * Return:      Success:    0, with n_elem elements packed into out
+ *              Failure:    -1 (out is left partially written; every caller
+ *                          discards the whole pending entry on failure)
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_gather_mem(const void *buf, hid_t mem_space, size_t elem_size, size_t n_elem, uint8_t *out)
+{
+    H5VL_stream_flat_run_t runs[H5VL_STREAM_MAX_PUSH_RUNS];
+    int                    n_runs, r;
+    size_t                 done = 0;
+
+    if (!buf || !out || elem_size == 0)
+        return -1;
+
+    /* The packed case, unchanged from before this function existed. */
+    if (H5VL__stream_mem_sel_is_packed(mem_space, n_elem)) {
+        memcpy(out, buf, n_elem * elem_size);
+        return 0;
+    }
+
+    if ((n_runs = H5VL__stream_space_flat_runs(mem_space, runs, H5VL_STREAM_MAX_PUSH_RUNS)) < 0)
+        return -1;
+
+    for (r = 0; r < n_runs; r++) {
+        /* The memory and file selections must agree on element count -- HDF5
+         * enforces that for the write itself, so a mismatch here means the
+         * two spaces were resolved inconsistently rather than that the caller
+         * erred. Refuse either way. */
+        if (done + (size_t)runs[r].count > n_elem)
+            return -1;
+
+        memcpy(out + done * elem_size, (const uint8_t *)buf + (size_t)runs[r].start * elem_size,
+               (size_t)runs[r].count * elem_size);
+        done += (size_t)runs[r].count;
+    }
+
+    return (done == n_elem) ? 0 : -1;
+} /* end H5VL__stream_gather_mem() */
+
+/*-------------------------------------------------------------------------
  * Function:    H5VL__stream_replay_manifest
  *
  * Purpose:     The M2 core (M7: the second half of what was
@@ -4210,11 +4912,19 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
             H5get_libversion(&cur_maj, &cur_minor, &cur_rel);
 
             if (written_ver / 1000u != ((uint32_t)cur_maj * 1000u + (uint32_t)cur_minor)) {
-                fprintf(stderr,
-                        "vol-stream: manifest was written by HDF5 %u.%u.x, this process is running HDF5 "
-                        "%u.%u.%u -- refusing to decode (H5Tdecode2()/H5Sdecode() compatibility is not "
-                        "guaranteed across a minor version change; see docs/dev-plan.md's residual risks)\n",
-                        written_ver / 1000000u, (written_ver / 1000u) % 1000u, cur_maj, cur_minor, cur_rel);
+                char msg[256];
+
+                /* Reported through the error stack rather than stderr. A
+                 * library writing to the application's stderr is bad enough
+                 * on its own; in an MPI job it multiplies by rank count, and
+                 * it is invisible to a caller that inspects H5Eprint(). */
+                snprintf(msg, sizeof(msg),
+                         "manifest was written by HDF5 %u.%u.x but this process is running HDF5 %u.%u.%u "
+                         "-- refusing to decode, since H5Tdecode2()/H5Sdecode() compatibility is not "
+                         "guaranteed across a minor version change",
+                         written_ver / 1000000u, (written_ver / 1000u) % 1000u, cur_maj, cur_minor,
+                         cur_rel);
+                H5VL_STREAM_ERR(H5VL_stream_err_manifest_g, msg);
                 ret_value = -1;
                 goto done;
             }
@@ -4254,6 +4964,40 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
             const uint8_t           *type_enc_ptr = type_enc;
             size_t                   type_enc_actual_len = flatbuffers_uint8_vec_len(type_enc);
 
+            /* Where this entry's bytes live. Normally the concatenated
+             * payload buffer at poff -- but H5VL__stream_build_manifest() is
+             * allowed to skip building that when nothing will read it (see
+             * H5VL__stream_replay_step()), in which case the bytes are still
+             * right there in the pending entry this manifest was just built
+             * from. Same bytes either way; one fewer full-size copy. */
+            const uint8_t *entry_payload = NULL;
+
+            if (payload_buf)
+                entry_payload = payload_buf + poff;
+            else if (pending_for_wiring && i < n_pending_for_wiring)
+                entry_payload = pending_for_wiring[i].payload;
+
+            /* Every payload slice must lie inside the payload buffer the
+             * step declares. The manifest's own payload_bytes total is what
+             * sizes that buffer, so an entry naming a range beyond it reads
+             * past the end. Cannot happen for a manifest this process just
+             * built, but this same function also replays manifests recovered
+             * from BAKE (H5VL__stream_drain_spill()), and "do not trust
+             * blindly" is the rule that path already follows for its own
+             * length header. */
+            if (plen > 0 && payload_buf && (poff > payload_len || plen > payload_len - poff)) {
+                ret_value = -1;
+                goto done;
+            }
+            /* An entry with payload but no reachable bytes at all is a
+             * programming error here, not a malformed manifest: it means a
+             * caller asked for the concatenated buffer to be skipped without
+             * supplying the pending entries to read instead. */
+            if (plen > 0 && !entry_payload) {
+                ret_value = -1;
+                goto done;
+            }
+
             /* H5VL__stream_type_cache_lookup()'s comment: a DsetWrite entry
              * with an empty type_enc means the writer omitted it because it
              * was identical to the last one sent for this path -- resolve
@@ -4263,7 +5007,7 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
              * here -- see this function's own comment on why "reader" does
              * not mean a separate process for this call). */
             if (kind == vs_Kind_DsetWrite && type_enc_actual_len == 0) {
-                type_enc_ptr = H5VL__stream_type_cache_lookup(fs->replay_type_cache, fs->n_replay_type_cache,
+                type_enc_ptr = H5VL__stream_type_cache_lookup(fs->replay_type_cache, &fs->replay_type_map,
                                                                 path, &type_enc_actual_len);
                 if (!type_enc_ptr) {
                     ret_value = -1;
@@ -4294,8 +5038,8 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
 
             if (kind == vs_Kind_DsetWrite && flatbuffers_uint8_vec_len(type_enc) > 0 &&
                 H5VL__stream_type_cache_upsert(&fs->replay_type_cache, &fs->n_replay_type_cache,
-                                                 &fs->cap_replay_type_cache, path, type_enc,
-                                                 flatbuffers_uint8_vec_len(type_enc)) < 0) {
+                                                 &fs->cap_replay_type_cache, &fs->replay_type_map, path,
+                                                 type_enc, flatbuffers_uint8_vec_len(type_enc)) < 0) {
                 H5Tclose(dtype);
                 H5Sclose(dspace);
                 ret_value = -1;
@@ -4423,7 +5167,7 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                 }
 
                 {
-                    const void *payload_ptr = payload_buf + poff;
+                    const void *payload_ptr = entry_payload;
                     int         vl_kind     = H5VL__stream_type_vl_kind(dtype);
                     void       *vl_buf      = NULL;
                     herr_t      w;
@@ -4433,7 +5177,7 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                      * rebuild real hvl_t/char* values pointing at fresh
                      * allocations before handing it to the under connector. */
                     if (vl_kind != H5VL_STREAM_VL_NONE) {
-                        if (H5VL__stream_vl_deserialize(payload_buf + poff, (size_t)plen, (size_t)n_elem,
+                        if (H5VL__stream_vl_deserialize(entry_payload, (size_t)plen, (size_t)n_elem,
                                                         dtype, vl_kind, &vl_buf) < 0) {
                             H5Sclose(mem_space);
                             H5Tclose(dtype);
@@ -4700,7 +5444,7 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                 }
 
                 if (plen > 0) {
-                    const void *payload_ptr = payload_buf + poff;
+                    const void *payload_ptr = entry_payload;
                     int         vl_kind     = H5VL__stream_type_vl_kind(dtype);
                     void       *vl_buf      = NULL;
                     hssize_t    a_nelem     = H5Sget_select_npoints(dspace);
@@ -4709,7 +5453,7 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                     /* Same as the DsetWrite path: a VL entry's payload is the
                      * deep-serialized form, not writable elements. */
                     if (vl_kind != H5VL_STREAM_VL_NONE && a_nelem > 0) {
-                        if (H5VL__stream_vl_deserialize(payload_buf + poff, (size_t)plen, (size_t)a_nelem,
+                        if (H5VL__stream_vl_deserialize(entry_payload, (size_t)plen, (size_t)a_nelem,
                                                         dtype, vl_kind, &vl_buf) < 0) {
                             H5VLattr_close(attr, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
                             H5Tclose(dtype);
@@ -4851,7 +5595,7 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
             H5Sclose(space);
         }
 
-        {
+        if (H5VL__stream_stage_payload()) {
             hsize_t dims[1] = {(hsize_t)payload_len};
             hid_t   space   = H5Screate_simple(1, dims, NULL);
             hid_t   pdcpl   = H5P_DATASET_CREATE_DEFAULT;
@@ -4948,7 +5692,14 @@ H5VL__stream_replay_step(H5VL_stream_t *file_obj)
     size_t                     payload_len  = 0;
     herr_t                     ret_value;
 
-    if (H5VL__stream_build_manifest(fs, &manifest_buf, &manifest_len, &payload_buf, &payload_len) < 0)
+    /* The concatenated payload buffer is only worth building when something
+     * will actually read it: the .payload staging dataset. Replay itself does
+     * not need it here, because it is handed fs->pending and can read each
+     * entry's own bytes. Skipping it removes one full-size copy of the step's
+     * data, in both time and peak memory -- measured at ~6ms of a 33ms
+     * end_step for a 64MB step (see H5VL__stream_build_manifest()). */
+    if (H5VL__stream_build_manifest(fs, &manifest_buf, &manifest_len, &payload_buf, &payload_len,
+                                      H5VL__stream_stage_payload()) < 0)
         return -1;
 
     ret_value = H5VL__stream_replay_manifest(file_obj, manifest_buf, manifest_len, payload_buf, fs->pending,
@@ -5991,7 +6742,8 @@ H5VL__stream_spill_step(H5VL_stream_t *file_obj)
     if (!fs->spill_bake)
         return -1;
 
-    if (H5VL__stream_build_manifest(fs, &manifest_buf, &manifest_len, &payload_buf, &payload_len) < 0)
+    /* Spill stores the bytes, so here the concatenated buffer IS the point. */
+    if (H5VL__stream_build_manifest(fs, &manifest_buf, &manifest_len, &payload_buf, &payload_len, 1) < 0)
         return -1;
 
     /* [0..8): manifest_len, [8..16): payload_len, then manifest bytes, then
@@ -6097,7 +6849,16 @@ H5VL__stream_drain_spill(H5VL_stream_t *file_obj, uint64_t min_acked_step)
             memcpy(&mlen, buf, 8);
             memcpy(&plen, (const uint8_t *)buf + 8, 8);
 
+            /* Verified, not just length-checked. These bytes came back from
+             * BAKE -- durable storage outside this process's address space --
+             * which is exactly the distinction the file header draws when it
+             * says a manifest from durable storage gets the generated
+             * verifier while a just-built buffer does not.
+             * H5VL__stream_reader_index_one_step() already honors that rule;
+             * this path did not, and handed unverified bytes straight to
+             * vs_Step_as_root(). */
             if (e->size != 16 + mlen + plen ||
+                vs_Step_verify_as_root((const uint8_t *)buf + 16, (size_t)mlen) != 0 ||
                 H5VL__stream_replay_manifest(file_obj, (const uint8_t *)buf + 16, (size_t)mlen,
                                                (const uint8_t *)buf + 16 + mlen, NULL, 0) < 0) {
                 free(buf);
@@ -6121,6 +6882,176 @@ H5VL__stream_drain_spill(H5VL_stream_t *file_obj, uint64_t min_acked_step)
     return ret_value;
 } /* end H5VL__stream_drain_spill() */
 #endif /* VOL_STREAM_HAVE_BAKE */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_has_comm
+ *
+ * Purpose:     Whether this file is a parallel (MPI) writer, answerable
+ *              without every caller having to spell out the H5_HAVE_PARALLEL
+ *              guard. Always 0 in a serial HDF5 build.
+ *-------------------------------------------------------------------------
+ */
+static int
+H5VL__stream_has_comm(H5VL_stream_file_state_t *fs)
+{
+#ifdef H5_HAVE_PARALLEL
+    return fs->has_comm;
+#else
+    (void)fs;
+    return 0;
+#endif
+} /* end H5VL__stream_has_comm() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_warn_once
+ *
+ * Purpose:     Push a diagnostic the first time a condition is hit on this
+ *              file and stay quiet afterwards. For conditions that recur
+ *              every step -- a policy degrading to another -- where saying it
+ *              once is information and saying it a thousand times is noise.
+ *-------------------------------------------------------------------------
+ */
+static void
+H5VL__stream_warn_once(int *flag, hid_t minor, const char *msg)
+{
+    if (*flag)
+        return;
+    *flag = 1;
+    H5VL_STREAM_ERR(minor, msg);
+} /* end H5VL__stream_warn_once() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_queue_lag_view
+ *
+ * Purpose:     How far behind the furthest-behind tracked reader is, as a
+ *              value every rank of a parallel writer agrees on.
+ *
+ *              A reader subscribes and acks to exactly one writer rank -- the
+ *              one it found by probing group members (see
+ *              vs_tr_reader_ack_step()) -- so each rank's lag table covers a
+ *              different, disjoint subset of readers.
+ *              vs_tr_writer_min_acked_step() therefore answers a purely local
+ *              question, and using it directly to drive a collective decision
+ *              is wrong twice over: a rank with no tracked reader would see
+ *              no pressure and replay while its peers blocked, and the
+ *              "furthest behind reader" would be computed per rank rather
+ *              than over the group.
+ *
+ *              The reduction is the obvious one. "Is anyone tracked at all"
+ *              is a logical OR; the group's furthest-behind step is the MIN
+ *              over the ranks that have one, with untracked ranks
+ *              contributing UINT64_MAX so they do not drag the minimum down.
+ *
+ *              This is the piece M7 was missing, and the reason end_step()
+ *              used to skip the whole queue-policy path for a parallel
+ *              writer: without it, backpressure was available only to the
+ *              serial case -- which is precisely the case that does not need
+ *              it.
+ *
+ * Return:      1 with *out_min set if at least one reader is tracked anywhere
+ *              in the communicator, 0 if none is (no pressure).
+ *-------------------------------------------------------------------------
+ */
+static int
+H5VL__stream_queue_lag_view(H5VL_stream_file_state_t *fs, uint64_t *out_min)
+{
+    uint64_t local_min = UINT64_MAX;
+    int      local_have;
+
+    local_have = vs_tr_writer_min_acked_step(fs->transport, &local_min);
+    if (!local_have)
+        local_min = UINT64_MAX;
+
+#ifdef H5_HAVE_PARALLEL
+    if (fs->has_comm) {
+        unsigned long long send = (unsigned long long)local_min, recv = 0;
+        int                have_send = local_have, have_recv = 0;
+
+        if (MPI_SUCCESS !=
+            MPI_Allreduce(&send, &recv, 1, MPI_UNSIGNED_LONG_LONG, MPI_MIN, fs->comm))
+            return 0; /* cannot agree -- treat as no pressure rather than diverge */
+        if (MPI_SUCCESS != MPI_Allreduce(&have_send, &have_recv, 1, MPI_INT, MPI_LOR, fs->comm))
+            return 0;
+
+        if (!have_recv)
+            return 0;
+
+        *out_min = (uint64_t)recv;
+        return 1;
+    }
+#endif
+
+    if (!local_have)
+        return 0;
+
+    *out_min = local_min;
+    return 1;
+} /* end H5VL__stream_queue_lag_view() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_queue_agree_or
+ *
+ * Purpose:     Logical OR of a local predicate across the communicator, so a
+ *              decision that must be unanimous actually is. Returns the local
+ *              value unchanged for a serial writer.
+ *-------------------------------------------------------------------------
+ */
+static int
+H5VL__stream_queue_agree_or(H5VL_stream_file_state_t *fs, int local)
+{
+#ifdef H5_HAVE_PARALLEL
+    if (fs->has_comm) {
+        int global = 0;
+
+        if (MPI_SUCCESS != MPI_Allreduce(&local, &global, 1, MPI_INT, MPI_LOR, fs->comm))
+            return 1; /* cannot agree -- take the conservative branch everywhere */
+        return global;
+    }
+#else
+    (void)fs;
+#endif
+    return local;
+} /* end H5VL__stream_queue_agree_or() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_queue_agree_and
+ *
+ * Purpose:     Logical AND of a local predicate across the communicator.
+ *
+ *              Used for exactly one thing, and it is load-bearing: deciding
+ *              whether the queue-policy region runs at all. That region
+ *              contains collectives, so every rank has to enter it or none
+ *              can -- and the natural local test, "is a policy set and did
+ *              this rank's transport come up", is not uniform.
+ *              H5VL__stream_transport_start_writer() is explicitly
+ *              best-effort and leaves fs->transport NULL on failure without
+ *              failing the file open, so one rank losing its transport is a
+ *              supported state. Branching on it per rank would leave that
+ *              rank skipping an MPI_Allreduce its peers are already blocked
+ *              in: a hang, not a wrong answer.
+ *
+ *              AND rather than OR because the conservative direction here is
+ *              "no policy": a rank with no transport cannot evaluate reader
+ *              lag at all, so the group cannot meaningfully apply
+ *              backpressure and should fall through to the ordinary replay.
+ *-------------------------------------------------------------------------
+ */
+static int
+H5VL__stream_queue_agree_and(H5VL_stream_file_state_t *fs, int local)
+{
+#ifdef H5_HAVE_PARALLEL
+    if (fs->has_comm) {
+        int global = 0;
+
+        if (MPI_SUCCESS != MPI_Allreduce(&local, &global, 1, MPI_INT, MPI_LAND, fs->comm))
+            return 0; /* cannot agree -- no policy anywhere */
+        return global;
+    }
+#else
+    (void)fs;
+#endif
+    return local;
+} /* end H5VL__stream_queue_agree_and() */
 
 /*-------------------------------------------------------------------------
  * Function:    H5VL__stream_apply_queue_policy
@@ -6160,24 +7091,41 @@ H5VL__stream_drain_spill(H5VL_stream_t *file_obj, uint64_t min_acked_step)
 static herr_t
 H5VL__stream_apply_queue_policy(H5VL_stream_t *file_obj)
 {
-    H5VL_stream_file_state_t *fs = file_obj->file_state;
+    H5VL_stream_file_state_t *fs            = file_obj->file_state;
+    int                       policy_active = 0;
 
 #ifdef VOL_STREAM_HAVE_MERCURY
-    if (fs->queue_policy_set && fs->transport) {
+    policy_active = (fs->queue_policy_set && fs->transport) ? 1 : 0;
+#endif
+
+    /* Unanimous or not at all. Everything under policy_active below contains
+     * collectives, and the local test is NOT uniform across ranks -- a rank
+     * whose transport failed to start (a supported, best-effort outcome; see
+     * H5VL__stream_transport_start_writer()) would otherwise skip an
+     * MPI_Allreduce its peers are already blocked in. Reached by every rank
+     * unconditionally, which is what makes it safe to gate on. */
+    policy_active = H5VL__stream_queue_agree_and(fs, policy_active);
+
+#ifdef VOL_STREAM_HAVE_MERCURY
+    if (policy_active) {
         uint64_t min_acked = 0;
         int       have_lag;
 
 #ifdef VOL_STREAM_HAVE_BAKE
-        if (fs->n_pending_spill > 0) {
+        /* Serial writers only. Spill degrades to Block for a parallel writer
+         * (see below), so a parallel file never has anything queued here --
+         * and this test is per-rank, so entering the collective inside on
+         * some ranks and not others would hang. */
+        if (!H5VL__stream_has_comm(fs) && fs->n_pending_spill > 0) {
             uint64_t drain_to;
 
-            if (!vs_tr_writer_min_acked_step(fs->transport, &drain_to))
+            if (!H5VL__stream_queue_lag_view(fs, &drain_to))
                 drain_to = fs->physical_step; /* nothing tracked -- no pressure, drain everything */
             H5VL__stream_drain_spill(file_obj, drain_to);
         }
 #endif
 
-        have_lag = vs_tr_writer_min_acked_step(fs->transport, &min_acked);
+        have_lag = H5VL__stream_queue_lag_view(fs, &min_acked);
 
         if (have_lag && fs->physical_step > min_acked + fs->reserve_slots) {
             size_t i;
@@ -6189,12 +7137,33 @@ H5VL__stream_apply_queue_policy(H5VL_stream_t *file_obj)
                     break;
                 }
 
+            /* Agreed across the communicator, not decided per rank: this
+             * gates whether the step is spilled/discarded at all, and ranks
+             * disagreeing would leave some replaying a step others dropped.
+             * Any rank holding a placeholder forces everyone onto the full
+             * immediate replay. */
+            has_open_placeholder = H5VL__stream_queue_agree_or(fs, has_open_placeholder);
+
             if (!has_open_placeholder) {
                 if (fs->queue_policy == H5VL_STREAM_QUEUE_DISCARD)
                     return H5VL__stream_discard_step(file_obj);
 
 #ifdef VOL_STREAM_HAVE_BAKE
-                if (fs->queue_policy == H5VL_STREAM_QUEUE_SPILL) {
+                /* Spill stays serial-only, deliberately. A spilled step is
+                 * drained later by H5VL__stream_drain_spill(), which replays
+                 * through H5VL__stream_replay_manifest() directly -- the
+                 * serial path. A parallel writer's step does not go through
+                 * that path at all: it needs the cross-rank aggregation in
+                 * H5VL__stream_replay_step_parallel() (and, with
+                 * VOL_STREAM_CONCENTRATION, the concentrator exchange), all
+                 * of which happen inside the original end_step()'s collective
+                 * window and cannot be reconstructed from one rank's stored
+                 * bytes afterwards. Spilling here would therefore replay a
+                 * heterogeneous step as if every rank had written the same
+                 * objects -- silent data loss on drain rather than a visible
+                 * failure now. Degrade to Block, which is correct for every
+                 * topology, and say so once. */
+                if (fs->queue_policy == H5VL_STREAM_QUEUE_SPILL && !H5VL__stream_has_comm(fs)) {
                     /* H5VL__stream_spill_step() lazily starts fs->spill_bake
                      * on its own on the very first call -- do not pre-check
                      * it here, or that first start never happens at all. */
@@ -6204,6 +7173,12 @@ H5VL__stream_apply_queue_policy(H5VL_stream_t *file_obj)
                      * failed -- fall through to Block rather than silently
                      * lose the step. */
                 }
+                else if (fs->queue_policy == H5VL_STREAM_QUEUE_SPILL)
+                    H5VL__stream_warn_once(&fs->warned_parallel_spill,
+                                           H5VL_stream_err_transport_g,
+                                           "Spill queue policy is not supported for a parallel writer "
+                                           "(draining a spilled step cannot redo the cross-rank "
+                                           "aggregation its replay needs) -- behaving as Block instead");
 #else
                 if (fs->queue_policy == H5VL_STREAM_QUEUE_SPILL)
                     return H5VL__stream_discard_step(file_obj); /* connector built without BAKE */
@@ -6215,21 +7190,60 @@ H5VL__stream_apply_queue_policy(H5VL_stream_t *file_obj)
                  * updating while it sleeps. */
                 {
                     int iter;
+                    int caught_up = 0;
 
                     for (iter = 0; iter < 600; iter++) {
                         uint64_t cur_min;
 
-                        if (!vs_tr_writer_min_acked_step(fs->transport, &cur_min))
-                            break; /* reader departed -- nothing left to wait for */
-                        if (fs->physical_step <= cur_min + fs->reserve_slots)
+                        /* Collective every iteration, not just once before
+                         * the loop. Each rank tracks only the readers that
+                         * acked to *it*, so polling a local view would let
+                         * ranks leave the loop at different iterations -- and
+                         * the rank that left first would then enter the next
+                         * collective (the replay itself) while the others were
+                         * still sleeping here, which is a hang, not a
+                         * performance problem. H5VL__stream_queue_lag_view()
+                         * reduces, so every rank sees the same answer and
+                         * breaks together. */
+                        if (!H5VL__stream_queue_lag_view(fs, &cur_min)) {
+                            caught_up = 1; /* reader departed -- nothing left to wait for */
                             break;
+                        }
+                        if (fs->physical_step <= cur_min + fs->reserve_slots) {
+                            caught_up = 1;
+                            break;
+                        }
                         usleep(100000); /* 100ms */
+                    }
+
+                    /* Giving up and replaying anyway is the right behavior --
+                     * the bound exists so a genuine reader failure cannot hang
+                     * the writer forever -- but it used to be indistinguishable
+                     * from the reader actually catching up. An application
+                     * could not tell whether its backpressure policy was
+                     * working, which is most of the reason to set one. */
+                    if (!caught_up) {
+                        char msg[192];
+
+                        snprintf(msg, sizeof(msg),
+                                 "Block queue policy timed out after 60s waiting for a tracked reader to "
+                                 "reach within %llu steps of step %llu; committing anyway",
+                                 (unsigned long long)fs->reserve_slots,
+                                 (unsigned long long)fs->physical_step);
+                        H5VL_STREAM_ERR(H5VL_stream_err_transport_g, msg);
                     }
                 }
             }
         }
     }
 #endif /* VOL_STREAM_HAVE_MERCURY */
+
+    /* No pressure, or the policy declined to act: the ordinary full replay,
+     * through whichever path this file's topology requires. */
+#ifdef H5_HAVE_PARALLEL
+    if (fs->has_comm)
+        return H5VL__stream_replay_step_parallel(file_obj);
+#endif
 
     return H5VL__stream_replay_step(file_obj);
 } /* end H5VL__stream_apply_queue_policy() */
@@ -6301,6 +7315,9 @@ H5VL_stream_init(hid_t vipl_id)
     /* Shut compiler up about unused parameter */
     (void)vipl_id;
 
+    /* Before anything that can fail, so its own failures are reportable. */
+    H5VL__stream_init_error_class();
+
     /* Register the step operations.  H5VLregister_opt_operation() is public, so
      * a connector can define its own operations with no HDF5 library change.
      * The op values land in file-scope statics that the H5F* wrappers below and
@@ -6351,6 +7368,16 @@ H5VL_stream_term(void)
 #ifdef ENABLE_STREAM_LOGGING
     printf("------- VOL-STREAM TERM\n");
 #endif
+
+    /* The cached connector ID is this connector's, and it is gone now.
+     * H5VL_stream_register() re-validates with H5Iget_type() before trusting
+     * it, so leaving it stale worked -- but that made the invariant live in
+     * the reader rather than here. The error class and the registered
+     * optional operations deliberately stay: both are process-global
+     * registries that outlive one registration, and tearing them down here
+     * would break a concurrent registration still using them (see
+     * H5VL__stream_register_op()'s comment). */
+    H5VL_STREAM_g = H5I_INVALID_HID;
 
     return 0;
 } /* end H5VL_stream_term() */
@@ -6965,11 +7992,21 @@ H5VL_stream_attr_write(void *attr, hid_t mem_type_id, const void *buf, hid_t dxp
          * only valid in this process. Top-level VL is exempt there because
          * it is deep-serialized just below, exactly as on the dataset path. */
         if (H5VL__stream_type_unsafe_to_capture(e->type_id) != 0)
-            return -1;
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_capture_g,
+                                 "attribute datatype cannot be captured into a step: a variable-length "
+                                 "or reference type nested inside a compound or array is not "
+                                 "self-contained",
+                                 -1);
 
         vl_kind = H5VL__stream_type_vl_kind(e->type_id);
         nbytes  = (size_t)n_elem * H5Tget_size(e->type_id);
 
+        /* This entry is mutated in place rather than appended (H5Awrite
+         * overwrites atomically, so there is exactly one Attr entry per
+         * attribute), so the step's byte total has to be adjusted here --
+         * H5VL__stream_pending_append()'s accounting never sees this path.
+         * The replacement is charged below, once its real length is known. */
+        o->file_state->pending_bytes -= e->payload_len;
         free(e->payload);
         e->payload     = NULL;
         e->payload_len = 0;
@@ -7028,6 +8065,10 @@ H5VL_stream_attr_write(void *attr, hid_t mem_type_id, const void *buf, hid_t dxp
                 free(scratch);
             }
         }
+
+        /* Charge the replacement payload to the step's byte total (the old
+         * one was credited back above). */
+        o->file_state->pending_bytes += e->payload_len;
 
         /* M4: same durability-tracking request as the dataset-write deferred
          * path above -- see H5VL__stream_make_deferred_request()'s comment. */
@@ -7375,8 +8416,11 @@ H5VL_stream_dataset_read(size_t count, void *dset[], hid_t mem_type_id[], hid_t 
         obj[i] = ((H5VL_stream_t *)dset[i])->under_object;
 
         /* Make sure the class matches */
-        if (((H5VL_stream_t *)dset[i])->under_vol_id != ((H5VL_stream_t *)dset[0])->under_vol_id)
+        if (((H5VL_stream_t *)dset[i])->under_vol_id != ((H5VL_stream_t *)dset[0])->under_vol_id) {
+            if (obj != &obj_local)
+                free(obj); /* template bug: this path returned without freeing */
             return -1;
+        }
     }
 
     ret_value = H5VLdataset_read(count, obj, ((H5VL_stream_t *)dset[0])->under_vol_id, mem_type_id,
@@ -7596,6 +8640,7 @@ H5VL_stream_dataset_write(size_t count, void *dset[], hid_t mem_type_id[], hid_t
             H5VL_stream_t                *o = (H5VL_stream_t *)dset[i];
             size_t                        create_index;
             hid_t                         resolved_fspace;
+            hid_t                         resolved_mspace;
             hssize_t                      n_elem;
             H5VL_stream_pending_entry_t   write_entry;
             int                           vl_kind;
@@ -7610,6 +8655,14 @@ H5VL_stream_dataset_write(size_t count, void *dset[], hid_t mem_type_id[], hid_t
                 return -1;
             resolved_fspace = H5VL__stream_resolve_space(file_space_id[i],
                                                           o->file_state->pending[create_index].space_id);
+            /* The capture below packs a contiguous run out of buf[i], which is
+             * what the caller asked for only when the MEMORY selection is the
+             * leading n_elem elements. This argument used to be ignored
+             * entirely -- see H5VL__stream_gather_mem() for the silent
+             * corruption that produced and how it was found. H5S_ALL resolves
+             * to the file selection, matching what the under connector would
+             * do with the same pair. */
+            resolved_mspace = H5VL__stream_resolve_space(mem_space_id[i], resolved_fspace);
 
             if ((n_elem = H5Sget_select_npoints(resolved_fspace)) < 0)
                 return -1;
@@ -7634,14 +8687,34 @@ H5VL_stream_dataset_write(size_t count, void *dset[], hid_t mem_type_id[], hid_t
              * instead of memcpy'd. */
             if (H5VL__stream_type_unsafe_to_capture(write_entry.type_id) != 0) {
                 H5VL__stream_pending_entry_clear(&write_entry);
-                return -1;
+                H5VL_STREAM_GOTO_ERR(H5VL_stream_err_capture_g,
+                                     "datatype cannot be captured into a step: a variable-length or "
+                                     "reference type nested inside a compound or array is not "
+                                     "self-contained, and replaying it later would read through pointers "
+                                     "valid only in the writing process",
+                                     -1);
             }
 
             vl_kind = H5VL__stream_type_vl_kind(write_entry.type_id);
 
             if (n_elem > 0 && vl_kind != H5VL_STREAM_VL_NONE) {
                 /* Not self-contained bytes -- follow the pointers now, while
-                 * the application's buffer is still alive. */
+                 * the application's buffer is still alive.
+                 *
+                 * H5VL__stream_vl_serialize() walks the leading n_elem
+                 * elements, so it is only correct for a packed memory
+                 * selection. Gathering a VL buffer would mean following
+                 * pointers in selection order, which that function does not
+                 * do; refuse rather than serialize the wrong elements. Same
+                 * reasoning as H5VL__stream_gather_mem()'s own refuse path. */
+                if (!H5VL__stream_mem_sel_is_packed(resolved_mspace, (size_t)n_elem)) {
+                    H5VL__stream_pending_entry_clear(&write_entry);
+                    H5VL_STREAM_GOTO_ERR(H5VL_stream_err_capture_g,
+                                         "a variable-length write captured into a step needs a packed "
+                                         "memory selection: gathering one would mean following pointers "
+                                         "in selection order, which this connector does not do",
+                                         -1);
+                }
                 if (H5VL__stream_vl_serialize(buf[i], (size_t)n_elem, write_entry.type_id, vl_kind,
                                               &write_entry.payload, &write_entry.payload_len) < 0) {
                     H5VL__stream_pending_entry_clear(&write_entry);
@@ -7656,7 +8729,16 @@ H5VL_stream_dataset_write(size_t count, void *dset[], hid_t mem_type_id[], hid_t
                     H5VL__stream_pending_entry_clear(&write_entry);
                     return -1;
                 }
-                memcpy(write_entry.payload, buf[i], nbytes);
+                if (H5VL__stream_gather_mem(buf[i], resolved_mspace, elem_size, (size_t)n_elem,
+                                            write_entry.payload) < 0) {
+                    H5VL__stream_pending_entry_clear(&write_entry);
+                    H5VL_STREAM_GOTO_ERR(H5VL_stream_err_capture_g,
+                                         "memory selection cannot be gathered into a step: point and "
+                                         "irregular selections, and selections needing more contiguous "
+                                         "runs than the connector's cap, are refused rather than "
+                                         "captured incorrectly",
+                                         -1);
+                }
                 write_entry.payload_len = nbytes;
             }
 
@@ -7688,8 +8770,11 @@ H5VL_stream_dataset_write(size_t count, void *dset[], hid_t mem_type_id[], hid_t
         obj[i] = ((H5VL_stream_t *)dset[i])->under_object;
 
         /* Make sure the class matches */
-        if (((H5VL_stream_t *)dset[i])->under_vol_id != ((H5VL_stream_t *)dset[0])->under_vol_id)
+        if (((H5VL_stream_t *)dset[i])->under_vol_id != ((H5VL_stream_t *)dset[0])->under_vol_id) {
+            if (obj != &obj_local)
+                free(obj); /* template bug: this path returned without freeing */
             return -1;
+        }
     }
 
     ret_value = H5VLdataset_write(count, obj, ((H5VL_stream_t *)dset[0])->under_vol_id, mem_type_id,
@@ -8353,6 +9438,29 @@ H5VL_stream_file_specific(void *file, H5VL_file_specific_args_t *args, hid_t dxp
         new_o = NULL;
     } /* end else-if */
     else {
+        /* H5VL_FILE_FLUSH deliberately does NOT commit an open step.
+         *
+         * The flush forwards below and makes everything already replayed
+         * durable -- but this step's captured entries are still sitting in
+         * fs->pending and are not part of that. So H5Fflush() during a step
+         * succeeds over a file missing everything written since
+         * H5Fbegin_step().
+         *
+         * That is the intended contract rather than an oversight: the step is
+         * this connector's unit of durability and atomicity, and a flush that
+         * committed half of one would publish a state no reader is meant to
+         * observe -- the same reasoning that makes H5Fclose() discard an
+         * unclosed step instead of rescuing it. Failing the call instead was
+         * considered and rejected: H5Fflush() is something library and
+         * framework code calls defensively, and erroring would break callers
+         * doing nothing wrong.
+         *
+         * Documented at H5Fbegin_step() in H5VLstream.h, where a user will
+         * actually meet it. It cannot be expressed through the capability
+         * flags: H5Pget_vol_cap_flags() reports H5VL_CAP_FLAG_FLUSH_REFRESH
+         * inherited from the native connector, which admits no such
+         * qualification. */
+
         /* Keep the correct underlying VOL ID for later */
         under_vol_id = o->under_vol_id;
 
@@ -8462,7 +9570,10 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
          * unclosed one is a bug in the caller rather than something to
          * silently absorb. */
         if (o->file_state->step_state != H5F_STEP_NOT_IN_STEP)
-            return -1;
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g,
+                                 "a step is already open on this file -- steps do not nest; call "
+                                 "H5Fend_step() before opening another",
+                                 -1);
 
         /* Take our own copy of the logical ids -- the caller's array is only
          * required to live for the duration of the call. */
@@ -8487,7 +9598,10 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
         uint64_t committed_step, committed_wall_time_ns;
 
         if (!o->file_state || o->file_state->step_state != H5F_STEP_IN_STEP)
-            return -1;
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g,
+                                 "no step is open on this file -- H5Fend_step() must be preceded by a "
+                                 "matching H5Fbegin_step()",
+                                 -1);
 
         o->file_state->step_state = H5F_STEP_COMMITTING;
 
@@ -8501,25 +9615,17 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
             MPI_Barrier(o->file_state->comm);
 #endif
 
-#ifdef H5_HAVE_PARALLEL
-        /* M6.5: a parallel writer supporting heterogeneous per-rank object
-         * sets needs cross-rank aggregation before it can replay
-         * collectively -- see H5VL__stream_replay_step_parallel()'s
-         * comment. M7's queue policy is not yet integrated with this path
-         * (out of M6.5's own scope, a real gap, not an oversight): a
-         * parallel writer with a policy set still gets this collective
-         * replay unconditionally, the same as if no policy were set at
-         * all. */
-        if (o->file_state->has_comm)
-            replay_ret = H5VL__stream_replay_step_parallel(o);
-        else
-            replay_ret = H5VL__stream_apply_queue_policy(o);
-#else
-        /* M7: a no-op wrapper around H5VL__stream_replay_step() unless a
-         * queue policy was set (H5Fset_stream_queue_policy()) -- see its
-         * comment. */
+        /* M7: a no-op wrapper around the ordinary replay unless a queue
+         * policy was set (H5Fset_stream_queue_policy()) -- see its comment.
+         * It dispatches to the parallel or serial replay itself, so both
+         * topologies get the policy.
+         *
+         * A parallel writer used to bypass this entirely and go straight to
+         * H5VL__stream_replay_step_parallel(), which meant M7's whole
+         * backpressure mechanism existed only for serial writers -- the case
+         * least likely to need it. The missing piece was agreeing the lag
+         * view across ranks; see H5VL__stream_queue_lag_view(). */
         replay_ret = H5VL__stream_apply_queue_policy(o);
-#endif
 
         /* Discard the pending buffer either way: a failed replay may have
          * landed some entries and not others, and there is no partial-step
@@ -8812,6 +9918,22 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
                     *sargs->buf  = decoded;
                     *sargs->size = decoded_len;
                 }
+                else {
+                    /* This used to fall through and hand the caller the raw
+                     * *filtered* bytes while still returning success, which
+                     * breaks H5Fget_subscribed_data()'s documented promise
+                     * that it always returns decoded values -- a caller has
+                     * no way to tell the two apart, so it would read
+                     * compressed bytes as data. Fail instead, and release the
+                     * buffer so the caller does not have to free something it
+                     * never received. */
+                    free(*sargs->buf);
+                    *sargs->buf  = NULL;
+                    *sargs->size = 0;
+                    free(*sargs->path);
+                    *sargs->path = NULL;
+                    r            = -1;
+                }
             }
             free(dcpl_enc);
             free(type_enc);
@@ -8872,8 +9994,18 @@ H5VL_stream_file_close(void *file, hid_t dxpl_id, void **req)
         *req = H5VL_stream_new_obj(*req, o->under_vol_id);
 
     /* Release our wrapper, if underlying file was closed */
-    if (ret_value >= 0)
+    if (ret_value >= 0) {
+        /* End file_state's borrow of this object before the wrapper that owns
+         * it goes away. file_state can outlive the file wrapper -- any child
+         * object still open holds a reference -- and every reader resolution
+         * path routes through that pointer. See H5VL__stream_file_under().
+         * Sequenced before free_obj(), which is what drops the reference that
+         * may free fs outright. */
+        if (o->file_state)
+            o->file_state->file_under_closed = 1;
+
         H5VL_stream_free_obj(o);
+    }
 
     return ret_value;
 } /* end H5VL_stream_file_close() */
@@ -9537,7 +10669,7 @@ H5VL_stream_object_specific(void *obj, const H5VL_loc_params_t *loc_params,
             resolved_params.obj_type                   = H5I_FILE;
             resolved_params.loc_data.loc_by_name.name  = resolved;
 
-            ret_value = H5VLobject_specific(o->file_state->file_under_object, &resolved_params,
+            ret_value = H5VLobject_specific(H5VL__stream_file_under(o->file_state), &resolved_params,
                                             o->file_state->file_under_vol_id, args, dxpl_id, req);
             free(resolved);
 
@@ -9651,8 +10783,12 @@ H5VL_stream_introspect_get_cap_flags(const void *_info, uint64_t *cap_flags)
     }
 
     if (H5Iis_valid(info->under_vol_id) <= 0) {
-        printf("\nH5VLstream.c line %d in %s: not a valid underneath VOL ID for vol-stream\n",
-               __LINE__, __func__);
+        /* Was a printf() to the application's stdout, inherited from the
+         * template. Same reasoning as the version-mismatch diagnostic in
+         * H5VL__stream_replay_manifest(): this belongs on the error stack,
+         * where a caller can actually see it and an MPI job does not get one
+         * copy per rank interleaved into its output. */
+        H5VL_STREAM_ERR(H5VL_stream_err_maj_g, "connector info carries an invalid underlying VOL ID");
         if (default_info)
             H5VL_stream_info_free(default_info);
         return -1;

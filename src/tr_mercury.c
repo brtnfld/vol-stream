@@ -1090,6 +1090,28 @@ vs_tr_writer_broadcast_step_ready(vs_tr_t *tr, uint64_t physical_step, uint64_t 
     return 0;
 }
 
+/* Shared by both reader-wait functions below. Clamps timeout_ms first so a
+ * caller-supplied sentinel meant as "wait indefinitely" (e.g. UINT64_MAX)
+ * cannot carry deadline.tv_sec out of struct timespec's range -- a year is
+ * already far past anything this protocol's own timeouts (RPC forwards are
+ * bounded at 1s each) would ever need to actually wait for. */
+#define VS_TR_MAX_WAIT_TIMEOUT_MS (86400000ULL * 365ULL)
+
+static void
+vs_tr_compute_deadline(uint64_t timeout_ms, struct timespec *deadline)
+{
+    if (timeout_ms > VS_TR_MAX_WAIT_TIMEOUT_MS)
+        timeout_ms = VS_TR_MAX_WAIT_TIMEOUT_MS;
+
+    clock_gettime(CLOCK_REALTIME, deadline);
+    deadline->tv_sec += (time_t)(timeout_ms / 1000);
+    deadline->tv_nsec += (long)((timeout_ms % 1000) * 1000000L);
+    if (deadline->tv_nsec >= 1000000000L) {
+        deadline->tv_sec++;
+        deadline->tv_nsec -= 1000000000L;
+    }
+}
+
 int
 vs_tr_reader_wait_step_ready(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physical_step,
                               uint64_t *wall_time_ns)
@@ -1100,13 +1122,7 @@ vs_tr_reader_wait_step_ready(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physica
     if (!tr)
         return -1;
 
-    clock_gettime(CLOCK_REALTIME, &deadline);
-    deadline.tv_sec += (time_t)(timeout_ms / 1000);
-    deadline.tv_nsec += (long)((timeout_ms % 1000) * 1000000L);
-    if (deadline.tv_nsec >= 1000000000L) {
-        deadline.tv_sec++;
-        deadline.tv_nsec -= 1000000000L;
-    }
+    vs_tr_compute_deadline(timeout_ms, &deadline);
 
     pthread_mutex_lock(&tr->pending_lock);
     while (tr->n_pending == 0 && !tr->stopped) {
@@ -1421,7 +1437,80 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
 
     write_end = write_start + write_count;
 
-    for (i = 0; i < group_size; i++) {
+    /* Snapshot every sub_table entry matching this path in one sub_lock
+     * acquisition, instead of locking/unlocking once per group member below.
+     * The member loop below does real work per iteration -- RPC forwards
+     * with a 1s bound, refiltering -- so holding sub_lock across the whole
+     * loop (a single lock/unlock bracketing it) would serialize any
+     * concurrent subscribe/unsubscribe against that entire duration instead
+     * of against a brief table scan. This keeps the same "copy out, release
+     * before real work" shape the per-member version already used, just
+     * with one lock acquisition instead of up to group_size. */
+    {
+        typedef struct {
+            ssg_member_id_t member_id;
+            uint64_t        sel_start;
+            uint64_t        sel_count;
+            uint8_t        *dcpl_enc;
+            uint64_t        dcpl_enc_len;
+            uint8_t        *pred_enc;
+            uint64_t        pred_enc_len;
+            uint8_t        *space_enc;
+            uint64_t        space_enc_len;
+        } vs_tr_push_sub_snapshot_t;
+
+        vs_tr_push_sub_snapshot_t *snapshot     = NULL;
+        size_t                      n_snapshot   = 0, cap_snapshot = 0;
+        size_t                      si;
+
+        pthread_mutex_lock(&tr->sub_lock);
+        for (si = 0; si < tr->n_sub; si++) {
+            vs_tr_push_sub_snapshot_t *grown;
+
+            if (strcmp(tr->sub_table[si].path, path) != 0)
+                continue;
+
+            if (n_snapshot == cap_snapshot) {
+                size_t new_cap = cap_snapshot ? cap_snapshot * 2 : 8;
+
+                if (NULL == (grown = (vs_tr_push_sub_snapshot_t *)realloc(
+                                 snapshot, new_cap * sizeof(*snapshot))))
+                    break; /* best-effort, same as the rest of this function --
+                            * proceed with whatever was captured so far. */
+                snapshot     = grown;
+                cap_snapshot = new_cap;
+            }
+
+            memset(&snapshot[n_snapshot], 0, sizeof(snapshot[n_snapshot]));
+            snapshot[n_snapshot].member_id = tr->sub_table[si].member_id;
+            snapshot[n_snapshot].sel_start  = tr->sub_table[si].sel_start;
+            snapshot[n_snapshot].sel_count  = tr->sub_table[si].sel_count;
+            if (tr->sub_table[si].dcpl_enc_len > 0 &&
+                NULL != (snapshot[n_snapshot].dcpl_enc =
+                             (uint8_t *)malloc(tr->sub_table[si].dcpl_enc_len))) {
+                memcpy(snapshot[n_snapshot].dcpl_enc, tr->sub_table[si].dcpl_enc,
+                       tr->sub_table[si].dcpl_enc_len);
+                snapshot[n_snapshot].dcpl_enc_len = tr->sub_table[si].dcpl_enc_len;
+            }
+            if (tr->sub_table[si].pred_enc_len > 0 &&
+                NULL != (snapshot[n_snapshot].pred_enc =
+                             (uint8_t *)malloc(tr->sub_table[si].pred_enc_len))) {
+                memcpy(snapshot[n_snapshot].pred_enc, tr->sub_table[si].pred_enc,
+                       tr->sub_table[si].pred_enc_len);
+                snapshot[n_snapshot].pred_enc_len = tr->sub_table[si].pred_enc_len;
+            }
+            if (tr->sub_table[si].space_enc_len > 0 &&
+                NULL != (snapshot[n_snapshot].space_enc =
+                             (uint8_t *)malloc(tr->sub_table[si].space_enc_len))) {
+                memcpy(snapshot[n_snapshot].space_enc, tr->sub_table[si].space_enc,
+                       tr->sub_table[si].space_enc_len);
+                snapshot[n_snapshot].space_enc_len = tr->sub_table[si].space_enc_len;
+            }
+            n_snapshot++;
+        }
+        pthread_mutex_unlock(&tr->sub_lock);
+
+        for (i = 0; i < group_size; i++) {
         ssg_member_id_t member_id;
         hg_addr_t         addr;
         hg_handle_t        handle;
@@ -1437,48 +1526,34 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
         vs_tr_run_t        sel_runs[VS_TR_MAX_PRED_RUNS];
         vs_tr_run_t        runs[VS_TR_MAX_PRED_RUNS];
         int                n_sel = 1, n_runs = 1, sr, r;
+        int                member_unreachable = 0;
 
         if (SSG_SUCCESS != ssg_get_group_member_id_from_rank(tr->group_id, i, &member_id))
             continue;
         if (member_id == self_id)
             continue;
 
-        pthread_mutex_lock(&tr->sub_lock);
-        for (j = 0; j < tr->n_sub; j++)
-            if (tr->sub_table[j].member_id == member_id && strcmp(tr->sub_table[j].path, path) == 0) {
-                sub_start = tr->sub_table[j].sel_start;
+        for (j = 0; j < n_snapshot; j++)
+            if (snapshot[j].member_id == member_id) {
+                sub_start = snapshot[j].sel_start;
                 /* UINT64_MAX sel_count means "whole object" -- keep sub_end
                  * at the UINT64_MAX sentinel too rather than computing
                  * sel_start + sel_count, which would overflow. */
-                sub_end   = (tr->sub_table[j].sel_count == UINT64_MAX) ? UINT64_MAX
-                                                                        : sub_start + tr->sub_table[j].sel_count;
-                /* Copy, not a borrowed pointer: a concurrent re-subscribe
-                 * could free/replace tr->sub_table[j].dcpl_enc after this
-                 * function releases sub_lock below, while the refilter call
-                 * further down (real work -- building a temp dataset,
-                 * writing, reading back) is still using it. */
-                if (tr->sub_table[j].dcpl_enc_len > 0 &&
-                    NULL != (sub_dcpl_enc = (uint8_t *)malloc(tr->sub_table[j].dcpl_enc_len))) {
-                    memcpy(sub_dcpl_enc, tr->sub_table[j].dcpl_enc, tr->sub_table[j].dcpl_enc_len);
-                    sub_dcpl_enc_len = tr->sub_table[j].dcpl_enc_len;
-                }
-                /* M9: copied for the same reason as dcpl_enc above -- the
-                 * predicate call below is real work (decoding types,
-                 * scanning every element) done outside sub_lock. */
-                if (tr->sub_table[j].pred_enc_len > 0 &&
-                    NULL != (sub_pred_enc = (uint8_t *)malloc(tr->sub_table[j].pred_enc_len))) {
-                    memcpy(sub_pred_enc, tr->sub_table[j].pred_enc, tr->sub_table[j].pred_enc_len);
-                    sub_pred_enc_len = tr->sub_table[j].pred_enc_len;
-                }
-                if (tr->sub_table[j].space_enc_len > 0 &&
-                    NULL != (sub_space_enc = (uint8_t *)malloc(tr->sub_table[j].space_enc_len))) {
-                    memcpy(sub_space_enc, tr->sub_table[j].space_enc, tr->sub_table[j].space_enc_len);
-                    sub_space_enc_len = tr->sub_table[j].space_enc_len;
-                }
+                sub_end   = (snapshot[j].sel_count == UINT64_MAX) ? UINT64_MAX
+                                                                    : sub_start + snapshot[j].sel_count;
+                /* Take ownership out of the snapshot rather than copying
+                 * again -- sub_table has at most one entry per (member_id,
+                 * path) pair, so this slot is never matched a second time. */
+                sub_dcpl_enc      = snapshot[j].dcpl_enc;
+                sub_dcpl_enc_len  = snapshot[j].dcpl_enc_len;
+                sub_pred_enc      = snapshot[j].pred_enc;
+                sub_pred_enc_len  = snapshot[j].pred_enc_len;
+                sub_space_enc     = snapshot[j].space_enc;
+                sub_space_enc_len = snapshot[j].space_enc_len;
+                snapshot[j].dcpl_enc = snapshot[j].pred_enc = snapshot[j].space_enc = NULL;
                 subscribed = 1;
                 break;
             }
-        pthread_mutex_unlock(&tr->sub_lock);
 
         if (!subscribed)
             continue;
@@ -1626,7 +1701,36 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
             }
 
             /* Same bounded, best-effort forward as vs_tr_writer_broadcast_step_ready() --
-             * a stalled or gone subscriber must not stall the writer. */
+             * a stalled or gone subscriber must not stall the writer.
+             *
+             * The per-RPC timeout bounds one push, not one write: a write goes
+             * out as one RPC per contiguous run (up to VS_TR_MAX_PRED_RUNS,
+             * and again per selection run), so nothing here structurally
+             * stopped an unreachable member from being charged the full
+             * timeout once per run. Giving up on that member after its first
+             * timeout makes the per-write bound explicit -- one timeout, not
+             * one per run.
+             *
+             * Measured, and the measurement is worth recording because it
+             * contradicts the obvious assumption: it did NOT cost a timeout
+             * per run beforehand. A 128-run write to an unreachable member
+             * took ~1.00s both with and without this guard, because Mercury
+             * itself stops retrying an address that has already timed out, so
+             * every later forward fails immediately. This guard therefore
+             * changes no number measured here.
+             *
+             * Kept anyway, as a bound this module owns rather than one it
+             * borrows. That fast-fail is Mercury's internal behavior observed
+             * on one provider (na+sm) in one failure mode, not a documented
+             * guarantee across providers or versions, and the cost if it ever
+             * differs is a multi-minute stall inside H5Fend_step() -- a poor
+             * thing to discover in production. For scale: a healthy push
+             * costs ~20us, so one timeout already costs ~50,000x the work it
+             * guards.
+             *
+             * The next write retries the member from scratch, and SSG's
+             * failure detector is what eventually removes it from the group,
+             * so nothing a later push would have delivered is lost. */
             if (HG_SUCCESS == margo_create(tr->mid, addr, tr->data_push_rpc_id, &handle)) {
                 if (HG_SUCCESS == margo_forward_timed(handle, &in, 1000.0)) {
                     vs_data_push_out_t out;
@@ -1634,14 +1738,38 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
                     if (HG_SUCCESS == margo_get_output(handle, &out))
                         margo_free_output(handle, &out);
                 }
+                else
+                    member_unreachable = 1;
                 margo_destroy(handle);
             }
+            else
+                member_unreachable = 1;
+
             free(filtered_buf);
+
+            if (member_unreachable)
+                break;
         }
+        if (member_unreachable)
+            break;
         } /* end per-selection-run loop */
         margo_addr_free(tr->mid, addr);
         free(sub_dcpl_enc);
         free(sub_pred_enc);
+        }
+
+        /* Whatever wasn't matched to a member above (e.g. a subscriber SSG
+         * has since dropped from the group) still owns its own copies. */
+        {
+            size_t k;
+
+            for (k = 0; k < n_snapshot; k++) {
+                free(snapshot[k].dcpl_enc);
+                free(snapshot[k].pred_enc);
+                free(snapshot[k].space_enc);
+            }
+            free(snapshot);
+        }
     }
 
     return 0;
@@ -1659,13 +1787,7 @@ vs_tr_reader_wait_data(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physical_step
     if (!tr)
         return -1;
 
-    clock_gettime(CLOCK_REALTIME, &deadline);
-    deadline.tv_sec += (time_t)(timeout_ms / 1000);
-    deadline.tv_nsec += (long)((timeout_ms % 1000) * 1000000L);
-    if (deadline.tv_nsec >= 1000000000L) {
-        deadline.tv_sec++;
-        deadline.tv_nsec -= 1000000000L;
-    }
+    vs_tr_compute_deadline(timeout_ms, &deadline);
 
     pthread_mutex_lock(&tr->data_lock);
     while (tr->n_data == 0 && !tr->stopped) {

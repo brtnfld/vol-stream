@@ -39,6 +39,8 @@ READER_RANKS=2
 PER_RANK=4
 OUTDIR="./parallel-test-results"
 CONCENTRATION=0
+# Queue policy to set on the parallel writer ("" = none). See t_parallel.c.
+QUEUE_POLICY=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -50,6 +52,7 @@ while [[ $# -gt 0 ]]; do
         --per-rank)     PER_RANK="$2"; shift 2 ;;
         --outdir)       OUTDIR="$2"; shift 2 ;;
         --concentration) CONCENTRATION="$2"; shift 2 ;;
+        --queue-policy) QUEUE_POLICY="$2"; shift 2 ;;
         -h|--help)      sed -n '2,24p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -127,11 +130,13 @@ echo "== write ($WRITER_RANKS ranks) =="
 write_log="$(mktemp)"
 if [[ "$CONCENTRATION" -gt 1 ]]; then
     HDF5_PLUGIN_PATH="$PLUGIN_DIR" VOL_STREAM_CONCENTRATION="$CONCENTRATION" \
+        VOL_STREAM_TEST_QUEUE_POLICY="$QUEUE_POLICY" \
         "$MPIRUN" "${MPI_EXTRA_ARGS[@]}" -n "$WRITER_RANKS" "$BIN" write \
         t_parallel.h5 "$GLOBAL_SIZE" 2>&1 | tee "$write_log"
     write_rc=${PIPESTATUS[0]}
 else
-    HDF5_PLUGIN_PATH="$PLUGIN_DIR" "$MPIRUN" "${MPI_EXTRA_ARGS[@]}" -n "$WRITER_RANKS" "$BIN" write \
+    HDF5_PLUGIN_PATH="$PLUGIN_DIR" VOL_STREAM_TEST_QUEUE_POLICY="$QUEUE_POLICY" \
+        "$MPIRUN" "${MPI_EXTRA_ARGS[@]}" -n "$WRITER_RANKS" "$BIN" write \
         t_parallel.h5 "$GLOBAL_SIZE" 2>&1 | tee "$write_log"
     write_rc=${PIPESTATUS[0]}
 fi

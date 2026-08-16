@@ -314,6 +314,21 @@ typedef enum H5VL_stream_queue_policy_t {
  *       ignored) and returns -1 once there is no next step. Object opens
  *       made afterward resolve bare paths against that step; see
  *       H5Fbegin_logical_step() to jump to a step by logical id instead.
+ *
+ * \warning **A step is the unit of durability, so H5Fflush() does not
+ *       commit one.** Between H5Fbegin_step() and H5Fend_step(), captured
+ *       creates and writes live in the connector's own staging buffer, not
+ *       in the file. H5Fflush() (and H5Dflush()) forwards to the underlying
+ *       connector and makes previously committed steps durable, but reports
+ *       success over a file that contains nothing written since the step
+ *       opened. Only H5Fend_step() publishes a step. This deliberately
+ *       cannot be discovered through H5Pget_vol_cap_flags(), which reports
+ *       H5VL_CAP_FLAG_FLUSH_REFRESH inherited from the underlying connector
+ *       and admits no such qualification.
+ *
+ * \warning For the same reason, a step left open when the file closes is
+ *       **discarded**, not committed: it was never durable, and there is no
+ *       partial-step state worth preserving.
  */
 H5VL_STREAM_API herr_t H5Fbegin_step(hid_t file_id, size_t n_logical, const uint64_t *logical_ids,
                                       uint64_t wall_time_ns);
