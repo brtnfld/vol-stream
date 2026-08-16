@@ -7228,10 +7228,22 @@ H5VL__stream_warn_once(int *flag, hid_t minor, const char *msg)
  *              serial case -- which is precisely the case that does not need
  *              it.
  *
+ *              Only ever called from inside a VOL_STREAM_HAVE_MERCURY guard
+ *              (H5VL__stream_apply_queue_policy(), below) -- tracked readers
+ *              are inherently a transport concept, there is nothing to ack a
+ *              step without one. Guarding the definition itself, not just
+ *              the call sites, is what a no-transport build needs: fs->
+ *              transport (referenced directly below) is itself only a
+ *              member of H5VL_stream_file_state_t under this same guard, so
+ *              an unguarded definition fails to compile on any configuration
+ *              without Mercury -- every CI job except the transport-specific
+ *              one, found by a real build failure there, not by inspection.
+ *
  * Return:      1 with *out_min set if at least one reader is tracked anywhere
  *              in the communicator, 0 if none is (no pressure).
  *-------------------------------------------------------------------------
  */
+#ifdef VOL_STREAM_HAVE_MERCURY
 static int
 H5VL__stream_queue_lag_view(H5VL_stream_file_state_t *fs, uint64_t *out_min)
 {
@@ -7267,6 +7279,7 @@ H5VL__stream_queue_lag_view(H5VL_stream_file_state_t *fs, uint64_t *out_min)
     *out_min = local_min;
     return 1;
 } /* end H5VL__stream_queue_lag_view() */
+#endif /* VOL_STREAM_HAVE_MERCURY */
 
 /*-------------------------------------------------------------------------
  * Function:    H5VL__stream_queue_agree_or
