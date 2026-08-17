@@ -300,6 +300,22 @@ struct H5VL_stream_file_state_t {
     H5VL_stream_queue_policy_t   queue_policy;
     uint64_t                     reserve_slots;
     int                          warned_parallel_spill; /* H5VL__stream_warn_once() latch */
+
+    /* Step retention, opt-in via H5Fset_stream_retention_policy(). Writer
+     * only, and a no-op unless set (retention_set == 0), so the default is
+     * the unbounded-history behavior every other section assumes.
+     *
+     * retain_floor is the lowest physical step still present in the file;
+     * everything below it has been unlinked. retain_bytes[i] is the payload
+     * byte count of step (retain_floor + i), kept so the max_bytes bound can
+     * be evaluated without re-reading manifests. */
+    int                          retention_set;
+    size_t                       retain_max_steps;
+    uint64_t                     retain_max_bytes;
+    uint64_t                     retain_floor;
+    uint64_t                    *retain_bytes;
+    size_t                       n_retain;
+    size_t                       cap_retain;
 #ifdef VOL_STREAM_HAVE_BAKE
     vs_bake_t                   *spill_bake;
     char                         *spill_dir;
@@ -486,6 +502,7 @@ static void   H5VL__stream_type_cache_clear(H5VL_stream_type_cache_entry_t *arr,
 static herr_t H5VL__stream_build_manifest(H5VL_stream_file_state_t *fs, uint8_t **out_manifest_buf,
                              size_t *out_manifest_len, uint8_t **out_payload_buf, size_t *out_payload_len,
                              int want_payload_buf);
+static void   H5VL__stream_apply_retention(H5VL_stream_t *file_obj, uint64_t committed_bytes);
 static herr_t H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_buf,
                              size_t manifest_len, const uint8_t *payload_buf,
                              H5VL_stream_pending_entry_t *pending_for_wiring, size_t n_pending_for_wiring);
@@ -573,6 +590,10 @@ static int H5VL__stream_refilter_for_subscriber(const void *raw_buf, uint64_t el
                              uint64_t type_enc_len, const uint8_t *native_dcpl_enc,
                              uint64_t native_dcpl_enc_len, void *native_ctx, void **out_buf,
                              uint64_t *out_len, uint32_t *out_filter_mask);
+static int H5VL__stream_convert_for_subscriber(const void *raw_buf, uint64_t count,
+                             const uint8_t *src_type_enc, uint64_t src_type_enc_len,
+                             const uint8_t *dst_type_enc, uint64_t dst_type_enc_len, void **out_buf,
+                             uint64_t *out_elem_size);
 static int H5VL__stream_refilter_zero_copy(const void *raw_buf, uint64_t elem_size, uint64_t count,
                              const uint8_t *dcpl_enc, uint64_t dcpl_enc_len, const uint8_t *native_dcpl_enc,
                              uint64_t native_dcpl_enc_len, void *native_ctx, void **out_buf,
@@ -887,6 +908,9 @@ static int H5VL_stream_op_wait_step_ready    = -1;
 static int H5VL_stream_op_set_queue_policy   = -1;
 static int H5VL_stream_op_get_subscribed_data = -1;
 static int H5VL_stream_op_subscribe_predicate = -1;
+static int H5VL_stream_op_wait_subscribers    = -1;
+static int H5VL_stream_op_set_retention       = -1;
+static int H5VL_stream_op_subscribe_type      = -1;
 
 /* Argument structs for the step operations. */
 typedef struct H5VL_stream_args_begin_step_t {
@@ -936,6 +960,24 @@ typedef struct H5VL_stream_args_set_queue_policy_t {
     H5VL_stream_queue_policy_t policy;
     uint64_t                    reserve_slots;
 } H5VL_stream_args_set_queue_policy_t;
+
+/* Datatype narrowing: reader-side, amends an existing subscription. */
+typedef struct H5VL_stream_args_subscribe_type_t {
+    const char *path;
+    hid_t       type_id; /* H5I_INVALID_HID clears the narrowing */
+} H5VL_stream_args_subscribe_type_t;
+
+/* Rendezvous barrier: writer-side wait for N distinct subscribers. */
+typedef struct H5VL_stream_args_wait_subscribers_t {
+    uint64_t n_expected;
+    uint64_t timeout_ms;
+} H5VL_stream_args_wait_subscribers_t;
+
+/* Step retention: writer-side bound on retained committed steps. */
+typedef struct H5VL_stream_args_set_retention_t {
+    size_t   max_steps;
+    uint64_t max_bytes;
+} H5VL_stream_args_set_retention_t;
 
 /* M8/M8.5 */
 typedef struct H5VL_stream_args_get_subscribed_data_t {
@@ -1321,6 +1363,7 @@ H5VL__stream_file_state_decref(H5VL_stream_file_state_t *fs)
         return;
 
     H5VL__stream_pending_discard_all(fs);
+    free(fs->retain_bytes);
     free(fs->logical_ids);
 
     for (i = 0; i < fs->n_steps_total; i++)
@@ -1595,6 +1638,7 @@ H5VL__stream_transport_start_writer(H5VL_stream_file_state_t *fs, const char *na
      * callbacks, so this is the only place any of them needs to be set. */
     vs_tr_set_refilter_cb(fs->transport, H5VL__stream_refilter_for_subscriber);
     vs_tr_set_refilter_shape_cb(fs->transport, H5VL__stream_refilter_shape_for_subscriber);
+    vs_tr_set_convert_cb(fs->transport, H5VL__stream_convert_for_subscriber);
     vs_tr_set_predicate_cb(fs->transport, H5VL__stream_eval_predicate);
     vs_tr_set_selection_cb(fs->transport, H5VL__stream_selection_runs);
 
@@ -2548,6 +2592,79 @@ H5VL__stream_debug_predicate(void)
 } /* end H5VL__stream_debug_predicate() */
 
 /*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_convert_for_subscriber
+ *
+ * Purpose:     vs_tr_convert_fn's implementation: deliver a subscriber its
+ *              data as the datatype IT asked for rather than the dataset's
+ *              own -- a viz client taking 4-byte float from a double field.
+ *
+ *              This is the differentiator the RFC calls "free type
+ *              conversion" doing real work: H5Tconvert() is HDF5's own
+ *              engine, so any legal conversion works (narrowing,
+ *              widening, byte-order, integer/float) without this connector
+ *              knowing anything about the types involved.
+ *
+ *              Converts in place in a scratch buffer sized for the LARGER
+ *              of the two types, which is what H5Tconvert() requires --
+ *              for the narrowing case that means the source size, and the
+ *              first count*dst_size bytes hold the result afterward.
+ *
+ * Return:      0 on success, with *out_buf (malloc'd, caller frees) and
+ *              *out_elem_size set; -1 to decline, on which the caller
+ *              sends the dataset's own representation unchanged.
+ *-------------------------------------------------------------------------
+ */
+static int
+H5VL__stream_convert_for_subscriber(const void *raw_buf, uint64_t count, const uint8_t *src_type_enc,
+                                    uint64_t src_type_enc_len, const uint8_t *dst_type_enc,
+                                    uint64_t dst_type_enc_len, void **out_buf, uint64_t *out_elem_size)
+{
+    hid_t   src = H5I_INVALID_HID, dst = H5I_INVALID_HID;
+    size_t  ssz, dsz, wide;
+    void   *scratch   = NULL;
+    int     ret_value = -1;
+
+    if (!raw_buf || !src_type_enc || !dst_type_enc || !out_buf || !out_elem_size || count == 0)
+        return -1;
+
+    if ((src = H5Tdecode2(src_type_enc, (size_t)src_type_enc_len)) < 0)
+        goto done;
+    if ((dst = H5Tdecode2(dst_type_enc, (size_t)dst_type_enc_len)) < 0)
+        goto done;
+
+    if (0 == (ssz = H5Tget_size(src)) || 0 == (dsz = H5Tget_size(dst)))
+        goto done;
+
+    /* Same type: nothing to do, and saying so lets the caller skip the copy
+     * rather than paying for an identity conversion on every write. */
+    if (H5Tequal(src, dst) > 0)
+        goto done;
+
+    wide = (ssz > dsz) ? ssz : dsz;
+    if (count > (uint64_t)(SIZE_MAX / wide))
+        goto done;
+    if (NULL == (scratch = malloc((size_t)count * wide)))
+        goto done;
+    memcpy(scratch, raw_buf, (size_t)count * ssz);
+
+    if (H5Tconvert(src, dst, (size_t)count, scratch, NULL, H5P_DATASET_XFER_DEFAULT) < 0)
+        goto done;
+
+    *out_buf       = scratch;
+    *out_elem_size = (uint64_t)dsz;
+    scratch        = NULL;
+    ret_value      = 0;
+
+done:
+    free(scratch);
+    if (src >= 0)
+        H5Tclose(src);
+    if (dst >= 0)
+        H5Tclose(dst);
+    return ret_value;
+} /* end H5VL__stream_convert_for_subscriber() */
+
+/*-------------------------------------------------------------------------
  * Function:    H5VL__stream_refilter_zero_copy
  *
  * Purpose:     M8.5.1, the chunk-level fast path behind
@@ -2609,6 +2726,12 @@ H5VL__stream_refilter_zero_copy(const void *raw_buf, uint64_t elem_size, uint64_
     (void)raw_buf;
 
     if (!ctx || !ctx->under_dset)
+        return -1;
+    /* No native DCPL to compare against means the caller is telling us this
+     * fast path cannot apply -- which is how a datatype-narrowed push opts
+     * out: the bytes stored in the real object are the dataset's own wide
+     * type, not what this subscriber asked for. */
+    if (!native_dcpl_enc || native_dcpl_enc_len == 0)
         return -1;
     /* Whole-dataset pushes only -- see the partial-overlap note above. */
     if (ctx->write_start != 0 || ctx->total_elems != count || elem_size == 0)
@@ -7604,6 +7727,123 @@ H5VL__stream_queue_agree_and(H5VL_stream_file_state_t *fs, int local)
 } /* end H5VL__stream_queue_agree_and() */
 
 /*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_unlink_step
+ *
+ * Purpose:     Remove one committed step's "/step/<n>" group from the file.
+ *
+ *              Quiet-probe idiom (H5Eget_current_stack()/H5Eset_current_
+ *              stack() around suppressed auto-printing), the same one
+ *              H5VL__stream_reader_index_build() uses: a step that is
+ *              already absent is not an error, and retention must never
+ *              contribute frames to a stack describing a successful commit.
+ *
+ * Return:      void -- best-effort by contract.
+ *-------------------------------------------------------------------------
+ */
+static void
+H5VL__stream_unlink_step(H5VL_stream_t *file_obj, uint64_t step)
+{
+    H5VL_loc_params_t          loc_params;
+    H5VL_link_specific_args_t  largs;
+    char                       path[48];
+    H5E_auto2_t                old_func;
+    void                      *old_data;
+    hid_t                      err_id;
+
+    snprintf(path, sizeof(path), "/step/%llu", (unsigned long long)step);
+
+    memset(&loc_params, 0, sizeof(loc_params));
+    loc_params.type                         = H5VL_OBJECT_BY_NAME;
+    loc_params.obj_type                     = H5I_FILE;
+    loc_params.loc_data.loc_by_name.name    = path;
+    loc_params.loc_data.loc_by_name.lapl_id = H5P_LINK_ACCESS_DEFAULT;
+
+    memset(&largs, 0, sizeof(largs));
+    largs.op_type = H5VL_LINK_DELETE;
+
+    H5Eget_auto2(H5E_DEFAULT, &old_func, &old_data);
+    H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
+    err_id = H5Eget_current_stack();
+    (void)H5VLlink_specific(file_obj->under_object, &loc_params, file_obj->under_vol_id, &largs,
+                             H5P_DATASET_XFER_DEFAULT, NULL);
+    H5Eset_current_stack(err_id);
+    H5Eset_auto2(H5E_DEFAULT, old_func, old_data);
+} /* end H5VL__stream_unlink_step() */
+
+/* Drop the oldest retained step: unlink it and advance the accounting. */
+static void
+H5VL__stream_retention_drop_oldest(H5VL_stream_t *file_obj)
+{
+    H5VL_stream_file_state_t *fs = file_obj->file_state;
+
+    H5VL__stream_unlink_step(file_obj, fs->retain_floor);
+    if (fs->n_retain > 1)
+        memmove(&fs->retain_bytes[0], &fs->retain_bytes[1], (fs->n_retain - 1) * sizeof(fs->retain_bytes[0]));
+    fs->n_retain--;
+    fs->retain_floor++;
+} /* end H5VL__stream_retention_drop_oldest() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_apply_retention
+ *
+ * Purpose:     Enforce H5Fset_stream_retention_policy()'s bounds after a
+ *              step commits. A no-op unless the policy was set, so the
+ *              default remains the unbounded history every other part of
+ *              this connector assumes.
+ *
+ *              Called after the commit is complete and physical_step has
+ *              advanced, so a failure here can never make the step just
+ *              written unreachable.
+ *
+ *              The newest step is never trimmed, even by a max_bytes
+ *              smaller than one step: dropping the step just committed
+ *              would turn a retention bound into data loss at the head of
+ *              the stream rather than the tail.
+ *
+ * Return:      void -- best-effort by contract.
+ *-------------------------------------------------------------------------
+ */
+static void
+H5VL__stream_apply_retention(H5VL_stream_t *file_obj, uint64_t committed_bytes)
+{
+    H5VL_stream_file_state_t *fs = file_obj->file_state;
+
+    if (!fs || !fs->retention_set || fs->is_reader)
+        return;
+
+    /* Record this step's payload bytes. A failure to grow the accounting
+     * array costs a trim opportunity, never correctness, so it just
+     * returns. */
+    if (fs->n_retain == fs->cap_retain) {
+        size_t    new_cap = fs->cap_retain ? fs->cap_retain * 2 : 16;
+        uint64_t *grown   = (uint64_t *)realloc(fs->retain_bytes, new_cap * sizeof(*grown));
+
+        if (NULL == grown)
+            return;
+        fs->retain_bytes = grown;
+        fs->cap_retain   = new_cap;
+    }
+    fs->retain_bytes[fs->n_retain++] = committed_bytes;
+
+    if (fs->retain_max_steps > 0)
+        while (fs->n_retain > 1 && fs->n_retain > fs->retain_max_steps)
+            H5VL__stream_retention_drop_oldest(file_obj);
+
+    if (fs->retain_max_bytes > 0) {
+        uint64_t total = 0;
+        size_t   i;
+
+        for (i = 0; i < fs->n_retain; i++)
+            total += fs->retain_bytes[i];
+
+        while (fs->n_retain > 1 && total > fs->retain_max_bytes) {
+            total -= fs->retain_bytes[0];
+            H5VL__stream_retention_drop_oldest(file_obj);
+        }
+    }
+} /* end H5VL__stream_apply_retention() */
+
+/*-------------------------------------------------------------------------
  * Function:    H5VL__stream_apply_queue_policy
  *
  * Purpose:     M7. Called from end_step() instead of calling
@@ -7894,6 +8134,12 @@ H5VL_stream_init(hid_t vipl_id)
         return -1;
     if (H5VL__stream_register_op(H5VL_STREAM_OP_SUBSCRIBE_PREDICATE, &H5VL_stream_op_subscribe_predicate) <
         0)
+        return -1;
+    if (H5VL__stream_register_op(H5VL_STREAM_OP_WAIT_SUBSCRIBERS, &H5VL_stream_op_wait_subscribers) < 0)
+        return -1;
+    if (H5VL__stream_register_op(H5VL_STREAM_OP_SET_RETENTION, &H5VL_stream_op_set_retention) < 0)
+        return -1;
+    if (H5VL__stream_register_op(H5VL_STREAM_OP_SUBSCRIBE_TYPE, &H5VL_stream_op_subscribe_type) < 0)
         return -1;
 
     return 0;
@@ -10250,7 +10496,7 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
     }
     else if (args->op_type == H5VL_stream_op_end_step) {
         herr_t   replay_ret;
-        uint64_t committed_step, committed_wall_time_ns;
+        uint64_t committed_step, committed_wall_time_ns, committed_bytes;
 
         if (!o->file_state || o->file_state->step_state != H5F_STEP_IN_STEP)
             H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g,
@@ -10281,6 +10527,11 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
          * least likely to need it. The missing piece was agreeing the lag
          * view across ranks; see H5VL__stream_queue_lag_view(). */
         replay_ret = H5VL__stream_apply_queue_policy(o);
+
+        /* Captured before the pending buffer is discarded below, since that
+         * is what zeroes it -- this step's own payload volume, which step
+         * retention accounts against its max_bytes bound. */
+        committed_bytes = o->file_state->pending_bytes;
 
         /* Discard the pending buffer either way: a failed replay may have
          * landed some entries and not others, and there is no partial-step
@@ -10327,6 +10578,11 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
 
         o->file_state->physical_step++;
         o->file_state->step_state = H5F_STEP_NOT_IN_STEP;
+
+        /* Retention runs after the step is fully committed and counted, so a
+         * pruning failure can never make a just-written step unreachable.
+         * Best-effort by construction: it returns void. */
+        H5VL__stream_apply_retention(o, committed_bytes);
 
 #ifdef VOL_STREAM_HAVE_MERCURY
         /* Best-effort: a stalled or absent reader must not fail (or stall)
@@ -10529,6 +10785,93 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
         o->file_state->queue_policy_set = 1;
         o->file_state->queue_policy      = sargs->policy;
         o->file_state->reserve_slots     = sargs->reserve_slots;
+        return 0;
+    }
+    else if (args->op_type == H5VL_stream_op_subscribe_type) {
+#ifdef VOL_STREAM_HAVE_MERCURY
+        H5VL_stream_args_subscribe_type_t *sargs = (H5VL_stream_args_subscribe_type_t *)args->args;
+        uint8_t                            *enc   = NULL;
+        size_t                              enc_len = 0;
+        int                                 r;
+
+        if (!sargs || !sargs->path || !o->file_state || !o->file_state->is_reader)
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g,
+                                 "H5Fsubscribe_type() is a reader-only call", -1);
+        if (!o->file_state->transport)
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                                 "H5Fsubscribe_type() needs the transport -- set VOL_STREAM_NA", -1);
+
+        /* H5I_INVALID_HID clears the narrowing: send a 0-length blob, which
+         * the writer treats as "restore the dataset's own type". */
+        if (sargs->type_id >= 0 && H5VL__stream_encode_type(sargs->type_id, &enc, &enc_len) < 0)
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                                 "could not H5Tencode() the requested datatype", -1);
+
+        r = vs_tr_reader_subscribe_type(o->file_state->transport, sargs->path, enc, (uint64_t)enc_len);
+        free(enc);
+        if (r < 0)
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                                 "no subscription for that path on the writer -- call H5Fsubscribe() first",
+                                 -1);
+        return 0;
+#else
+        H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                             "this connector was built without the Mercury transport", -1);
+#endif
+    }
+    else if (args->op_type == H5VL_stream_op_wait_subscribers) {
+#ifdef VOL_STREAM_HAVE_MERCURY
+        H5VL_stream_args_wait_subscribers_t *sargs =
+            (H5VL_stream_args_wait_subscribers_t *)args->args;
+
+        if (!sargs || !o->file_state || o->file_state->is_reader)
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g,
+                                 "H5Fwait_subscribers() is a writer-only call", -1);
+        if (!o->file_state->transport)
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                                 "H5Fwait_subscribers() needs the transport -- set VOL_STREAM_NA", -1);
+
+        if (vs_tr_writer_wait_subscribers(o->file_state->transport, sargs->n_expected,
+                                           sargs->timeout_ms) < 0)
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                                 "timed out waiting for the expected subscriber count", -1);
+        return 0;
+#else
+        (void)args;
+        H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                             "this connector was built without the Mercury transport", -1);
+#endif
+    }
+    else if (args->op_type == H5VL_stream_op_set_retention) {
+        H5VL_stream_args_set_retention_t *sargs = (H5VL_stream_args_set_retention_t *)args->args;
+
+        if (!sargs || !o->file_state || o->file_state->is_reader)
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g,
+                                 "H5Fset_stream_retention_policy() is a writer-only call", -1);
+
+        o->file_state->retention_set    = 1;
+        o->file_state->retain_max_steps = sargs->max_steps;
+        o->file_state->retain_max_bytes = sargs->max_bytes;
+
+        /* Seed the accounting with the steps already committed before this
+         * call, so a policy set mid-stream bounds the whole history rather
+         * than only what follows it. Their byte counts are recorded as 0 --
+         * unknown without re-reading their manifests -- which biases
+         * max_bytes toward keeping them. Under-counting over-retains, and
+         * over-retaining is the safe direction for a bound whose failure
+         * mode is deleting science. */
+        if (o->file_state->physical_step > 0 && o->file_state->n_retain == 0) {
+            size_t    want = (size_t)o->file_state->physical_step;
+            uint64_t *seed = (uint64_t *)calloc(want, sizeof(*seed));
+
+            if (seed) {
+                free(o->file_state->retain_bytes);
+                o->file_state->retain_bytes = seed;
+                o->file_state->n_retain     = want;
+                o->file_state->cap_retain   = want;
+                o->file_state->retain_floor = 0;
+            }
+        }
         return 0;
     }
     else if (args->op_type == H5VL_stream_op_get_subscribed_data) {
@@ -11527,6 +11870,18 @@ H5VL_stream_introspect_opt_query(void *obj, H5VL_subclass_t cls, int opt_type, u
         *flags = H5VL_OPT_QUERY_SUPPORTED | H5VL_OPT_QUERY_QUERY_METADATA;
         return 0;
     }
+    else if (cls == H5VL_SUBCLS_FILE && opt_type == H5VL_stream_op_subscribe_type) {
+        *flags = H5VL_OPT_QUERY_SUPPORTED | H5VL_OPT_QUERY_MODIFY_METADATA;
+        return 0;
+    }
+    else if (cls == H5VL_SUBCLS_FILE && opt_type == H5VL_stream_op_wait_subscribers) {
+        *flags = H5VL_OPT_QUERY_SUPPORTED | H5VL_OPT_QUERY_QUERY_METADATA;
+        return 0;
+    }
+    else if (cls == H5VL_SUBCLS_FILE && opt_type == H5VL_stream_op_set_retention) {
+        *flags = H5VL_OPT_QUERY_SUPPORTED | H5VL_OPT_QUERY_MODIFY_METADATA;
+        return 0;
+    }
     else if (cls == H5VL_SUBCLS_FILE && opt_type == H5VL_stream_op_set_queue_policy) {
         *flags = H5VL_OPT_QUERY_SUPPORTED | H5VL_OPT_QUERY_MODIFY_METADATA;
         return 0;
@@ -12192,6 +12547,39 @@ H5Fset_stream_queue_policy(hid_t file_id, H5VL_stream_queue_policy_t policy, uin
 
     return H5VL__stream_file_op(file_id, H5VL_stream_op_set_queue_policy, &op_args);
 } /* end H5Fset_stream_queue_policy() */
+
+herr_t
+H5Fsubscribe_type(hid_t file_id, const char *path, hid_t type_id)
+{
+    H5VL_stream_args_subscribe_type_t op_args;
+
+    op_args.path    = path;
+    op_args.type_id = type_id;
+
+    return H5VL__stream_file_op(file_id, H5VL_stream_op_subscribe_type, &op_args);
+} /* end H5Fsubscribe_type() */
+
+herr_t
+H5Fwait_subscribers(hid_t file_id, uint64_t n_expected, uint64_t timeout_ms)
+{
+    H5VL_stream_args_wait_subscribers_t op_args;
+
+    op_args.n_expected = n_expected;
+    op_args.timeout_ms = timeout_ms;
+
+    return H5VL__stream_file_op(file_id, H5VL_stream_op_wait_subscribers, &op_args);
+} /* end H5Fwait_subscribers() */
+
+herr_t
+H5Fset_stream_retention_policy(hid_t file_id, size_t max_steps, uint64_t max_bytes)
+{
+    H5VL_stream_args_set_retention_t op_args;
+
+    op_args.max_steps = max_steps;
+    op_args.max_bytes = max_bytes;
+
+    return H5VL__stream_file_op(file_id, H5VL_stream_op_set_retention, &op_args);
+} /* end H5Fset_stream_retention_policy() */
 
 herr_t
 H5Fget_subscribed_data(hid_t file_id, uint64_t timeout_ms, uint64_t *physical_step, char **path, void **buf,

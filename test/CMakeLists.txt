@@ -1,6 +1,6 @@
 foreach(t t_smoke t_step t_replay t_reader t_deferred t_vl_reject t_manifest_cache t_ref_path t_ref_roundtrip
            t_vl_roundtrip t_attr_convert t_payload_compress t_step_rewrite t_reregister t_memspace t_manypaths
-           t_dset_resize)
+           t_dset_resize t_retention)
   add_executable(${t} ${t}.c)
   target_link_libraries(${t} PRIVATE vol_stream)
 endforeach()
@@ -34,6 +34,12 @@ add_test(NAME manypaths COMMAND t_manypaths)
 # already-committed real object, silently rewriting history. Now refused;
 # see H5VL_stream_dataset_specific()'s own comment and t_dset_resize.c.
 add_test(NAME dset_resize COMMAND t_dset_resize)
+# Step retention (H5Fset_stream_retention_policy): vol-stream as a live
+# transit pipe rather than an archive. Asserts the newest K steps survive,
+# that they keep their own data, and that a policy set mid-stream bounds the
+# steps committed BEFORE the call too -- the seeding path, which a
+# policy-set-up-front test cannot reach. Needs no transport.
+add_test(NAME retention COMMAND t_retention)
 
 # M4 exit gate: the two-process Mercury round trip. M5 exit gate: SSG
 # rendezvous, late joiners, and a departing reader that does not stall the
@@ -47,11 +53,19 @@ add_test(NAME dset_resize COMMAND t_dset_resize)
 # VOL_STREAM_ENABLE_MERCURY option).
 if(VOL_STREAM_HAVE_MERCURY)
   foreach(t t_transport t_rendezvous t_queue_policy t_subscribe t_precision t_precision_dual
-           t_chunk_zerocopy t_chunk_shape_split t_subvolume_nd t_strided_write t_predicate t_subvolume_strided)
+           t_chunk_zerocopy t_chunk_shape_split t_subvolume_nd t_strided_write t_predicate t_subvolume_strided
+           t_rendezvous_barrier)
     add_executable(${t} ${t}.c)
     target_link_libraries(${t} PRIVATE vol_stream)
   endforeach()
   add_test(NAME transport COMMAND t_transport)
+  # The protocol-level fix for the subscription start-up race
+  # (H5Fwait_subscribers): the writer blocks on its own subscription table
+  # rather than on a ready-sentinel FILE, which is what keeps rendezvous free
+  # of any shared filesystem. Deliberately contains no sentinel: the reader
+  # dawdles before subscribing, so a writer that did not wait would lose step
+  # 0 every time rather than flake.
+  add_test(NAME rendezvous_barrier COMMAND t_rendezvous_barrier)
   add_test(NAME rendezvous COMMAND t_rendezvous)
   add_test(NAME queue_policy COMMAND t_queue_policy)
   add_test(NAME subscribe COMMAND t_subscribe)

@@ -176,6 +176,34 @@ typedef uint64_t (*vs_tr_refilter_shape_fn)(const uint8_t *dcpl_enc, uint64_t dc
                                               uint64_t elem_size);
 void vs_tr_set_refilter_shape_cb(vs_tr_t *tr, vs_tr_refilter_shape_fn fn);
 
+/* Convert count elements of raw_buf from src_type_enc to dst_type_enc,
+ * allocating *out_buf (caller frees) and reporting the destination element
+ * size in *out_elem_size.
+ *
+ * This is how a subscriber gets its data AS a different datatype than the
+ * dataset's own -- a viz client asking for 4-byte float from a double field,
+ * which halves the payload before any filter runs. Both blobs are opaque
+ * here; only the registered implementation decodes them, keeping this module
+ * HDF5-free.
+ *
+ * Returns 0 on success, -1 to decline -- on which the caller sends the
+ * dataset's own representation unchanged, exactly as if no narrowing had
+ * been requested. Declining is always safe. */
+typedef int (*vs_tr_convert_fn)(const void *raw_buf, uint64_t count, const uint8_t *src_type_enc,
+                                  uint64_t src_type_enc_len, const uint8_t *dst_type_enc,
+                                  uint64_t dst_type_enc_len, void **out_buf, uint64_t *out_elem_size);
+
+void vs_tr_set_convert_cb(vs_tr_t *tr, vs_tr_convert_fn fn);
+
+/* Reader side: ask for an existing subscription's data to be delivered as
+ * type_enc rather than the dataset's own type. vs_tr_reader_subscribe() must
+ * have succeeded for path first -- this narrows a subscription rather than
+ * being one, the same shape as vs_tr_reader_subscribe_predicate(). Pass
+ * NULL/0 to clear. Returns 0 only if the writer answered AND found the
+ * subscription, -1 otherwise. */
+int vs_tr_reader_subscribe_type(vs_tr_t *tr, const char *path, const uint8_t *type_enc,
+                                  uint64_t type_enc_len);
+
 /* M9 predicate pushdown: one maximal contiguous run of matching elements,
  * counted in elements relative to the overlap slice handed to
  * vs_tr_predicate_fn -- start == 0 is that slice's first element, not the
@@ -291,6 +319,25 @@ int vs_tr_writer_start_group(vs_tr_t *tr, const char *group_file);
  * Returns 0 on success (even if an individual member's RPC failed), -1 only
  * on a local error. */
 int vs_tr_writer_broadcast_step_ready(vs_tr_t *tr, uint64_t physical_step, uint64_t wall_time_ns);
+
+/* Writer side: block until at least n_expected *distinct* subscribers have
+ * registered at least one subscription, or timeout_ms elapses.
+ *
+ * This is the protocol-level answer to the start-up race a subscription
+ * cannot otherwise win: a subscription only affects writes issued after it
+ * reaches the writer, so a writer that commits step 0 before its readers
+ * have subscribed silently gives them nothing. Waiting here, rather than on
+ * a sentinel file both sides can see, is what removes the shared-filesystem
+ * dependency from rendezvous -- the whole point of using SSG for membership.
+ *
+ * Counts subscribers, not subscriptions: one reader subscribing to three
+ * paths is one. Polls rather than waiting on a condition variable, and
+ * sleeps with margo_thread_sleep() so the progress engine keeps serving the
+ * very subscribe RPCs being awaited.
+ *
+ * Returns 0 once the count is reached (immediately, if it already was), -1
+ * on timeout or if this transport has no group. n_expected == 0 is 0. */
+int vs_tr_writer_wait_subscribers(vs_tr_t *tr, uint64_t n_expected, uint64_t timeout_ms);
 
 /* Reader side: load the group id from group_file (bootstrap -- the caller
  * retries if the writer has not published it yet, same as M4) and join the

@@ -127,9 +127,14 @@ hg_proc_vs_blob_t(hg_proc_t proc, void *data)
  * probing, so answering non-zero would make the prober keep hunting for a
  * writer that had in fact already answered. */
 #define VS_SUB_FLAG_PRED_ONLY 0x1u
+/* "Amend only the wanted datatype of an existing subscription" -- the same
+ * narrow-an-existing-subscription shape as PRED_ONLY above. A 0-length
+ * type_enc clears the narrowing and restores the dataset's own type. */
+#define VS_SUB_FLAG_TYPE_ONLY 0x2u
 MERCURY_GEN_PROC(vs_subscribe_in_t, ((uint64_t)(member_id))((hg_string_t)(path))((uint64_t)(sel_start))(
                                           (uint64_t)(sel_count))((vs_blob_t)(dcpl_enc))((uint32_t)(flags))(
-                                          (vs_blob_t)(pred_enc))((vs_blob_t)(space_enc)))
+                                          (vs_blob_t)(pred_enc))((vs_blob_t)(space_enc))(
+                                          (vs_blob_t)(type_enc)))
 MERCURY_GEN_PROC(vs_subscribe_out_t, ((int32_t)(status))((int32_t)(matched)))
 /* M8: writer -> reader, one entry's actual bytes. M8.5: elem_start/
  * elem_count identify which element range of the subscribed object payload
@@ -222,6 +227,13 @@ typedef struct vs_tr_sub_entry_t {
     uint64_t          pred_enc_len;
     uint8_t          *space_enc;
     uint64_t          space_enc_len;
+    /* The datatype this subscriber wants its data delivered AS, rather than
+     * the dataset's own -- e.g. a viz client asking for 4-byte float from a
+     * double field. NULL/0 means "the dataset's own type", the original
+     * behavior. Opaque here; only the registered vs_tr_convert_fn decodes
+     * it. */
+    uint8_t          *want_type_enc;
+    uint64_t          want_type_enc_len;
 } vs_tr_sub_entry_t;
 
 /* M8, reader side: one pushed data item queued for vs_tr_reader_wait_data().
@@ -296,9 +308,10 @@ struct vs_tr_t {
     size_t              n_lag;
     size_t              cap_lag;
 
-    /* M8, writer side: subscription table (see vs_tr_sub_entry_t). Same
-     * "grown lazily, entries for departed members simply ignored rather than
-     * pruned" approach as lag_table above. */
+    /* M8, writer side: subscription table (see vs_tr_sub_entry_t). Grown
+     * lazily. Unlike lag_table, entries here *are* pruned when SSG reports
+     * the owning member dead or departed (vs_membership_cb()), because the
+     * push loop pays a real RPC timeout per stale entry per step. */
     pthread_mutex_t     sub_lock;
     vs_tr_sub_entry_t *sub_table;
     size_t              n_sub;
@@ -326,6 +339,11 @@ struct vs_tr_t {
      * always spans the whole run in one RPC, exactly the original M8.5
      * behavior. */
     vs_tr_refilter_shape_fn refilter_shape_fn;
+
+    /* Datatype narrowing (see vs_tr_convert_fn in tr_mercury.h). NULL until
+     * vs_tr_set_convert_cb() is called -- every push then carries the
+     * dataset's own type, the pre-narrowing behavior. */
+    vs_tr_convert_fn convert_fn;
 
     /* M9, writer side: predicate-evaluation callback, see vs_tr_predicate_
      * fn's comment in tr_mercury.h. NULL until vs_tr_set_predicate_cb() is
@@ -525,22 +543,123 @@ vs_tr_self_address(vs_tr_t *tr)
     return buf;
 } /* end vs_tr_self_address() */
 
+/* Free one subscription entry's owned storage and blank it.  Shared by the
+ * membership purge below and by vs_tr_stop()'s teardown, so the set of
+ * owned pointers is listed in exactly one place. */
+static void
+vs_tr_sub_entry_clear(vs_tr_sub_entry_t *e)
+{
+    free(e->path);
+    free(e->dcpl_enc);
+    free(e->pred_enc);
+    free(e->space_enc);
+    free(e->want_type_enc);
+    memset(e, 0, sizeof(*e));
+} /* end vs_tr_sub_entry_clear() */
+
 /* M5: fires on SSG_MEMBER_JOINED/LEFT/DIED for any group this process
- * belongs to. Both ssg_group_create() and ssg_group_join() require one;
+ * belongs to. Both ssg_group_create() and ssg_group_join() require one.
+ *
  * vs_tr_writer_broadcast_step_ready() does not need to be told about a
- * departure itself, since it queries live group membership at send time,
- * so a departed or failure-detected member is simply absent from the next
- * broadcast without this callback's help. */
+ * departure, since it queries live group membership at send time, so a
+ * departed member is simply absent from the next broadcast. The
+ * *subscription* table is different: it is built from subscribe RPCs and
+ * keyed by member, and nothing else prunes it. Left alone, a subscriber
+ * that dies keeps its entries forever, and the push loop pays a full
+ * margo_forward_timed() timeout against the dead peer on every subsequent
+ * step -- vs_tr_member_failed()'s guard is deliberately reset at the top
+ * of each push call, so it suppresses repeat attempts *within* one write,
+ * never across steps. That is the difference between a bounded per-step
+ * cost and an unbounded recurring one, so the purge belongs here, where
+ * SWIM's own failure detector is the trigger. */
 static void
 vs_membership_cb(void *group_data, ssg_member_id_t member_id, ssg_member_update_type_t update_type)
 {
-    (void)group_data;
-    (void)member_id;
+    vs_tr_t *tr = (vs_tr_t *)group_data;
+    size_t    i;
+
 #ifdef ENABLE_STREAM_LOGGING
     printf("------- VOL-STREAM SSG membership update: member %lu, type %d\n", (unsigned long)member_id,
            (int)update_type);
 #endif
+
+    if (!tr)
+        return;
+    if (update_type != SSG_MEMBER_DIED && update_type != SSG_MEMBER_LEFT)
+        return;
+
+    /* Same lock the subscribe handler takes, and from the same kind of
+     * context (an SSG/Margo ULT rather than the application thread). */
+    pthread_mutex_lock(&tr->sub_lock);
+    i = 0;
+    while (i < tr->n_sub) {
+        if (tr->sub_table[i].member_id == member_id) {
+            vs_tr_sub_entry_clear(&tr->sub_table[i]);
+            /* Shift rather than swap-remove: the push loop walks this table
+             * in order, and preserving it keeps a departure from reordering
+             * the pushes surviving subscribers see. */
+            if (i + 1 < tr->n_sub)
+                memmove(&tr->sub_table[i], &tr->sub_table[i + 1],
+                        (tr->n_sub - i - 1) * sizeof(tr->sub_table[0]));
+            tr->n_sub--;
+        }
+        else
+            i++;
+    }
+    pthread_mutex_unlock(&tr->sub_lock);
 } /* end vs_membership_cb() */
+
+/* Distinct subscriber count -- sub_table holds one entry per (member, path),
+ * so a single subscriber with three paths is three entries and one
+ * subscriber. Caller holds sub_lock. O(n^2), on a table that is one entry
+ * per subscribed path. */
+static size_t
+vs_tr_distinct_subscribers(const vs_tr_t *tr)
+{
+    size_t i, j, n = 0;
+
+    for (i = 0; i < tr->n_sub; i++) {
+        for (j = 0; j < i; j++)
+            if (tr->sub_table[j].member_id == tr->sub_table[i].member_id)
+                break;
+        if (j == i)
+            n++;
+    }
+    return n;
+} /* end vs_tr_distinct_subscribers() */
+
+int
+vs_tr_writer_wait_subscribers(vs_tr_t *tr, uint64_t n_expected, uint64_t timeout_ms)
+{
+    uint64_t deadline_ns;
+
+    if (!tr || tr->group_id == SSG_GROUP_ID_INVALID)
+        return -1;
+    if (n_expected == 0)
+        return 0;
+
+    deadline_ns = vs_now_ns() + timeout_ms * 1000000ull;
+
+    for (;;) {
+        size_t have;
+
+        pthread_mutex_lock(&tr->sub_lock);
+        have = vs_tr_distinct_subscribers(tr);
+        pthread_mutex_unlock(&tr->sub_lock);
+
+        if (have >= (size_t)n_expected)
+            return 0;
+        if (vs_now_ns() >= deadline_ns)
+            return -1;
+
+        /* margo_thread_sleep(), not sleep()/nanosleep(): this runs on the
+         * application thread, and the subscribe RPCs being waited for are
+         * served by Margo ULTs that need the progress engine to keep
+         * running. Blocking the OS thread outright would deadlock against
+         * exactly the arrivals this loop is waiting for. */
+        margo_thread_sleep(tr->mid, 5.0);
+    }
+} /* end vs_tr_writer_wait_subscribers() */
 
 /*-------------------------------------------------------------------------
  * RPC handlers
@@ -733,6 +852,7 @@ vs_subscribe_ult(hg_handle_t handle)
         size_t i;
         int    found     = 0;
         int    pred_only = (in.flags & VS_SUB_FLAG_PRED_ONLY) != 0;
+        int    type_only = (in.flags & VS_SUB_FLAG_TYPE_ONLY) != 0;
 
         pthread_mutex_lock(&tr->sub_lock);
 
@@ -750,6 +870,18 @@ vs_subscribe_ult(hg_handle_t handle)
                         tr->sub_table[i].pred_enc     = blob_copy;
                         tr->sub_table[i].pred_enc_len = blob_copy_len;
                         found                          = 1;
+                    }
+                    break;
+                }
+
+                if (type_only) {
+                    /* Same shape as PRED_ONLY: a 0-length blob clears the
+                     * narrowing and restores the dataset's own type. */
+                    if (vs_blob_dup(&in.type_enc, &blob_copy, &blob_copy_len) == 0) {
+                        free(tr->sub_table[i].want_type_enc);
+                        tr->sub_table[i].want_type_enc     = blob_copy;
+                        tr->sub_table[i].want_type_enc_len = blob_copy_len;
+                        found                               = 1;
                     }
                     break;
                 }
@@ -772,10 +904,15 @@ vs_subscribe_ult(hg_handle_t handle)
                     }
                 }
                 /* See this function's header comment: a plain re-subscribe
-                 * starts from no predicate rather than inheriting one. */
+                 * starts from no predicate rather than inheriting one. The
+                 * wanted datatype resets on the same rule, for the same
+                 * reason -- one call, one predictable starting state. */
                 free(tr->sub_table[i].pred_enc);
                 tr->sub_table[i].pred_enc     = NULL;
                 tr->sub_table[i].pred_enc_len = 0;
+                free(tr->sub_table[i].want_type_enc);
+                tr->sub_table[i].want_type_enc     = NULL;
+                tr->sub_table[i].want_type_enc_len = 0;
                 found = 1;
                 break;
             }
@@ -783,7 +920,7 @@ vs_subscribe_ult(hg_handle_t handle)
         /* PRED_ONLY never creates a subscription: a predicate narrows one
          * that already exists. Reporting !matched lets the caller fail
          * loudly instead of quietly over-sending forever. */
-        if (!found && !pred_only) {
+        if (!found && !pred_only && !type_only) {
             if (tr->n_sub == tr->cap_sub) {
                 size_t               new_cap = tr->cap_sub ? tr->cap_sub * 2 : 8;
                 vs_tr_sub_entry_t *grown   = (vs_tr_sub_entry_t *)realloc(tr->sub_table,
@@ -945,6 +1082,13 @@ vs_tr_set_refilter_cb(vs_tr_t *tr, vs_tr_refilter_fn fn)
 }
 
 void
+vs_tr_set_convert_cb(vs_tr_t *tr, vs_tr_convert_fn fn)
+{
+    if (tr)
+        tr->convert_fn = fn;
+} /* end vs_tr_set_convert_cb() */
+
+void
 vs_tr_set_refilter_shape_cb(vs_tr_t *tr, vs_tr_refilter_shape_fn fn)
 {
     if (tr)
@@ -1038,12 +1182,8 @@ vs_tr_stop(vs_tr_t *tr)
     {
         size_t i;
 
-        for (i = 0; i < tr->n_sub; i++) {
-            free(tr->sub_table[i].path);
-            free(tr->sub_table[i].dcpl_enc);
-            free(tr->sub_table[i].pred_enc);
-            free(tr->sub_table[i].space_enc);
-        }
+        for (i = 0; i < tr->n_sub; i++)
+            vs_tr_sub_entry_clear(&tr->sub_table[i]);
         free(tr->sub_table);
         for (i = 0; i < tr->n_data; i++) {
             free(tr->data_queue[i].path);
@@ -1184,7 +1324,14 @@ vs_tr_reader_get_current_step(vs_tr_t *tr, uint64_t *physical_step, uint64_t *wa
             continue;
 
         if (HG_SUCCESS == margo_create(tr->mid, addr, tr->get_current_step_rpc_id, &handle)) {
-            if (HG_SUCCESS == margo_forward(handle, &in)) {
+            /* Bounded, like every other forward in this file (1000 ms), and
+             * for a sharper reason here: this loop queries members a reader
+             * has never spoken to, one of which may be an SSG entry for a
+             * peer that has already died. An untimed forward against a dead
+             * peer retries until the job's wall clock ends it. A timeout
+             * just means this member does not answer, which the loop already
+             * treats as "not the writer" and skips. */
+            if (HG_SUCCESS == margo_forward_timed(handle, &in, 1000.0)) {
                 vs_get_current_step_out_t out;
 
                 if (HG_SUCCESS == margo_get_output(handle, &out)) {
@@ -1580,6 +1727,10 @@ vs_tr_reader_subscribe(vs_tr_t *tr, const char *path, uint64_t sel_start, uint64
     in.dcpl_enc.buf  = (void *)(uintptr_t)dcpl_enc;
     in.dcpl_enc.size = dcpl_enc_len;
     in.flags         = 0;
+    /* No narrowing on a plain subscribe. Must be set explicitly: the wire
+     * struct is a stack local, so leaving it alone ships garbage. */
+    in.type_enc.buf  = NULL;
+    in.type_enc.size = 0;
     in.pred_enc.buf  = NULL;
     in.pred_enc.size = 0;
     in.space_enc.buf  = (void *)(uintptr_t)space_enc;
@@ -1616,11 +1767,46 @@ vs_tr_reader_subscribe_predicate(vs_tr_t *tr, const char *path, const uint8_t *p
      * selection is left exactly as the original subscribe set it. */
     in.space_enc.buf  = NULL;
     in.space_enc.size = 0;
+    /* Ignored under PRED_ONLY; set so the wire struct is fully initialized. */
+    in.type_enc.buf  = NULL;
+    in.type_enc.size = 0;
 
     if (vs_send_subscribe(tr, self_id, &in, &matched) != 0)
         return -1;
     return matched ? 0 : -1;
 }
+
+int
+vs_tr_reader_subscribe_type(vs_tr_t *tr, const char *path, const uint8_t *type_enc, uint64_t type_enc_len)
+{
+    ssg_member_id_t     self_id;
+    vs_subscribe_in_t in;
+    int                  matched = 0;
+
+    if (!tr || !path || tr->group_id == SSG_GROUP_ID_INVALID)
+        return -1;
+    if (SSG_SUCCESS != ssg_get_self_id(tr->mid, &self_id))
+        return -1;
+
+    in.member_id = (uint64_t)self_id;
+    in.path       = (hg_string_t)path;
+    /* All ignored under TYPE_ONLY -- only the wanted datatype is amended. */
+    in.sel_start      = 0;
+    in.sel_count      = UINT64_MAX;
+    in.dcpl_enc.buf   = NULL;
+    in.dcpl_enc.size  = 0;
+    in.pred_enc.buf   = NULL;
+    in.pred_enc.size  = 0;
+    in.space_enc.buf  = NULL;
+    in.space_enc.size = 0;
+    in.flags          = VS_SUB_FLAG_TYPE_ONLY;
+    in.type_enc.buf   = (void *)(uintptr_t)type_enc;
+    in.type_enc.size  = type_enc_len;
+
+    if (vs_send_subscribe(tr, self_id, &in, &matched) != 0)
+        return -1;
+    return matched ? 0 : -1;
+} /* end vs_tr_reader_subscribe_type() */
 
 /*-------------------------------------------------------------------------
  * Writer-side in-flight push bookkeeping (see vs_tr_inflight_t)
@@ -1878,6 +2064,8 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
             uint64_t        pred_enc_len;
             uint8_t        *space_enc;
             uint64_t        space_enc_len;
+            uint8_t        *want_type_enc;
+            uint64_t        want_type_enc_len;
         } vs_tr_push_sub_snapshot_t;
 
         vs_tr_push_sub_snapshot_t *snapshot     = NULL;
@@ -1927,6 +2115,13 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
                        tr->sub_table[si].space_enc_len);
                 snapshot[n_snapshot].space_enc_len = tr->sub_table[si].space_enc_len;
             }
+            if (tr->sub_table[si].want_type_enc_len > 0 &&
+                NULL != (snapshot[n_snapshot].want_type_enc =
+                             (uint8_t *)malloc(tr->sub_table[si].want_type_enc_len))) {
+                memcpy(snapshot[n_snapshot].want_type_enc, tr->sub_table[si].want_type_enc,
+                       tr->sub_table[si].want_type_enc_len);
+                snapshot[n_snapshot].want_type_enc_len = tr->sub_table[si].want_type_enc_len;
+            }
             n_snapshot++;
         }
         pthread_mutex_unlock(&tr->sub_lock);
@@ -1964,6 +2159,19 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
         uint64_t           sub_pred_enc_len = 0;
         uint8_t           *sub_space_enc = NULL;
         uint64_t           sub_space_enc_len = 0;
+        uint8_t           *sub_want_type_enc = NULL;
+        uint64_t           sub_want_type_enc_len = 0;
+        /* This subscriber's view of the data: the dataset's own buffer/type by
+         * default, or a narrowed conversion of the overlap. s_base is the
+         * element index s_buf's first element corresponds to -- write_start
+         * normally, overlap_start once converted. s_conv_buf is the owned
+         * allocation, NULL when no conversion happened. */
+        const void        *s_buf = buf;
+        uint64_t           s_base = write_start;
+        uint64_t           s_elem_size = elem_size;
+        const uint8_t     *s_type_enc = type_enc;
+        uint64_t           s_type_enc_len = type_enc_len;
+        void              *s_conv_buf = NULL;
         vs_tr_run_t        sel_runs[VS_TR_MAX_PRED_RUNS];
         vs_tr_run_t        runs[VS_TR_MAX_PRED_RUNS];
         int                n_sel = 1, n_runs = 1, sr, r;
@@ -1990,7 +2198,10 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
         sub_pred_enc_len  = snapshot[si].pred_enc_len;
         sub_space_enc     = snapshot[si].space_enc;
         sub_space_enc_len = snapshot[si].space_enc_len;
+        sub_want_type_enc     = snapshot[si].want_type_enc;
+        sub_want_type_enc_len = snapshot[si].want_type_enc_len;
         snapshot[si].dcpl_enc = snapshot[si].pred_enc = snapshot[si].space_enc = NULL;
+        snapshot[si].want_type_enc = NULL;
 
         /* M8.5: only the overlap between what this member asked for and
          * what was just written -- never the whole write, and never
@@ -2003,6 +2214,7 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
             free(sub_dcpl_enc);
             free(sub_pred_enc);
             free(sub_space_enc);
+            free(sub_want_type_enc);
             continue;
         }
         overlap_count = overlap_end - overlap_start;
@@ -2041,13 +2253,45 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
             /* The selection does not touch this write at all. */
             free(sub_dcpl_enc);
             free(sub_pred_enc);
+            free(sub_want_type_enc);
             continue;
         }
 
         if (SSG_SUCCESS != ssg_get_group_member_addr(tr->group_id, member_id, &addr)) {
             free(sub_dcpl_enc);
             free(sub_pred_enc);
+            free(sub_want_type_enc);
             continue;
+        }
+
+        /* Datatype narrowing: deliver this subscriber the overlap AS the type
+         * it asked for, rather than the dataset's own -- a viz client taking
+         * 4-byte float from a double field halves the payload before any
+         * filter runs.
+         *
+         * Converted once per subscriber over the whole overlap, not per run,
+         * and the converted buffer is re-based: its first element is
+         * overlap_start rather than write_start, which is why every indexing
+         * expression below goes through s_base rather than write_start.
+         *
+         * Declining leaves every s_* local pointing at the dataset's own
+         * representation, i.e. exactly the pre-narrowing behavior -- the same
+         * decline-is-safe rule the refilter and predicate paths follow. */
+        if (sub_want_type_enc_len > 0 && tr->convert_fn) {
+            void    *conv     = NULL;
+            uint64_t conv_esz = 0;
+
+            if (0 == tr->convert_fn((const uint8_t *)buf + (overlap_start - write_start) * elem_size,
+                                      overlap_count, type_enc, type_enc_len, sub_want_type_enc,
+                                      sub_want_type_enc_len, &conv, &conv_esz) &&
+                conv_esz > 0) {
+                s_conv_buf     = conv;
+                s_buf          = conv;
+                s_base         = overlap_start;
+                s_elem_size    = conv_esz;
+                s_type_enc     = sub_want_type_enc;
+                s_type_enc_len = sub_want_type_enc_len;
+            }
         }
 
         for (sr = 0; sr < n_sel; sr++) {
@@ -2062,9 +2306,9 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
         runs[0].count = sel_count_abs;
         n_runs        = 1;
         if (sub_pred_enc_len > 0 && tr->predicate_fn) {
-            int n = tr->predicate_fn((const uint8_t *)buf + (sel_start_abs - write_start) * elem_size,
-                                       elem_size, sel_count_abs, sub_pred_enc, sub_pred_enc_len, type_enc,
-                                       type_enc_len, runs, VS_TR_MAX_PRED_RUNS);
+            int n = tr->predicate_fn((const uint8_t *)s_buf + (sel_start_abs - s_base) * s_elem_size,
+                                       s_elem_size, sel_count_abs, sub_pred_enc, sub_pred_enc_len,
+                                       s_type_enc, s_type_enc_len, runs, VS_TR_MAX_PRED_RUNS);
 
             if (n >= 0)
                 n_runs = n;
@@ -2118,10 +2362,10 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
              * by byte offset into buf: buf's own first element is
              * write_start, so this run begins (run_start - write_start)
              * elements in. */
-            const void *run_ptr = (const uint8_t *)buf + (run_start - write_start) * elem_size;
+            const void *run_ptr = (const uint8_t *)s_buf + (run_start - s_base) * s_elem_size;
 
             if (sub_dcpl_enc_len > 0 && tr->refilter_shape_fn)
-                chunk_elems = tr->refilter_shape_fn(sub_dcpl_enc, sub_dcpl_enc_len, run_count, elem_size);
+                chunk_elems = tr->refilter_shape_fn(sub_dcpl_enc, sub_dcpl_enc_len, run_count, s_elem_size);
 
             if (chunk_elems > 0 && chunk_elems < run_count) {
                 /* M8.5 follow-up: this subscriber's DCPL asked for a real
@@ -2134,18 +2378,21 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
 
                 while (off < run_count) {
                     uint64_t    this_count = (run_count - off < chunk_elems) ? (run_count - off) : chunk_elems;
-                    const void *sub_ptr    = (const uint8_t *)run_ptr + off * elem_size;
+                    const void *sub_ptr    = (const uint8_t *)run_ptr + off * s_elem_size;
                     void       *cb_buf     = NULL;
                     uint64_t    cb_len     = 0;
                     uint32_t    cb_mask    = 0;
 
                     if (tr->refilter_fn &&
-                        0 == tr->refilter_fn(sub_ptr, elem_size, this_count, sub_dcpl_enc, sub_dcpl_enc_len,
-                                               type_enc, type_enc_len, native_dcpl_enc, native_dcpl_enc_len,
-                                               native_ctx, &cb_buf, &cb_len, &cb_mask))
+                        0 == tr->refilter_fn(sub_ptr, s_elem_size, this_count, sub_dcpl_enc,
+                                               sub_dcpl_enc_len, s_type_enc, s_type_enc_len,
+                                               s_conv_buf ? NULL : native_dcpl_enc,
+                                               s_conv_buf ? 0 : native_dcpl_enc_len, native_ctx, &cb_buf,
+                                               &cb_len, &cb_mask))
                         member_unreachable = vs_tr_push_one_item(
                             tr, addr, member_id, physical_step, path, run_start + off, this_count, cb_buf,
-                            cb_len, sub_dcpl_enc, sub_dcpl_enc_len, type_enc, type_enc_len, cb_mask, cb_buf);
+                            cb_len, sub_dcpl_enc, sub_dcpl_enc_len, s_type_enc, s_type_enc_len, cb_mask,
+                            cb_buf);
                     else
                         /* Refilter declined/failed for this slice: fall back
                          * to raw bytes for just this slice, the same
@@ -2153,7 +2400,7 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
                          * already follows. */
                         member_unreachable = vs_tr_push_one_item(
                             tr, addr, member_id, physical_step, path, run_start + off, this_count, sub_ptr,
-                            this_count * elem_size, NULL, 0, NULL, 0, 0, NULL);
+                            this_count * s_elem_size, NULL, 0, s_type_enc, s_type_enc_len, 0, NULL);
 
                     if (member_unreachable)
                         break;
@@ -2183,20 +2430,23 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
                  * partial run never does. Correct by construction rather
                  * than by a check here. */
                 if (sub_dcpl_enc_len > 0 && tr->refilter_fn &&
-                    0 == tr->refilter_fn(run_ptr, elem_size, run_count, sub_dcpl_enc, sub_dcpl_enc_len,
-                                           type_enc, type_enc_len, native_dcpl_enc, native_dcpl_enc_len,
-                                           native_ctx, &filtered_buf, &filtered_len, &filter_mask))
+                    0 == tr->refilter_fn(run_ptr, s_elem_size, run_count, sub_dcpl_enc, sub_dcpl_enc_len,
+                                           s_type_enc, s_type_enc_len,
+                                           s_conv_buf ? NULL : native_dcpl_enc,
+                                           s_conv_buf ? 0 : native_dcpl_enc_len, native_ctx, &filtered_buf,
+                                           &filtered_len, &filter_mask))
                     did_refilter = 1;
 
                 if (did_refilter)
                     member_unreachable = vs_tr_push_one_item(
                         tr, addr, member_id, physical_step, path, run_start, run_count, filtered_buf,
-                        filtered_len, sub_dcpl_enc, sub_dcpl_enc_len, type_enc, type_enc_len, filter_mask,
-                        filtered_buf);
+                        filtered_len, sub_dcpl_enc, sub_dcpl_enc_len, s_type_enc, s_type_enc_len,
+                        filter_mask, filtered_buf);
                 else
                     member_unreachable =
                         vs_tr_push_one_item(tr, addr, member_id, physical_step, path, run_start, run_count,
-                                             run_ptr, run_count * elem_size, NULL, 0, NULL, 0, 0, NULL);
+                                             run_ptr, run_count * s_elem_size, NULL, 0, s_type_enc,
+                                             s_type_enc_len, 0, NULL);
             }
 
             if (member_unreachable)
@@ -2208,6 +2458,8 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
         margo_addr_free(tr->mid, addr);
         free(sub_dcpl_enc);
         free(sub_pred_enc);
+        free(sub_want_type_enc);
+        free(s_conv_buf);
         }
 
         /* Whatever wasn't matched to a member above (e.g. a subscriber SSG
@@ -2219,6 +2471,7 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
                 free(snapshot[k].dcpl_enc);
                 free(snapshot[k].pred_enc);
                 free(snapshot[k].space_enc);
+                free(snapshot[k].want_type_enc);
             }
             free(snapshot);
         }

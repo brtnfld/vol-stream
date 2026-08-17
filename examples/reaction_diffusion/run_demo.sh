@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Runs rd_writer and rd_monitor together: the writer in the background, the
 # monitor in the foreground so its live redraw is what you see.
-# Usage: run_demo.sh [build-dir] [grid-n] [nsteps] [substeps] [delay-ms]
+# Usage: run_demo.sh [build-dir] [grid-n] [nsteps] [substeps] [delay-ms] [--float]
+#
+# --float: have the monitor ask for /V as 4-byte float while the file keeps
+# 8-byte double (H5Fsubscribe_type) -- halves the wire payload for the live
+# viewer without touching the archive.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,6 +25,18 @@ find_bin() {
 
 WRITER=$(find_bin rd_writer) || { echo "run_demo.sh: can't find rd_writer -- pass its build dir as \$1" >&2; exit 1; }
 MONITOR=$(find_bin rd_monitor) || { echo "run_demo.sh: can't find rd_monitor -- pass its build dir as \$1" >&2; exit 1; }
+
+# --float may appear anywhere; strip it out before positional parsing.
+MONITOR_EXTRA=""
+ARGS=()
+for a in "$@"; do
+    if [ "$a" = "--float" ]; then
+        MONITOR_EXTRA="--float"
+    else
+        ARGS+=("$a")
+    fi
+done
+set -- "${ARGS[@]:-}"
 
 GRID_N="${2:-80}"
 NSTEPS="${3:-150}"
@@ -62,6 +78,6 @@ fi
 # BEFORE the writer's fixed-length run ends and tears down the rendezvous
 # group, or the race goes the other way -- see rd_monitor.c's comment on
 # why it closes gracefully but promptly.
-"$MONITOR" "$GRID_N" "$NSTEPS"
+"$MONITOR" "$GRID_N" "$NSTEPS" 20000 ${MONITOR_EXTRA:+$MONITOR_EXTRA}
 
 wait "$WPID"

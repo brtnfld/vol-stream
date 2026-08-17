@@ -32,7 +32,12 @@ if(HDF5_C_LIBRARIES AND HDF5_INCLUDE_DIRS)
     set(HDF5_VERSION "caller-supplied")
   endif()
 else()
-  find_package(HDF5 1.14 REQUIRED COMPONENTS C)
+  # HDF5 2.x only.  The connector calls H5Tdecode2() and H5Dread_chunk2(),
+  # neither of which exists in 1.14.6, the latest 1.14 release -- so 1.14
+  # fails at compile time, not at run time.  This floor used to read 1.14,
+  # predating those calls; it never meant 1.14 was supported.  See the
+  # version-support section of docs/user-guide.md.
+  find_package(HDF5 2.0 REQUIRED COMPONENTS C)
 endif()
 
 # A parallel HDF5 pulls <mpi.h> in from H5public.h, so anything including
@@ -269,6 +274,30 @@ if(VOL_STREAM_HAVE_MERCURY)
 endif()
 if(VOL_STREAM_HAVE_BAKE)
   list(APPEND VOL_STREAM_SOURCES src/tr_bake.c)
+endif()
+
+# Mercury/Margo/Argobots/SSG (and BAKE) arrive as "-L<dir> -l<name>" flags
+# from `pkg-config --static`, not as full library paths, so CMake has no way
+# to infer an RPATH for them -- every binary then fails at load time with
+# "libssg.so.0: cannot open shared object file" unless the caller happens to
+# have LD_LIBRARY_PATH set.  Feed those directories in explicitly.
+#
+# Set before any target is created, so every target below (the connector, the
+# tests, the tools, the examples) inherits it.
+if(VOL_STREAM_HAVE_MERCURY OR VOL_STREAM_HAVE_BAKE)
+  set(VOL_STREAM_DEP_LIBDIRS
+      ${VOL_STREAM_MERCURY_LIBRARY_DIRS}  ${VOL_STREAM_MERCURY_STATIC_LIBRARY_DIRS}
+      ${VOL_STREAM_MARGO_LIBRARY_DIRS}    ${VOL_STREAM_MARGO_STATIC_LIBRARY_DIRS}
+      ${VOL_STREAM_ARGOBOTS_LIBRARY_DIRS} ${VOL_STREAM_ARGOBOTS_STATIC_LIBRARY_DIRS}
+      ${VOL_STREAM_SSG_LIBRARY_DIRS}      ${VOL_STREAM_SSG_STATIC_LIBRARY_DIRS}
+      ${VOL_STREAM_BAKE_CLIENT_LIBRARY_DIRS} ${VOL_STREAM_BAKE_CLIENT_STATIC_LIBRARY_DIRS}
+      ${VOL_STREAM_BAKE_SERVER_LIBRARY_DIRS} ${VOL_STREAM_BAKE_SERVER_STATIC_LIBRARY_DIRS}
+      ${VOL_STREAM_ABTIO_LIBRARY_DIRS}       ${VOL_STREAM_ABTIO_STATIC_LIBRARY_DIRS})
+  if(VOL_STREAM_DEP_LIBDIRS)
+    list(REMOVE_DUPLICATES VOL_STREAM_DEP_LIBDIRS)
+    list(APPEND CMAKE_BUILD_RPATH ${VOL_STREAM_DEP_LIBDIRS})
+    message(STATUS "  dep RPATH:       ${VOL_STREAM_DEP_LIBDIRS}")
+  endif()
 endif()
 
 add_library(vol_stream SHARED ${VOL_STREAM_SOURCES})

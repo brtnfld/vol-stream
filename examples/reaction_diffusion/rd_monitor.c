@@ -14,10 +14,20 @@
  * temperature does.
  *
  * Grid size (first argument) must match what rd_writer was started with.
+ *
+ * --float: ask the writer to deliver /V as 4-byte float instead of the
+ * 8-byte double it is stored as (H5Fsubscribe_type). The FILE keeps full
+ * double precision for the checkpoint; only this subscriber's stream is
+ * narrowed, and the conversion happens on the writer before marshaling, so
+ * the wire payload really is halved rather than merely cast on arrival.
+ * Exactly the "full fidelity to the archive, reduced precision to the live
+ * viz, from one end_step()" case -- and for a heatmap, float is already more
+ * precision than the terminal can show.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include "hdf5.h"
@@ -27,11 +37,19 @@
 static const char RD_RAMP[] = " .:-=+*#%@";
 #define RD_RAMP_LEN ((int)(sizeof(RD_RAMP) - 1))
 
+/* One element, whichever width the stream delivered. Keeping the rendering
+ * and stats code width-agnostic is the whole accommodation --float needs. */
+static double
+rd_at(const void *field, int as_float, size_t i)
+{
+    return as_float ? (double)((const float *)field)[i] : ((const double *)field)[i];
+}
+
 #define RD_FRAME_FILE "reaction_diffusion_frame.dat"
 #define RD_FRAME_TMP "reaction_diffusion_frame.dat.tmp"
 
 static void
-rd_print_map(const double *field, int n, double lo, double hi)
+rd_print_map(const void *field, int as_float, int n, double lo, double hi)
 {
     int    i, j;
     double span = hi - lo;
@@ -41,7 +59,7 @@ rd_print_map(const double *field, int n, double lo, double hi)
 
     for (i = 0; i < n; i++) {
         for (j = 0; j < n; j++) {
-            double v   = field[i * n + j];
+            double v   = rd_at(field, as_float, (size_t)i * n + j);
             int    idx = (int)(((v - lo) / span) * (RD_RAMP_LEN - 1));
 
             if (idx < 0)
@@ -58,7 +76,7 @@ rd_print_map(const double *field, int n, double lo, double hi)
  * heat_monitor.c's heat_write_frame(): rename() is atomic, a partial
  * fwrite() during plot_live.gnuplot's reread is not. */
 static void
-rd_write_frame(const double *field, int n)
+rd_write_frame(const void *field, int as_float, int n)
 {
     FILE *f = fopen(RD_FRAME_TMP, "w");
     int   i, j;
@@ -67,7 +85,7 @@ rd_write_frame(const double *field, int n)
         return;
     for (i = 0; i < n; i++) {
         for (j = 0; j < n; j++)
-            fprintf(f, "%s%.4f", j ? " " : "", field[i * n + j]);
+            fprintf(f, "%s%.4f", j ? " " : "", rd_at(field, as_float, (size_t)i * n + j));
         fputc('\n', f);
     }
     fclose(f);
@@ -77,14 +95,25 @@ rd_write_frame(const double *field, int n)
 int
 main(int argc, char **argv)
 {
-    int n            = argc > 1 ? atoi(argv[1]) : RD_DEFAULT_N;
-    int max_steps    = argc > 2 ? atoi(argv[2]) : 0; /* 0 = until the writer stops */
-    int step_timeout = argc > 3 ? atoi(argv[3]) : 20000;
+    int n = RD_DEFAULT_N, max_steps = 0, step_timeout = 20000;
+    int as_float = 0, positional = 0, a;
 
     hid_t       vol_id, fapl, fid, sub_space;
     hsize_t     dims[2];
     const char *paths[1] = {RD_DATASET_V};
     int         seen     = 0;
+
+    for (a = 1; a < argc; a++) {
+        if (strcmp(argv[a], "--float") == 0)
+            as_float = 1;
+        else
+            switch (positional++) {
+                case 0: n = atoi(argv[a]); break;
+                case 1: max_steps = atoi(argv[a]); break;
+                case 2: step_timeout = atoi(argv[a]); break;
+                default: break;
+            }
+    }
 
     setenv("VOL_STREAM_NA", "na+sm", 0);
 
@@ -116,9 +145,23 @@ main(int argc, char **argv)
         return 1;
     }
     H5Sclose(sub_space);
+
+    /* The narrowing, applied AFTER the subscription it narrows -- a later
+     * H5Fsubscribe() on the same path would clear it, so the order matters. */
+    if (as_float && H5Fsubscribe_type(fid, RD_DATASET_V, H5T_NATIVE_FLOAT) < 0) {
+        /* Not fatal, deliberately: the stream still works at the dataset's
+         * own precision, and returning here would strand a writer that is
+         * waiting for this subscriber. The consumer loop below reports the
+         * width actually delivered rather than trusting the request. */
+        fprintf(stderr, "monitor: WARNING could not narrow %s to float; taking double\n", RD_DATASET_V);
+        as_float = 0;
+    }
+
     rd_touch(RD_READY_SENTINEL);
 
     printf("monitor: subscribed to %s (%dx%d) -- watching live\n", RD_DATASET_V, n, n);
+    if (as_float)
+        printf("monitor: requested 4-byte float delivery; the file keeps 8-byte double\n");
     printf("monitor: live gnuplot matrix at ./%s (see plot_live.gnuplot)\n\n", RD_FRAME_FILE);
 
     for (;;) {
@@ -140,18 +183,30 @@ main(int argc, char **argv)
         }
 
         {
-            const double *field = (const double *)buf;
-            size_t        count = size / sizeof(double);
+            /* Trust the bytes actually delivered, not the request: a writer
+             * that could not convert sends the dataset's own type instead
+             * (over-send never under-send), so infer the width from size and
+             * element count rather than assuming --float was honored. */
+            int           got_float = (elem_count > 0 && size / (size_t)elem_count == sizeof(float));
+            const void   *field     = buf;
+            size_t        count     = size / (got_float ? sizeof(float) : sizeof(double));
             double        sum = 0.0, lo, hi;
             size_t        i;
 
-            lo = hi = field[0];
+            if (seen == 0 && as_float)
+                printf("monitor: delivered %zu bytes for %llu elements -> %s (double would be %zu)\n\n",
+                       size, (unsigned long long)elem_count, got_float ? "float, halved" : "double",
+                       (size_t)elem_count * sizeof(double));
+
+            lo = hi = rd_at(field, got_float, 0);
             for (i = 0; i < count; i++) {
-                sum += field[i];
-                if (field[i] > hi)
-                    hi = field[i];
-                if (field[i] < lo)
-                    lo = field[i];
+                double x = rd_at(field, got_float, i);
+
+                sum += x;
+                if (x > hi)
+                    hi = x;
+                if (x < lo)
+                    lo = x;
             }
 
             {
@@ -161,8 +216,8 @@ main(int argc, char **argv)
                 printf("reaction_diffusion: step %d (physical %llu), %zu element(s) [%s]\n\n", seen + 1,
                        (unsigned long long)phys, count, path ? path : "?");
                 if (count == (size_t)n * (size_t)n) {
-                    rd_print_map(field, n, lo, hi);
-                    rd_write_frame(field, n);
+                    rd_print_map(field, got_float, n, lo, hi);
+                    rd_write_frame(field, got_float, n);
                 }
                 printf("\nV: mean=%.4f  max=%.4f  min=%.4f  (auto-contrast range shown above)\n", mean, hi,
                        lo);

@@ -242,6 +242,9 @@ H5VL_STREAM_API extern hid_t H5VL_STREAM_g;
 #define H5VL_STREAM_OP_SET_QUEUE_POLICY   "vol-stream:set_queue_policy"
 #define H5VL_STREAM_OP_GET_SUBSCRIBED_DATA "vol-stream:get_subscribed_data"
 #define H5VL_STREAM_OP_SUBSCRIBE_PREDICATE "vol-stream:subscribe_predicate"
+#define H5VL_STREAM_OP_WAIT_SUBSCRIBERS    "vol-stream:wait_subscribers"
+#define H5VL_STREAM_OP_SET_RETENTION       "vol-stream:set_retention"
+#define H5VL_STREAM_OP_SUBSCRIBE_TYPE      "vol-stream:subscribe_type"
 
 /** Status of the current step */
 typedef enum H5F_step_status_t {
@@ -591,6 +594,116 @@ H5VL_STREAM_API herr_t H5Fwait_step_ready(hid_t file_id, uint64_t timeout_ms, ui
  */
 H5VL_STREAM_API herr_t H5Fset_stream_queue_policy(hid_t file_id, H5VL_stream_queue_policy_t policy,
                                                     uint64_t reserve_slots);
+
+/**
+ * \brief Reader only. Deliver an existing subscription's data as \p type_id
+ *        rather than the dataset's own datatype.
+ *
+ * The classic case: a field stored as \c double for the checkpoint, delivered
+ * to a live visualizer as \c float. The file keeps full precision; the
+ * subscriber gets half the bytes. Conversion happens on the \em writer, before
+ * marshaling, so the saving is in wire bytes and not merely in what the reader
+ * casts afterward.
+ *
+ * H5Fsubscribe() must have succeeded for \p path first: this narrows a
+ * subscription rather than being one, the same shape as
+ * H5Fsubscribe_predicate(). A later H5Fsubscribe() naming the same path clears
+ * the narrowing, so re-subscribe first and re-apply after, never the reverse.
+ *
+ * Conversion is HDF5's own (\c H5Tconvert), so any legal conversion works, not
+ * only narrowing: widening, byte-order swaps, and integer/float changes are all
+ * expressible. Passing \c H5I_INVALID_HID clears the narrowing and restores the
+ * dataset's own type.
+ *
+ * \param file_id  File opened through the vol-stream connector for reading,
+ *                 with the transport enabled (see VOL_STREAM_NA)
+ * \param path     A path passed to a previous H5Fsubscribe() on this file
+ * \param type_id  Datatype to deliver as, or H5I_INVALID_HID to clear
+ * \return \herr_t, -1 if the transport is unavailable, if \p path has no
+ *         subscription on the writer, or if \p type_id cannot be encoded
+ *
+ * \note H5Fget_subscribed_data() returns values in the requested type, so its
+ *       \c size reflects the narrowed element size. There is no type OUT
+ *       parameter: the caller asked for the type, so it already knows it.
+ *
+ * \note Composes with per-subscriber precision, in that order -- convert
+ *       first, then filter -- so a subscriber may ask for float AND a GZIP
+ *       pipeline and get both. It does, however, disable the M8.5.1 zero-copy
+ *       fast path, which serves the stored bytes verbatim in the dataset's own
+ *       type and therefore cannot apply.
+ *
+ * \note If the conversion cannot be performed, the writer sends the dataset's
+ *       own representation unchanged rather than failing -- the same
+ *       over-send-never-under-send rule the predicate and selection paths
+ *       follow. A subscriber that must have the narrowed type should check the
+ *       size it receives.
+ */
+H5VL_STREAM_API herr_t H5Fsubscribe_type(hid_t file_id, const char *path, hid_t type_id);
+
+/**
+ * \brief Writer only. Block until \p n_expected distinct subscribers have
+ *        registered, or \p timeout_ms elapses.
+ *
+ * This is the protocol-level fix for the start-up race that a subscription
+ * cannot otherwise win. A subscription only affects writes issued *after* it
+ * reaches the writer (see H5Fsubscribe()), so a writer that commits its first
+ * step before its readers have subscribed silently gives them nothing. Call
+ * this once, after H5Fcreate() and before the first H5Fbegin_step(), with the
+ * number of subscribers the job expects.
+ *
+ * Waiting here rather than on a sentinel file both sides can see is what keeps
+ * rendezvous free of any shared filesystem: the count is answered by the
+ * writer's own subscription table, filled by subscribe RPCs over the
+ * transport.
+ *
+ * Counts *subscribers*, not subscriptions -- one reader subscribing to three
+ * paths counts once. Returns immediately if the count is already met.
+ *
+ * \param file_id     File opened through the vol-stream connector for writing,
+ *                    with the transport enabled (see VOL_STREAM_NA)
+ * \param n_expected  Distinct subscribers to wait for. 0 returns immediately
+ * \param timeout_ms  Milliseconds to wait before giving up
+ * \return \herr_t, -1 on timeout, if the transport is unavailable, or if
+ *         \p file_id is not a writer
+ *
+ * \note Not collective. In a parallel writer each rank has its own transport
+ *       and its own subscribers; every rank that expects subscribers should
+ *       call it.
+ */
+H5VL_STREAM_API herr_t H5Fwait_subscribers(hid_t file_id, uint64_t n_expected, uint64_t timeout_ms);
+
+/**
+ * \brief Writer only. Bound how much committed step history the file retains.
+ *
+ * For using vol-stream as a live transit pipe rather than an archive. After
+ * each successful H5Fend_step(), steps beyond the bound are unlinked oldest
+ * first. Takes effect from the next commit; a policy set mid-stream accounts
+ * for the steps already committed, so it bounds the whole history rather than
+ * only what follows.
+ *
+ * \param file_id    File opened through the vol-stream connector for writing
+ * \param max_steps  Maximum committed steps to retain, or 0 for no step bound
+ * \param max_bytes  Maximum retained payload bytes, or 0 for no byte bound
+ * \return \herr_t, -1 if \p file_id is not a writer
+ *
+ * \warning **Pruning is destructive to reader resolution.** A reader resolves
+ *       a bare path to the largest step at or before its cursor that has an
+ *       entry for it (see H5Fbegin_step()), so an object whose most recent
+ *       write lives in a pruned step becomes unreadable, and
+ *       H5Fbegin_logical_step() cannot reach a pruned logical id. The same
+ *       applies to carry-forward for a resized dataset. Use this only when
+ *       the stream's consumers track the live tail.
+ *
+ * \note The newest step is never pruned, even by a \p max_bytes smaller than a
+ *       single step: bounding retention must not delete the step just written.
+ *
+ * \note This unlinks groups; it does not shrink the file. HDF5 does not return
+ *       freed space to the filesystem without \c h5repack, so this bounds
+ *       metadata and logical growth rather than bytes on disk.
+ *
+ * \note Best-effort: a failed unlink never fails the commit that triggered it.
+ */
+H5VL_STREAM_API herr_t H5Fset_stream_retention_policy(hid_t file_id, size_t max_steps, uint64_t max_bytes);
 
 /**
  * \brief Register the vol-stream connector and return its ID.
