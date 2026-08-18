@@ -189,6 +189,14 @@ is meant to catch. It needs an HDF5 built with `-DHDF5_TEST_API=ON`:
 | M9 | Tools, bindings, and the long tail | |
 | M10 | Live schema discovery | |
 
+Stretch goals — real ideas, no milestone number or exit gate — are recorded
+in [`docs/dev-plan.md`](docs/dev-plan.md#stretch-goals): a ParaView/VisIt
+reader plugin (both tools' current releases can already load the connector;
+what's missing is a plugin speaking `H5Fsubscribe()`/
+`H5Fget_stream_schema()`), and Conduit Blueprint as the data-model convention
+on top of a schema entry, which costs nothing to make legal here since
+Blueprint is HDF5 paths and attributes, not a separate library.
+
 Only four things are written here rather than borrowed: step semantics, queue
 policy, the subscription protocol, and the HDF5-to-step mapping. Everything else
 comes from a library that does that one job better — HDF5's own

@@ -1166,6 +1166,86 @@ nothing here changes that — but the metadata such a plugin has to have before
 it can be written now exists, and on both tools' current releases the
 connector itself is loadable.
 
+## Stretch goals
+
+Recorded rather than scheduled: real ideas with no milestone number, no exit
+gate, and no commitment to build them. Kept here so the reasoning survives
+even if nobody picks one up for a while.
+
+### A ParaView/VisIt reader plugin
+
+**Motivation.** M9's tool-compatibility matrix already establishes that a
+live stream is unreadable by any file-opening tool, `h5dump` included —
+`h5ls` reports `**NOT FOUND**` against a file a writer still holds open. A
+purpose-built visualization or analysis tool coupled to a running simulation
+hits exactly this wall, which M10 (live schema discovery) was built to
+answer: `H5Fget_stream_schema()` gives a reader with no prior knowledge of
+the stream a variable list before it subscribes to anything.
+
+**What is already measured, not assumed.** ParaView 5.12.0 ships HDF5 1.14.2
+and exports `H5VLregister_connector`, `H5Pset_vol`,
+`H5VLregister_opt_operation`, `H5VLfind_opt_operation`,
+`H5VLfile_optional_op` and `H5PLappend` unmangled from its bundled
+`libhdf5.310.2.0.dylib` — a connector built against the same version loads
+into it and the step API resolves. VisIt's current release (`v3.5.0`) builds
+against HDF5 2.0.0 per `bv_hdf5.sh`, so it has the VOL layer too. Neither
+ships a reader that speaks `H5Fsubscribe()`/`H5Fget_stream_schema()` — that
+plugin does not exist yet in either tool, and writing one is the actual
+stretch goal.
+
+**Shape of the plugin, if built.** `VisIt`'s `PopulateDatabaseMetaData` and
+ParaView's `RequestInformation` both run before any data request and need a
+variable list to offer a user — precisely what `H5Fget_stream_schema()`
+provides. `examples/heat_diffusion/heat_monitor.c` is already the minimal
+version of this: it discovers `/temperature`'s dataspace from the schema
+rather than trusting a command-line argument, subscribes with the discovered
+space, and redraws on every `H5Fget_subscribed_data()` push. A real plugin
+is the same loop wearing the tool's own reader interface instead of an ASCII
+heatmap.
+
+### Conduit Blueprint as the data-model convention
+
+A schema entry is a typed array at a path; it has no notion of "this is a
+coordinate array" or "this field lives on that mesh." Blueprint supplies
+exactly that, and unlike netCDF or CGNS it costs nothing to make legal here:
+Blueprint is a set of conventional HDF5 paths and attributes
+(`/coordsets/<name>/values/{x,y,z}`, `/topologies/<name>/type`,
+`/fields/<name>/{association,topology,values}`), not a separate C library
+with its own `H5Fopen`-equivalent. `conduit_relay_io_hdf5` reads and writes
+that convention with ordinary `H5D`/`H5G`/`H5A` calls, so nothing about the
+connector needs to change for a writer to legally produce it — a simulation
+that names its `H5Dcreate2()`/`H5Awrite()` calls at Blueprint paths already
+gets a Blueprint-shaped stream, no bridge required.
+
+Confirmed rather than assumed: `H5VL_stream_group_create()` always passes
+groups straight through, live, uncaptured in the step manifest — its own
+comment says a group "exist[s] only to supply path bookkeeping for their
+children's manifest entries," and replay rebuilds any needed ancestor group
+via `H5Pset_create_intermediate_group()`. The nested `/coordsets/coords/...`
+hierarchy Blueprint wants therefore needs no special handling; it is already
+exercised by every nested-path test in this suite.
+
+**The real gap, not glossed over.** `H5Fget_stream_schema()` reports a
+path's *type and extent*, never its *value* — so a Blueprint descriptor like
+`/topologies/mesh/type` (a string: `"structured"` vs `"unstructured"`) is
+visible to a reader as "an attribute of this datatype exists" but its actual
+content still has to arrive over `H5Fsubscribe()` + `H5Fget_subscribed_data()`,
+which delivers on the *next write*, not retroactively. Nothing in the
+subscription protocol replays a push that happened before a reader
+subscribed, so a reader either has to attach before the writer's first step,
+or the writer has to cheaply re-declare small Blueprint metadata every step
+so a late joiner eventually catches one. Real, and worth solving properly if
+this is picked up — not a one-line fix, since it would mean either a
+retroactive-delivery mode for a subscription (a genuine protocol change) or
+a documented convention that Blueprint descriptors are written every step.
+
+**Precedent.** This is structurally what Ascent already does for in-situ
+visualization: export a Blueprint-conforming Conduit node each cycle, hand
+it to a VisIt or ParaView Catalyst back end. A vol-stream reader plugin
+would be a different, reader-driven transport for the same Conduit-node
+shape — replacing Ascent's typically co-located, in-memory hand-off with
+`H5Fsubscribe()` over the wire — not a new data model.
+
 ## CI matrix
 
 | Axis | Values | Why |
