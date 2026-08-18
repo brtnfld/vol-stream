@@ -191,13 +191,8 @@ run_writer(hid_t vol_id, const char *fname, H5VL_stream_queue_policy_t policy, c
 {
     hid_t           fapl, fid, sp;
     struct timespec t0;
-    char            group_sidecar[128];
 
     (void)reader_pid;
-
-    snprintf(group_sidecar, sizeof(group_sidecar), "%s.vsgroup", fname);
-    unlink(group_sidecar);
-    unlink(fname);
 
     if ((fapl = H5Pcreate(H5P_FILE_ACCESS)) < 0 || H5Pset_vol(fapl, vol_id, NULL) < 0 ||
         H5Pset_file_locking(fapl, false, true) < 0) {
@@ -322,6 +317,21 @@ run_scenario(hid_t vol_id, H5VL_stream_queue_policy_t policy, const char *policy
     printf("-- %s --\n", policy_name);
 
     snprintf(fname, sizeof(fname), "t_queue_policy_%s.h5", policy_name);
+
+    /* Cleared before the fork, not inside run_writer(): the reader polls for
+     * this sidecar to know the writer is up, so one left behind by a previous
+     * run in the same directory sends it to join a group that died with that
+     * run -- and then to open a file the current writer is about to unlink
+     * ("can't retrieve stat info for file"). Same fix, and the same reason,
+     * as t_precision_dual.c's own pre-fork cleanup. */
+    {
+        char group_sidecar[128];
+
+        snprintf(group_sidecar, sizeof(group_sidecar), "%s.vsgroup", fname);
+        unlink(group_sidecar);
+        unlink(fname);
+    }
+
     unlink(PREFIX_SENTINEL);
     unlink(ACK0_SENTINEL);
     unlink(ACK1_SENTINEL);

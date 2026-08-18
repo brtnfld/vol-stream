@@ -91,8 +91,6 @@ run_writer(void)
     hid_t vol_id, fapl, fid, space, dcpl, ds = -1;
     int   s, *vals;
 
-    unlink(FNAME ".vsgroup");
-
     if ((vol_id = H5VL_stream_register()) < 0) {
         printf("writer: FAIL register\n");
         return 1;
@@ -365,6 +363,14 @@ main(void)
         return 1;
     }
     memset(g_timing, 0, sizeof(step_timing_t) * NSTEPS);
+
+    /* Cleared before the fork, not inside run_writer(): a reader polls for
+     * this sidecar to know the writer is up, so one left behind by a previous
+     * run in the same directory sends it to join a group that died with that
+     * run -- and then to open a file the current writer is about to unlink
+     * ("can't retrieve stat info for file"). Same fix, and the same reason,
+     * as t_precision_dual.c's own pre-fork cleanup. */
+    unlink(FNAME ".vsgroup");
 
     if ((pid = fork()) < 0) {
         perror("fork");
