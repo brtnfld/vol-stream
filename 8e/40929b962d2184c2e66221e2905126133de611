@@ -1,0 +1,21 @@
+README.md
+  s_421ba49132ba2b::t_cd92b5cbf3c6ae 192-199
+docs/dev-plan.md
+  s_421ba49132ba2b::t_3b209b3ebda139 1169-1248
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "8e40929b962d2184c2e66221e2905126133de611",
+  "prompts": {},
+  "sessions": {
+    "s_421ba49132ba2b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7f69c516-c332-45f5-8167-c009e22493be",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
