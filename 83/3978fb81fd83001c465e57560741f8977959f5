@@ -1,0 +1,65 @@
+examples/heat_diffusion/heat_monitor.c
+  s_421ba49132ba2b::t_967c7f97b0f4ab 14-19,24,119-157
+.github/workflows/ci.yml
+  s_421ba49132ba2b::t_f37499724f1a8a 346
+examples/heat_diffusion/README.md
+  s_421ba49132ba2b::t_c3f29f3483b490 65-72
+src/H5VLstream.h
+  s_421ba49132ba2b::t_eaac7bb42a14f8 163-175,258,554-616,618-641
+  s_421ba49132ba2b::t_23e4894d1bc907 617
+  s_421ba49132ba2b::t_8129303b94c091 642
+test/t_schema.c
+  s_421ba49132ba2b::t_39513ef6048452 1-449,460-504
+  s_421ba49132ba2b::t_38074c00a58918 450-459
+test/CMakeLists.txt
+  s_421ba49132ba2b::t_c0c89d9063b7b8 45-47,52-53,71-72
+docs/dev-plan.md
+  s_421ba49132ba2b::t_23e4894d1bc907 1138-1141
+  s_421ba49132ba2b::t_2d42e07a39bd61 969,981-983,1061-1137,1142-1152,1156-1157
+  s_421ba49132ba2b::t_bd7ee2a220e9da 1153-1155,1158-1167
+  s_421ba49132ba2b::t_b65189b8fd8b8c 1168
+src/H5VLstream.c
+  s_421ba49132ba2b::t_d33ba1dab98db0 220-245,403-416,647-657
+  s_421ba49132ba2b::t_b3c2c2719b4fc2 3464-3707,3716-3769,3771-3806,3808,3810-3817
+  s_421ba49132ba2b::t_adc565e3075a7e 941,1435-1436,8314-8315,10703-10711,11060,11998-12002
+  s_421ba49132ba2b::t_f265f7a7afc056 11030-11057,11059,11061,12004-12005,12683-12714,12716,12718-12723
+  s_421ba49132ba2b::t_b6ca0414f83e26 1003-1009
+  s_421ba49132ba2b::t_ea65518f9cc2a4 3708-3714,3770
+  s_421ba49132ba2b::t_38074c00a58918 3807,3809,12715,12717
+  s_421ba49132ba2b::t_d8792fdafbcc0a 3715
+  s_421ba49132ba2b::t_ef97e4bcc15b27 1010,10712,11058,12003
+src/tr_mercury.h
+  s_421ba49132ba2b::t_2ede3b9097903b 89-102,441-479
+  s_421ba49132ba2b::t_b205edc0d42a0e 480
+tools/h5stream.c
+  s_421ba49132ba2b::t_b0b10e5200f3da 848-935,937-1007,1131
+  s_421ba49132ba2b::t_f331ae2d46ca36 1040,1043-1048,1050-1056,1118-1130
+  s_421ba49132ba2b::t_54c0a40fd0a6d9 936
+  s_421ba49132ba2b::t_35b9dd5dc6f8fd 55,64-67
+src/tr_mercury.c
+  s_421ba49132ba2b::t_0928e175e7127a 148-158,264,282-290
+  s_421ba49132ba2b::t_77976cf152e38e 621-642,649-672,988,1005-1007,1014,1115-1116
+  s_421ba49132ba2b::t_2c688591ad2ba7 11
+  s_421ba49132ba2b::t_73d2d1238b18e2 1296-1434
+  s_421ba49132ba2b::t_d8792fdafbcc0a 643-648
+  s_421ba49132ba2b::t_af1f32353d1943 291,1435
+README.md
+  s_421ba49132ba2b::t_f5cf06e5c31e86 110,113-117,190
+  s_421ba49132ba2b::t_5a1ff130dfedc1 31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "833978fb81fd83001c465e57560741f8977959f5",
+  "prompts": {},
+  "sessions": {
+    "s_421ba49132ba2b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7f69c516-c332-45f5-8167-c009e22493be",
+        "model": "claude-opus-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
