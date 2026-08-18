@@ -62,9 +62,14 @@ network setup.
 
 `heat_writer [grid-n] [nsteps] [substeps] [delay-ms]` -- defaults 28, 150,
 6, 60. `heat_monitor [grid-n] [max-steps] [step-timeout-ms]` -- defaults
-28, 0 (watch until the writer stops), 20000. The grid size must match on
-both sides; nothing checks this for you (`H5Fsubscribe()`'s dataspace
-argument is how the monitor tells the writer what shape to expect).
+28, 0 (watch until the writer stops), 20000.
+
+The grid size no longer has to match by hand: the monitor calls
+`H5Fget_stream_schema()` and takes `/temperature`'s extent from the writer's
+own dataspace, printing a line if that disagrees with the number given on the
+command line. That argument is now a fallback for a writer that publishes no
+schema, and the discovered dataspace is what `H5Fsubscribe()` receives -- an
+in-situ tool cannot ask a user to retype the simulation's mesh.
 
 ## Watching it as a real graphical heatmap
 

@@ -217,6 +217,32 @@ typedef struct H5VL_stream_type_cache_entry_t {
     size_t   type_enc_len;
 } H5VL_stream_type_cache_entry_t;
 
+#ifdef VOL_STREAM_HAVE_MERCURY
+/* M10: one path in the schema a writer publishes for live discovery -- see
+ * H5VL__stream_publish_schema(). type_enc/space_enc are the bytes that go on
+ * the wire; type_id/space_id are copies kept only so the next step can ask
+ * "did this actually change?" with H5Tequal()/H5Sextent_equal() instead of
+ * re-encoding to find out. Re-encoding every path every step is precisely
+ * the O(steps x paths) bookkeeping cost the manifest's own type cache was
+ * added to avoid, and a schema is by definition the part that mostly does
+ * not change.
+ *
+ * space_id/space_enc describe the object's *extent* with everything
+ * selected, not the selection of whichever write last touched it: a
+ * selection belongs to a write, and a consumer reading this wants to know
+ * how big the object is so it can build a selection of its own. */
+typedef struct H5VL_stream_schema_entry_t {
+    char    *path;
+    int      kind; /* vs_Kind_enum_t -- Attr is reported as an attribute */
+    hid_t    type_id;
+    hid_t    space_id;
+    uint8_t *type_enc;
+    size_t   type_enc_len;
+    uint8_t *space_enc;
+    size_t   space_enc_len;
+} H5VL_stream_schema_entry_t;
+#endif
+
 /* One H5VL_stream_request_notify() registration still waiting on a step's
  * completion cell to resolve -- a singly linked list since there is no
  * bound on how many deferred requests from the same step get a callback
@@ -374,6 +400,20 @@ struct H5VL_stream_file_state_t {
     size_t                           n_replay_type_cache;
     size_t                           cap_replay_type_cache;
     H5VL_stream_pathmap_t            replay_type_map;
+
+#ifdef VOL_STREAM_HAVE_MERCURY
+    /* M10, writer side: what this stream currently carries, republished to
+     * the transport by H5Fend_step() only when schema_dirty says a step
+     * actually changed it (a new path, a new type, a resized extent). A
+     * steady stream rewriting the same objects therefore publishes once and
+     * pays nothing per step after that. Empty on a reader, and on any writer
+     * with no transport. */
+    H5VL_stream_schema_entry_t *schema;
+    size_t                       n_schema;
+    size_t                       cap_schema;
+    H5VL_stream_pathmap_t        schema_map;
+    int                          schema_dirty;
+#endif
 };
 
 /* Whether a wrapped object is a real, opened/created underlying object, a
@@ -604,6 +644,17 @@ static int H5VL__stream_selection_runs(const uint8_t *sub_space_enc, uint64_t su
  * H5Pcreate(H5P_FILE_ACCESS). */
 static hid_t H5VL__stream_scratch_fapl(void);
 static void  H5VL__stream_scratch_name(const char *role, char *out, size_t out_len);
+/* M10 live schema: the writer half (fold this step's entries into the
+ * published schema, encode it, hand it to the transport) and the reader half
+ * (turn the received blob back into real ids). See
+ * H5VL__stream_publish_schema()'s comment. */
+static herr_t H5VL__stream_schema_upsert(H5VL_stream_file_state_t *fs, const H5VL_stream_pending_entry_t *pe);
+static herr_t H5VL__stream_encode_schema(H5VL_stream_file_state_t *fs, uint64_t physical_step, uint8_t **buf,
+                             size_t *len);
+static void   H5VL__stream_publish_schema(H5VL_stream_file_state_t *fs, uint64_t physical_step);
+static herr_t H5VL__stream_decode_schema(const uint8_t *blob, size_t len, size_t *out_n,
+                             H5F_stream_var_t **out_vars);
+static void   H5VL__stream_schema_clear(H5VL_stream_file_state_t *fs);
 #endif
 
 /* Flat-run decomposition of a selection. Declared up here rather than beside
@@ -887,6 +938,7 @@ static int H5VL_stream_op_wait_step_ready    = -1;
 static int H5VL_stream_op_set_queue_policy   = -1;
 static int H5VL_stream_op_get_subscribed_data = -1;
 static int H5VL_stream_op_subscribe_predicate = -1;
+static int H5VL_stream_op_get_stream_schema  = -1;
 
 /* Argument structs for the step operations. */
 typedef struct H5VL_stream_args_begin_step_t {
@@ -947,6 +999,14 @@ typedef struct H5VL_stream_args_get_subscribed_data_t {
     uint64_t *elem_start;    /* OUT */
     uint64_t *elem_count;    /* OUT */
 } H5VL_stream_args_get_subscribed_data_t;
+
+/* M10 */
+typedef struct H5VL_stream_args_get_stream_schema_t {
+    uint64_t           timeout_ms;
+    uint64_t          *physical_step; /* OUT; NULL if not wanted */
+    size_t            *n_vars;        /* OUT */
+    H5F_stream_var_t **vars;          /* OUT, newly allocated */
+} H5VL_stream_args_get_stream_schema_t;
 
 /*-------------------------------------------------------------------------
  * Default connector info.
@@ -1372,6 +1432,8 @@ H5VL__stream_file_state_decref(H5VL_stream_file_state_t *fs)
 #endif
 
 #ifdef VOL_STREAM_HAVE_MERCURY
+    H5VL__stream_schema_clear(fs);
+
     if (fs->transport)
         vs_tr_stop(fs->transport);
 #endif
@@ -3399,6 +3461,360 @@ done:
         H5Pclose(dcpl);
     return ret_value;
 } /* end H5VL__stream_unfilter_pushed_data() */
+
+/*-------------------------------------------------------------------------
+ * M10: the live schema -- what a running writer says its stream contains.
+ *
+ * The wire format is this project's own, hand-rolled and explicitly
+ * little-endian, for the reason the VL length tag taught (see the
+ * cross-endian section in docs/dev-plan.md): the contents are HDF5's own
+ * portable H5Tencode()/H5Sencode2() bytes, but the framing around them is
+ * ours and has to be readable by a subscriber of the other endianness.
+ *
+ *   header, 16 bytes
+ *     u8  version                 u8  reserved (0)
+ *     u16 reserved (0)            u32 n_entries
+ *     u64 physical_step           -- the step whose commit published this
+ *
+ *   then n_entries x (16-byte entry header, then its three variable parts)
+ *     u32 path_len (no NUL)       u32 type_enc_len
+ *     u32 space_enc_len           u8  kind (vs_Kind_enum_t)
+ *     u8  reserved[3]
+ *     path bytes, type bytes, space bytes
+ *
+ * Not a flatbuffer, unlike the step manifest, and deliberately: the manifest
+ * is persisted into the file and has to stay readable by a later, different
+ * version of this code, which is what flatcc's compatible-evolution rules
+ * buy. A schema blob lives for exactly one RPC between two processes that
+ * are talking right now, so the version byte is enough, and keeping flatcc
+ * out of the transport path leaves tr_mercury.c free of it too.
+ *-------------------------------------------------------------------------
+ */
+#define H5VL_STREAM_SCHEMA_VERSION 1
+#define H5VL_STREAM_SCHEMA_HDR     16
+#define H5VL_STREAM_SCHEMA_ENT_HDR 16
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_schema_upsert
+ *
+ * Purpose:     Fold one of a committing step's pending entries into the
+ *              file's published schema, marking it dirty only if this entry
+ *              actually changed something.
+ *
+ *              The comparison is H5Tequal()/H5Sextent_equal() against the
+ *              ids kept from last time rather than a memcmp of freshly
+ *              encoded bytes, so the ordinary case -- the same objects
+ *              rewritten at the same shape, step after step -- costs two
+ *              cheap library calls per entry and no encoding at all. Only a
+ *              real change (a path first seen, a datatype changed, an extent
+ *              resized) pays for H5Tencode()/H5Sencode2().
+ *
+ * Return:      Success:    0
+ *              Failure:    -1, schema left as it was
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_schema_upsert(H5VL_stream_file_state_t *fs, const H5VL_stream_pending_entry_t *pe)
+{
+    H5VL_stream_schema_entry_t *e          = NULL;
+    hid_t                        extent     = H5I_INVALID_HID;
+    uint8_t                     *type_enc   = NULL;
+    uint8_t                     *space_enc  = NULL;
+    size_t                       type_len   = 0;
+    size_t                       space_len  = 0;
+    size_t                       idx;
+    int                          found;
+
+    if (!pe->path || pe->type_id < 0 || pe->space_id < 0)
+        return 0; /* nothing describable -- not an error, just not schema */
+
+    found = (0 == H5VL__stream_pathmap_find(&fs->schema_map, pe->path, &idx));
+    if (found) {
+        e = &fs->schema[idx];
+        if (e->kind == pe->kind && H5Tequal(e->type_id, pe->type_id) > 0 &&
+            H5Sextent_equal(e->space_id, pe->space_id) > 0)
+            return 0; /* unchanged -- the steady-state path, and the point */
+    }
+
+    /* The extent, with the selection dropped: a selection describes one
+     * write, and a consumer reading a schema wants the object's shape so it
+     * can build a selection of its own. */
+    if ((extent = H5Scopy(pe->space_id)) < 0)
+        return -1;
+    if (H5Sget_simple_extent_type(extent) == H5S_SIMPLE && H5Sselect_all(extent) < 0)
+        goto error;
+
+    if (H5VL__stream_encode_type(pe->type_id, &type_enc, &type_len) < 0)
+        goto error;
+    if (H5VL__stream_encode_space(extent, &space_enc, &space_len) < 0)
+        goto error;
+
+    if (found) {
+        H5Tclose(e->type_id);
+        H5Sclose(e->space_id);
+        free(e->type_enc);
+        free(e->space_enc);
+    }
+    else {
+        if (fs->n_schema == fs->cap_schema) {
+            size_t                       new_cap = fs->cap_schema ? fs->cap_schema * 2 : 8;
+            H5VL_stream_schema_entry_t *grown;
+
+            if (NULL == (grown = (H5VL_stream_schema_entry_t *)realloc(fs->schema,
+                                                                        new_cap * sizeof(*fs->schema))))
+                goto error;
+            fs->schema     = grown;
+            fs->cap_schema = new_cap;
+        }
+        e = &fs->schema[fs->n_schema];
+        memset(e, 0, sizeof(*e));
+        if (NULL == (e->path = strdup(pe->path)))
+            goto error;
+        if (H5VL__stream_pathmap_set(&fs->schema_map, pe->path, fs->n_schema) < 0) {
+            free(e->path);
+            goto error;
+        }
+        fs->n_schema++;
+    }
+
+    e->kind           = pe->kind;
+    e->type_id        = H5Tcopy(pe->type_id);
+    e->space_id       = extent;
+    e->type_enc       = type_enc;
+    e->type_enc_len   = type_len;
+    e->space_enc      = space_enc;
+    e->space_enc_len  = space_len;
+    fs->schema_dirty  = 1;
+
+    return 0;
+
+error:
+    if (extent >= 0)
+        H5Sclose(extent);
+    free(type_enc);
+    free(space_enc);
+    return -1;
+} /* end H5VL__stream_schema_upsert() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_encode_schema
+ *
+ * Purpose:     Pack the whole published schema into the blob above. Caller
+ *              frees *buf.
+ *
+ * Return:      Success:    0
+ *              Failure:    -1
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_encode_schema(H5VL_stream_file_state_t *fs, uint64_t physical_step, uint8_t **buf, size_t *len)
+{
+    size_t   total = H5VL_STREAM_SCHEMA_HDR;
+    size_t   i, off;
+    uint8_t *out;
+
+    for (i = 0; i < fs->n_schema; i++)
+        total += H5VL_STREAM_SCHEMA_ENT_HDR + strlen(fs->schema[i].path) + fs->schema[i].type_enc_len +
+                 fs->schema[i].space_enc_len;
+
+    if (NULL == (out = (uint8_t *)malloc(total)))
+        return -1;
+
+    out[0] = (uint8_t)H5VL_STREAM_SCHEMA_VERSION;
+    out[1] = 0;
+    H5VL__stream_put_u16le(out + 2, 0);
+    H5VL__stream_put_u32le(out + 4, (uint32_t)fs->n_schema);
+    H5VL__stream_put_u64le(out + 8, physical_step);
+
+    off = H5VL_STREAM_SCHEMA_HDR;
+    for (i = 0; i < fs->n_schema; i++) {
+        H5VL_stream_schema_entry_t *e        = &fs->schema[i];
+        size_t                       path_len = strlen(e->path);
+
+        H5VL__stream_put_u32le(out + off, (uint32_t)path_len);
+        H5VL__stream_put_u32le(out + off + 4, (uint32_t)e->type_enc_len);
+        H5VL__stream_put_u32le(out + off + 8, (uint32_t)e->space_enc_len);
+        out[off + 12] = (uint8_t)e->kind;
+        out[off + 13] = 0;
+        out[off + 14] = 0;
+        out[off + 15] = 0;
+        off += H5VL_STREAM_SCHEMA_ENT_HDR;
+
+        memcpy(out + off, e->path, path_len);
+        off += path_len;
+        memcpy(out + off, e->type_enc, e->type_enc_len);
+        off += e->type_enc_len;
+        memcpy(out + off, e->space_enc, e->space_enc_len);
+        off += e->space_enc_len;
+    }
+
+    *buf = out;
+    *len = total;
+    return 0;
+} /* end H5VL__stream_encode_schema() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_publish_schema
+ *
+ * Purpose:     Called from H5Fend_step() with the committing step's entries
+ *              still in the pending buffer: fold them into the schema and,
+ *              if that changed anything, hand the transport a fresh blob to
+ *              answer live queries with.
+ *
+ *              Best-effort, like every other transport call end_step()
+ *              makes. A schema that fails to encode costs a reader its
+ *              variable list, which is worth reporting nowhere and failing
+ *              nothing: the step itself is already durable, and the next
+ *              step republishes.
+ *
+ * Return:      void
+ *-------------------------------------------------------------------------
+ */
+static void
+H5VL__stream_publish_schema(H5VL_stream_file_state_t *fs, uint64_t physical_step)
+{
+    uint8_t *blob = NULL;
+    size_t   len  = 0;
+    size_t   i;
+
+    if (!fs->transport)
+        return;
+
+    for (i = 0; i < fs->n_pending; i++)
+        H5VL__stream_schema_upsert(fs, &fs->pending[i]);
+
+    if (!fs->schema_dirty)
+        return;
+
+    if (H5VL__stream_encode_schema(fs, physical_step, &blob, &len) < 0)
+        return;
+
+    vs_tr_writer_publish_schema(fs->transport, physical_step, blob, (uint64_t)len);
+    free(blob);
+    fs->schema_dirty = 0;
+} /* end H5VL__stream_publish_schema() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_decode_schema
+ *
+ * Purpose:     Reader side: turn a received blob back into real ids.
+ *
+ *              Every length is bounds-checked against what actually arrived
+ *              rather than trusted. This is the only place in the connector
+ *              where a buffer from another process is walked structurally,
+ *              and a truncated or hostile blob must fail the call, not index
+ *              past the end of it.
+ *
+ *              The framing is fully checked; the payloads are as checked as
+ *              HDF5 allows. H5Tdecode2() takes the length and is given it;
+ *              H5Sdecode() takes none, so for the dataspace this can only
+ *              guarantee that its *declared* extent lies inside what arrived.
+ *              That is the same exposure the manifest replay path has had
+ *              since M2, and it is HDF5's API surface rather than this
+ *              protocol's framing.
+ *
+ * Return:      Success:    0, *out_vars newly allocated (H5Ffree_stream_
+ *                          schema() releases it)
+ *              Failure:    -1
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_decode_schema(const uint8_t *blob, size_t len, size_t *out_n, H5F_stream_var_t **out_vars)
+{
+    H5F_stream_var_t *vars = NULL;
+    uint32_t           n, i;
+    size_t             off;
+
+    if (!blob || len < H5VL_STREAM_SCHEMA_HDR)
+        return -1;
+    if (blob[0] != H5VL_STREAM_SCHEMA_VERSION)
+        return -1;
+
+    n = H5VL__stream_get_u32le(blob + 4);
+    if (n == 0) {
+        *out_n    = 0;
+        *out_vars = NULL;
+        return 0;
+    }
+    if (NULL == (vars = (H5F_stream_var_t *)calloc(n, sizeof(*vars))))
+        return -1;
+    for (i = 0; i < n; i++) {
+        vars[i].type_id  = H5I_INVALID_HID;
+        vars[i].space_id = H5I_INVALID_HID;
+    }
+
+    off = H5VL_STREAM_SCHEMA_HDR;
+    for (i = 0; i < n; i++) {
+        uint32_t path_len, type_len, space_len;
+
+        if (off + H5VL_STREAM_SCHEMA_ENT_HDR > len)
+            goto error;
+        path_len  = H5VL__stream_get_u32le(blob + off);
+        type_len  = H5VL__stream_get_u32le(blob + off + 4);
+        space_len = H5VL__stream_get_u32le(blob + off + 8);
+        vars[i].is_attr = (blob[off + 12] == (uint8_t)vs_Kind_Attr) ? 1u : 0u;
+        off += H5VL_STREAM_SCHEMA_ENT_HDR;
+
+        /* Added rather than summed into a single comparison so an overflowing
+         * length cannot wrap past the check. */
+        if (path_len > len - off)
+            goto error;
+        if (NULL == (vars[i].path = (char *)malloc((size_t)path_len + 1)))
+            goto error;
+        memcpy(vars[i].path, blob + off, path_len);
+        vars[i].path[path_len] = '\0';
+        off += path_len;
+
+        if (type_len > len - off)
+            goto error;
+        if ((vars[i].type_id = H5Tdecode2(blob + off, (size_t)type_len)) < 0)
+            goto error;
+        off += type_len;
+
+        if (space_len > len - off)
+            goto error;
+        if ((vars[i].space_id = H5Sdecode(blob + off)) < 0)
+            goto error;
+        off += space_len;
+    }
+
+    *out_n    = (size_t)n;
+    *out_vars = vars;
+    return 0;
+
+error:
+    H5Ffree_stream_schema((size_t)n, vars);
+    return -1;
+} /* end H5VL__stream_decode_schema() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_schema_clear
+ *
+ * Purpose:     Release the published schema at file close.
+ *
+ * Return:      void
+ *-------------------------------------------------------------------------
+ */
+static void
+H5VL__stream_schema_clear(H5VL_stream_file_state_t *fs)
+{
+    size_t i;
+
+    for (i = 0; i < fs->n_schema; i++) {
+        free(fs->schema[i].path);
+        free(fs->schema[i].type_enc);
+        free(fs->schema[i].space_enc);
+        if (fs->schema[i].type_id > 0)
+            H5Tclose(fs->schema[i].type_id);
+        if (fs->schema[i].space_id > 0)
+            H5Sclose(fs->schema[i].space_id);
+    }
+    free(fs->schema);
+    fs->schema     = NULL;
+    fs->n_schema   = 0;
+    fs->cap_schema = 0;
+    H5VL__stream_pathmap_clear(&fs->schema_map);
+} /* end H5VL__stream_schema_clear() */
 #endif /* VOL_STREAM_HAVE_MERCURY */
 
 /*-------------------------------------------------------------------------
@@ -7895,6 +8311,8 @@ H5VL_stream_init(hid_t vipl_id)
     if (H5VL__stream_register_op(H5VL_STREAM_OP_SUBSCRIBE_PREDICATE, &H5VL_stream_op_subscribe_predicate) <
         0)
         return -1;
+    if (H5VL__stream_register_op(H5VL_STREAM_OP_GET_STREAM_SCHEMA, &H5VL_stream_op_get_stream_schema) < 0)
+        return -1;
 
     return 0;
 } /* end H5VL_stream_init() */
@@ -10282,6 +10700,16 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
          * view across ranks; see H5VL__stream_queue_lag_view(). */
         replay_ret = H5VL__stream_apply_queue_policy(o);
 
+#ifdef VOL_STREAM_HAVE_MERCURY
+        /* M10: fold what this step wrote into the schema a live reader can
+         * query, while the entries still exist -- the pending buffer is
+         * discarded immediately below. Only on a step that actually
+         * committed: a failed replay published nothing, so describing it
+         * would be describing a step no reader can ever read. */
+        if (replay_ret >= 0)
+            H5VL__stream_publish_schema(o->file_state, o->file_state->physical_step);
+#endif
+
         /* Discard the pending buffer either way: a failed replay may have
          * landed some entries and not others, and there is no partial-step
          * state worth preserving -- see the same reasoning for an unclosed
@@ -10595,6 +11023,38 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
 
             return (herr_t)r;
         }
+#else
+        return -1;
+#endif
+    }
+    else if (args->op_type == H5VL_stream_op_get_stream_schema) {
+#ifdef VOL_STREAM_HAVE_MERCURY
+        H5VL_stream_args_get_stream_schema_t *sargs = (H5VL_stream_args_get_stream_schema_t *)args->args;
+        uint8_t                              *blob     = NULL;
+        uint64_t                               blob_len = 0;
+        uint64_t                               step      = 0;
+        herr_t                                 ret;
+
+        if (!sargs || !sargs->n_vars || !sargs->vars || !o->file_state || !o->file_state->is_reader ||
+            !o->file_state->transport)
+            return -1;
+
+        if (0 != vs_tr_reader_get_schema(o->file_state->transport, sargs->timeout_ms, &step, &blob,
+                                          &blob_len))
+            return -1;
+
+        /* Decoding is this side's job, not the transport's: tr_mercury.c
+         * carries the blob without knowing an H5Tencode() from an
+         * H5Sencode2() one, exactly as it carries every other blob in this
+         * protocol. */
+        ret = H5VL__stream_decode_schema(blob, (size_t)blob_len, sargs->n_vars, sargs->vars);
+        free(blob);
+        if (ret < 0)
+            return -1;
+
+        if (sargs->physical_step)
+            *sargs->physical_step = step;
+        return 0;
 #else
         return -1;
 #endif
@@ -11535,6 +11995,14 @@ H5VL_stream_introspect_opt_query(void *obj, H5VL_subclass_t cls, int opt_type, u
         *flags = H5VL_OPT_QUERY_SUPPORTED | H5VL_OPT_QUERY_QUERY_METADATA;
         return 0;
     }
+    else if (cls == H5VL_SUBCLS_FILE && opt_type == H5VL_stream_op_get_stream_schema) {
+        /* M10: reads what the writer publishes and changes nothing, on
+         * either side -- the same shape as get_subscribed_data, and
+         * registered regardless of whether this build has a transport so the
+         * op string always resolves. */
+        *flags = H5VL_OPT_QUERY_SUPPORTED | H5VL_OPT_QUERY_QUERY_METADATA;
+        return 0;
+    }
 
     ret_value = H5VLintrospect_opt_query(o->under_object, o->under_vol_id, cls, opt_type, flags);
 
@@ -12212,3 +12680,44 @@ H5Fget_subscribed_data(hid_t file_id, uint64_t timeout_ms, uint64_t *physical_st
 
     return H5VL__stream_file_op(file_id, H5VL_stream_op_get_subscribed_data, &op_args);
 } /* end H5Fget_subscribed_data() */
+
+herr_t
+H5Fget_stream_schema(hid_t file_id, uint64_t timeout_ms, uint64_t *physical_step, size_t *n_vars,
+                       H5F_stream_var_t **vars)
+{
+    H5VL_stream_args_get_stream_schema_t op_args;
+
+    if (!n_vars || !vars)
+        return -1;
+
+    op_args.timeout_ms     = timeout_ms;
+    op_args.physical_step  = physical_step;
+    op_args.n_vars          = n_vars;
+    op_args.vars            = vars;
+
+    return H5VL__stream_file_op(file_id, H5VL_stream_op_get_stream_schema, &op_args);
+} /* end H5Fget_stream_schema() */
+
+herr_t
+H5Ffree_stream_schema(size_t n_vars, H5F_stream_var_t *vars)
+{
+    size_t i;
+
+    /* Not routed through the connector at all -- it frees memory this
+     * process allocated and closes ids this process opened, neither of which
+     * needs a file to still be open. A viewer that closed the stream and
+     * then released its variable list is doing something reasonable. */
+    if (!vars)
+        return 0;
+
+    for (i = 0; i < n_vars; i++) {
+        free(vars[i].path);
+        if (vars[i].type_id > 0)
+            H5Tclose(vars[i].type_id);
+        if (vars[i].space_id > 0)
+            H5Sclose(vars[i].space_id);
+    }
+    free(vars);
+
+    return 0;
+} /* end H5Ffree_stream_schema() */

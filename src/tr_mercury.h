@@ -86,6 +86,20 @@
  *          in the protocol that can take a push to zero bytes: subvolume
  *          routing and precision both still send *something* for every write
  *          that overlaps a subscription.
+ *
+ *          M10, live schema: one more RPC, and the first that answers "what
+ *          is in this stream?" rather than moving one path's bytes. A writer
+ *          publishes an opaque schema blob at each end_step()
+ *          (vs_tr_writer_publish_schema()); a reader pulls the latest one
+ *          (vs_tr_reader_get_schema()) before it knows any path, shape or
+ *          type. Pull rather than push, for the same reader-driven reason
+ *          the subscription protocol is: metadata that changes rarely should
+ *          not go on the wire once per step to every member, and a late
+ *          joiner attaching to a steady stream would otherwise never see a
+ *          change to learn from. Opaque here like every other blob -- see
+ *          vs_tr_writer_publish_schema()'s comment for why the writer hands
+ *          over finished bytes instead of this module calling back to
+ *          produce them on demand.
  */
 
 #ifndef VOL_STREAM_TR_MERCURY_H
@@ -423,6 +437,46 @@ int vs_tr_reader_wait_data(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physical_
                             void **out_buf, uint64_t *out_size, uint64_t *out_elem_start,
                             uint64_t *out_elem_count, uint8_t **out_dcpl_enc, uint64_t *out_dcpl_enc_len,
                             uint8_t **out_type_enc, uint64_t *out_type_enc_len, uint32_t *out_filter_mask);
+
+/* Writer side (M10): publish the schema bytes a later
+ * vs_tr_reader_get_schema() query is answered with -- what this stream
+ * currently carries, one entry per path, with whatever a reader needs to
+ * describe it. Opaque here exactly like dcpl_enc/pred_enc/space_enc:
+ * H5VLstream.c both encodes and decodes it (H5Tencode()/H5Sencode2() bytes
+ * inside), so this module still needs no HDF5 header of its own.
+ *
+ * Deliberately *published* rather than produced on demand by a callback,
+ * unlike vs_tr_refilter_fn and friends. Every RPC handler in this module
+ * runs on a Margo/Argobots thread and is forbidden from touching HDF5 (v1
+ * is not H5VL_CAP_FLAG_THREADSAFE -- see vs_reader_ack_ult()'s comment), and
+ * encoding a datatype is an HDF5 call. The writer therefore hands over
+ * finished bytes on its own application thread, from H5Fend_step(), where
+ * the encoded blobs already exist because the step's manifest just built
+ * them; the handler only has to copy them out.
+ *
+ * Copies blob rather than borrowing it, so the caller keeps ownership of its
+ * own buffer, and replaces whatever was published before -- the latest
+ * schema is the only one anybody asks for. blob NULL/len 0 clears it.
+ * Returns 0 on success, -1 on a local error (allocation, or no tr). */
+int vs_tr_writer_publish_schema(vs_tr_t *tr, uint64_t physical_step, const uint8_t *blob, uint64_t len);
+
+/* Reader side (M10): fetch the writer's most recently published schema blob,
+ * newly malloc'd into *out_blob (caller frees) with *out_physical_step set
+ * to the step it describes. Finds the writer the same
+ * cached-then-probe way vs_tr_reader_subscribe() does.
+ *
+ * Retries until timeout_ms elapses when a writer answers but has published
+ * nothing yet -- the ordinary case for a reader that attached before the
+ * first end_step(), and the reason this takes a timeout at all. The two
+ * answers are distinguishable because the reply says which member is the
+ * writer independently of whether it had a schema to give (the lesson
+ * vs_subscribe_out_t's `matched` field records: overloading status would
+ * make a prober keep hunting for a writer that had already answered).
+ *
+ * Returns 0 on success, -1 on timeout, if no writer is reachable, or if this
+ * process has no group. */
+int vs_tr_reader_get_schema(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *out_physical_step,
+                             uint8_t **out_blob, uint64_t *out_len);
 
 #ifdef __cplusplus
 }

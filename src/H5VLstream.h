@@ -160,6 +160,19 @@
  *              is about how a re-filtered push is stored in transit, not
  *              about which elements are chosen.
  *
+ *              M10 status: live schema discovery. H5Fget_stream_schema()
+ *              asks a running writer what it is publishing -- every path,
+ *              with its datatype and its current extent -- over the same
+ *              transport a subscription travels on. Until this, a subscriber
+ *              had to already know the shape of what it wanted
+ *              (H5Fsubscribe() takes a dataspace, and nothing checked it
+ *              against the writer's), which is fine for a purpose-built
+ *              monitor and impossible for a generic consumer: a
+ *              visualization tool has to populate a variable list before a
+ *              user can ask for anything. The writer publishes the schema
+ *              from H5Fend_step(), where the encoded blobs already exist,
+ *              and a reader pulls the latest one.
+ *
  *              M9 status: predicate pushdown. H5Fsubscribe_predicate()
  *              attaches a value test to an existing subscription, and the
  *              writer evaluates it against the bytes it is about to send,
@@ -242,6 +255,7 @@ H5VL_STREAM_API extern hid_t H5VL_STREAM_g;
 #define H5VL_STREAM_OP_SET_QUEUE_POLICY   "vol-stream:set_queue_policy"
 #define H5VL_STREAM_OP_GET_SUBSCRIBED_DATA "vol-stream:get_subscribed_data"
 #define H5VL_STREAM_OP_SUBSCRIBE_PREDICATE "vol-stream:subscribe_predicate"
+#define H5VL_STREAM_OP_GET_STREAM_SCHEMA   "vol-stream:get_stream_schema"
 
 /** Status of the current step */
 typedef enum H5F_step_status_t {
@@ -536,6 +550,95 @@ H5VL_STREAM_API herr_t H5Fsubscribe_predicate(hid_t file_id, const char *path, H
 H5VL_STREAM_API herr_t H5Fget_subscribed_data(hid_t file_id, uint64_t timeout_ms, uint64_t *physical_step,
                                                 char **path, void **buf, size_t *size, uint64_t *elem_start,
                                                 uint64_t *elem_count);
+
+/**
+ * \brief M10: one object a live stream is currently publishing, as
+ *        H5Fget_stream_schema() reports it.
+ *
+ * \c type_id and \c space_id are real HDF5 ids decoded from the writer's own
+ * H5Tencode()/H5Sencode2() bytes, so a consumer that has never opened the
+ * file can size a buffer, build a selection and subscribe from these alone.
+ * \c space_id carries the object's *extent* with everything selected -- not
+ * whatever selection the writer's last write to that path happened to use,
+ * which is a property of one write rather than of the object. Apply your own
+ * selection to a copy of it and hand that to H5Fsubscribe().
+ *
+ * Every field is owned by the array H5Fget_stream_schema() returned; release
+ * the whole thing with H5Ffree_stream_schema(), which closes the ids too.
+ */
+typedef struct H5F_stream_var_t {
+    char    *path;     /**< Object path as the writer captured it            */
+    hid_t    type_id;  /**< Datatype                                          */
+    hid_t    space_id; /**< Extent, all elements selected                     */
+    unsigned is_attr;  /**< 1 if \c path names an attribute ("object@attr")   */
+} H5F_stream_var_t;
+
+/**
+ * \brief M10: reader only. Ask the writer what this stream currently carries.
+ *
+ * The metadata half of the subscription protocol, and the call that makes a
+ * *generic* consumer possible: H5Fsubscribe() needs a path and a dataspace,
+ * and before this the only way to have either was to know them in advance
+ * (which every example and test in this repo did, by construction -- see
+ * examples/heat_diffusion, where the grid size is a command-line argument on
+ * both sides and nothing checks that the two agree). A visualization or
+ * analysis tool cannot work that way: it has to present a variable list
+ * before a user can select anything from it.
+ *
+ * Reader-driven, so it is a pull: the writer republishes its schema only when
+ * something about it actually changed (a new path, a new type, a resized
+ * extent), and the reader asks for the latest whenever it wants one. Nothing
+ * about this goes on the wire per step.
+ *
+ * \param file_id       File opened through the vol-stream connector for
+ *                      reading, with the transport enabled (see
+ *                      VOL_STREAM_NA) -- the writer holds the file open, so
+ *                      there is no other channel by which this can be
+ *                      answered
+ * \param timeout_ms    Milliseconds to keep trying. A reader that attached
+ *                      before the writer's first H5Fend_step() gets a writer
+ *                      with no schema yet, which is retried rather than
+ *                      failed, so this doubles as "wait for the stream to
+ *                      describe itself"
+ * \param physical_step OUT: the step whose commit last published this
+ *                      schema, or NULL if not wanted
+ * \param n_vars        OUT: number of entries in \p vars
+ * \param vars          OUT: newly allocated array of \p n_vars entries --
+ *                      release with H5Ffree_stream_schema(), never free()
+ * \return \herr_t, -1 on timeout, if the transport is unavailable for this
+ *         file, or if the schema the writer sent cannot be decoded
+ *
+ * \note What is reported is what the writer has *captured in a step*, which
+ *       is the only thing a stream carries -- an object written outside a
+ *       step passes straight through to the file and is not part of the
+ *       stream (see H5Fbegin_step()).
+ *
+ * \note A parallel writer publishes from every rank, and a reader's query is
+ *       answered by whichever rank's group it joined. With the ordinary
+ *       parallel-HDF5 pattern (every rank creates the same objects and writes
+ *       its own hyperslab) that rank's schema is the whole stream's, extents
+ *       included, since an entry's dataspace is the dataset's own. A writer
+ *       whose ranks create *different* objects (M6.5's heterogeneous case)
+ *       therefore reports only that rank's share here, unlike the manifest,
+ *       which is aggregated across ranks at replay.
+ */
+H5VL_STREAM_API herr_t H5Fget_stream_schema(hid_t file_id, uint64_t timeout_ms, uint64_t *physical_step,
+                                              size_t *n_vars, H5F_stream_var_t **vars);
+
+/**
+ * \brief M10: release what H5Fget_stream_schema() returned.
+ *
+ * Frees each entry's path and \p vars itself, and closes each entry's
+ * \c type_id and \c space_id -- which is why this exists rather than
+ * documenting free(): a caller that freed the array by hand would leak two
+ * ids per variable, and HDF5's id space is a process-wide resource a
+ * long-running viewer notices. Safe with \p vars NULL and \p n_vars 0.
+ *
+ * \param n_vars  Entry count H5Fget_stream_schema() reported
+ * \param vars    The array it returned
+ * \return \herr_t
+ */
+H5VL_STREAM_API herr_t H5Ffree_stream_schema(size_t n_vars, H5F_stream_var_t *vars);
 
 /**
  * \brief M4/M5: reader only. Block until the writer's transport announces a

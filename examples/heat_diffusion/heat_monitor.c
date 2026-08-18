@@ -11,13 +11,17 @@
  * state as it happens, never by re-opening or polling the file (which does
  * not work while the writer holds it open).
  *
- * Grid size (first argument) must match what heat_writer was started with;
- * the two are independent processes and vol-stream has no schema to check
- * this for you.
+ * The grid size is *discovered*, not assumed: H5Fget_stream_schema() asks
+ * the running writer what it publishes and this monitor sizes itself from
+ * the answer, which is what a real in-situ tool has to do -- it cannot ask a
+ * user to retype the simulation's mesh dimensions. The first argument
+ * remains as a fallback for a writer too old to publish a schema, and a
+ * mismatch is reported rather than silently drawn wrong.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include "hdf5.h"
@@ -112,11 +116,45 @@ main(int argc, char **argv)
         return 1;
     }
 
-    dims[0] = (hsize_t)n;
-    dims[1] = (hsize_t)n;
-    if ((sub_space = H5Screate_simple(2, dims, NULL)) < 0 || H5Fsubscribe(fid, 1, paths, &sub_space, NULL) < 0) {
-        fprintf(stderr, "monitor: FAIL subscribe to %s (grid size must match the writer's)\n",
-                HEAT_DATASET);
+    /* Ask the writer what it carries, and take the grid from its own
+     * dataspace. Retries internally while the writer has committed nothing
+     * yet, so this doubles as the wait for the stream to describe itself. */
+    sub_space = H5I_INVALID_HID;
+    {
+        H5F_stream_var_t *vars   = NULL;
+        size_t             n_vars = 0, i;
+
+        if (H5Fget_stream_schema(fid, 15000, NULL, &n_vars, &vars) == 0) {
+            for (i = 0; i < n_vars; i++) {
+                hsize_t vdims[2];
+
+                if (!vars[i].path || strcmp(vars[i].path, HEAT_DATASET) != 0)
+                    continue;
+                if (H5Sget_simple_extent_dims(vars[i].space_id, vdims, NULL) != 2)
+                    continue;
+                if ((int)vdims[0] != n)
+                    printf("monitor: writer publishes %s at %llux%llu; using that, not the %dx%d asked "
+                           "for on the command line\n",
+                           HEAT_DATASET, (unsigned long long)vdims[0], (unsigned long long)vdims[1], n, n);
+                n         = (int)vdims[0];
+                sub_space = H5Scopy(vars[i].space_id);
+                break;
+            }
+            H5Ffree_stream_schema(n_vars, vars);
+        }
+        else
+            printf("monitor: writer published no schema; falling back to the %dx%d given on the command "
+                   "line\n",
+                   n, n);
+    }
+
+    if (sub_space < 0) {
+        dims[0] = (hsize_t)n;
+        dims[1] = (hsize_t)n;
+        sub_space = H5Screate_simple(2, dims, NULL);
+    }
+    if (sub_space < 0 || H5Fsubscribe(fid, 1, paths, &sub_space, NULL) < 0) {
+        fprintf(stderr, "monitor: FAIL subscribe to %s\n", HEAT_DATASET);
         return 1;
     }
     H5Sclose(sub_space);

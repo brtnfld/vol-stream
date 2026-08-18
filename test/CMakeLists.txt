@@ -42,12 +42,15 @@ add_test(NAME dset_resize COMMAND t_dset_resize)
 # subscribed. M8.5: per-subscriber precision -- the subscription's own DCPL
 # actually re-filters what goes on the wire. M9: predicate pushdown -- the
 # writer evaluates a subscriber's value test and sends only what matches, or
-# nothing. All need the transport, so all are only built/run when
+# nothing. M10: live schema discovery -- a reader with no prior knowledge of
+# the stream learns what it carries and subscribes from that alone. All need
+# the transport, so all are only built/run when
 # VOL_STREAM_HAVE_MERCURY is on (see ../CMakeLists.txt's
 # VOL_STREAM_ENABLE_MERCURY option).
 if(VOL_STREAM_HAVE_MERCURY)
   foreach(t t_transport t_rendezvous t_queue_policy t_subscribe t_precision t_precision_dual
-           t_chunk_zerocopy t_chunk_shape_split t_subvolume_nd t_strided_write t_predicate t_subvolume_strided)
+           t_chunk_zerocopy t_chunk_shape_split t_subvolume_nd t_strided_write t_predicate t_subvolume_strided
+           t_schema)
     add_executable(${t} ${t}.c)
     target_link_libraries(${t} PRIVATE vol_stream)
   endforeach()
@@ -65,7 +68,8 @@ if(VOL_STREAM_HAVE_MERCURY)
   add_test(NAME strided_write COMMAND t_strided_write)
   add_test(NAME predicate COMMAND t_predicate)
   add_test(NAME subvolume_strided COMMAND t_subvolume_strided)
-  set_tests_properties(transport rendezvous queue_policy subscribe precision chunk_zerocopy chunk_shape_split subvolume_nd strided_write predicate subvolume_strided PROPERTIES
+  add_test(NAME schema COMMAND t_schema)
+  set_tests_properties(transport rendezvous queue_policy subscribe precision chunk_zerocopy chunk_shape_split subvolume_nd strided_write predicate subvolume_strided schema PROPERTIES
     ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
     TIMEOUT 60
   )
