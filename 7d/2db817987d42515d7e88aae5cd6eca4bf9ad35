@@ -1,0 +1,67 @@
+test/t_precision.c
+  s_421ba49132ba2b::t_8cbcf6c9bd4804 330-336
+  s_421ba49132ba2b::t_b801444cef4a5f 329
+  s_421ba49132ba2b::t_67376bc3268dd2 337
+test/t_subvolume_strided.c
+  s_421ba49132ba2b::t_b801444cef4a5f 298
+  s_421ba49132ba2b::t_8cbcf6c9bd4804 299-305
+  s_421ba49132ba2b::t_783b699ae8bf4f 306
+test/t_subvolume_nd.c
+  s_421ba49132ba2b::t_8cbcf6c9bd4804 255-261
+  s_421ba49132ba2b::t_b801444cef4a5f 254
+  s_421ba49132ba2b::t_7ac439f6352d86 262
+test/t_chunk_zerocopy.c
+  s_421ba49132ba2b::t_b801444cef4a5f 343
+  s_421ba49132ba2b::t_8cbcf6c9bd4804 344-350
+  s_421ba49132ba2b::t_ac47e49bda8796 351
+test/t_subscribe.c
+  s_421ba49132ba2b::t_b801444cef4a5f 407
+  s_421ba49132ba2b::t_8cbcf6c9bd4804 408-414
+  s_421ba49132ba2b::t_a34250da78339e 415
+test/t_queue_policy.c
+  s_421ba49132ba2b::t_33e73d4b0f3259 320-334
+test/b_stream_grow.c
+  s_421ba49132ba2b::t_8cbcf6c9bd4804 386-391
+  s_421ba49132ba2b::t_b801444cef4a5f 385
+  s_421ba49132ba2b::t_a72121021a553b 392
+test/t_predicate.c
+  s_421ba49132ba2b::t_8cbcf6c9bd4804 565-571
+  s_421ba49132ba2b::t_b801444cef4a5f 564
+  s_421ba49132ba2b::t_a6ccce3a376479 572
+test/t_rendezvous.c
+  s_421ba49132ba2b::t_b801444cef4a5f 338
+  s_421ba49132ba2b::t_8cbcf6c9bd4804 339-344
+  s_421ba49132ba2b::t_3eb37fa1f1326b 345
+test/t_strided_write.c
+  s_421ba49132ba2b::t_b801444cef4a5f 283
+  s_421ba49132ba2b::t_8cbcf6c9bd4804 284-290
+  s_421ba49132ba2b::t_79d982d1f25e9e 291
+test/t_transport.c
+  s_421ba49132ba2b::t_8cbcf6c9bd4804 254-259
+  s_421ba49132ba2b::t_b801444cef4a5f 253
+  s_421ba49132ba2b::t_c4d57c2a98714b 260
+test/b_stream_grow_tail.c
+  s_421ba49132ba2b::t_8cbcf6c9bd4804 368-373
+  s_421ba49132ba2b::t_b801444cef4a5f 367
+  s_421ba49132ba2b::t_52dfd18b5bf0e8 374
+test/t_chunk_shape_split.c
+  s_421ba49132ba2b::t_8cbcf6c9bd4804 305-311
+  s_421ba49132ba2b::t_b801444cef4a5f 304
+  s_421ba49132ba2b::t_86e8b468cbb386 312
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "7d2db817987d42515d7e88aae5cd6eca4bf9ad35",
+  "prompts": {},
+  "sessions": {
+    "s_421ba49132ba2b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7f69c516-c332-45f5-8167-c009e22493be",
+        "model": "claude-opus-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
