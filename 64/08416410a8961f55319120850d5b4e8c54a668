@@ -1,0 +1,14 @@
+.gitignore
+  h_ec7c85911bb3c3 15-18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "6408416410a8961f55319120850d5b4e8c54a668",
+  "prompts": {},
+  "humans": {
+    "h_ec7c85911bb3c3": {
+      "author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
