@@ -966,7 +966,7 @@ and the honest answer has two halves rather than one.
 
 | State | `h5ls` | `h5dump` | `h5stat` | Usable? |
 |---|---|---|---|---|
-| **Live** (writer holds it open) | `**NOT FOUND**` | error | error | **No** — use `h5stream tail` |
+| **Live** (writer holds it open) | `**NOT FOUND**` | error | error | **No** — use `h5stream tail` / `h5stream schema` |
 | **Finished** stream | opens | opens | opens | Yes, but see below |
 | **Exported** (`h5stream export`) | opens | opens | opens | **Yes, fully** |
 | **Archived** (`h5stream history`) | opens¹ | opens¹ | opens¹ | Yes for the latest state; past revisions need an onion fapl |
@@ -978,7 +978,9 @@ reports `**NOT FOUND**` on a file that is plainly on disk with content in it.
 This is the constraint named at the top of this document, confirmed by
 measurement rather than argument, and it is precisely why the connector
 carries a transport — `h5stream tail` follows a live stream over
-`H5Fwait_step_ready()` because no file-reading tool can.
+`H5Fwait_step_ready()` because no file-reading tool can, and (M10)
+`h5stream schema` lists its contents over `H5Fget_stream_schema()` for the
+same reason `h5ls` cannot.
 
 **Finished streams: the tools open, but show the layout, not the data.** They
 work in the sense that nothing errors — and are still not what a user wants.
@@ -1055,6 +1057,194 @@ bindings were the two items aimed at other ecosystems; what remains is aimed
 at this one — making a live stream inspectable with the tools an HDF5 user
 already has, which is also what the "existing tools on a stream" constraint
 in the opening section says is the real adoption risk.
+
+### M10 — live schema discovery · S
+
+**Added 2026-08-18**, and not from the roadmap: it came out of asking whether
+VisIt or ParaView could consume a live vol-stream, and finding that the
+answer was no for a reason that belonged to this repo rather than to them.
+
+The subscription protocol was complete except for its first question. A
+subscriber must name a path and hand over a dataspace, and until now the only
+way to have either was to already know them: `t_subscribe.c` hard-codes
+`NSUB`, and `examples/heat_diffusion` takes the grid size as a command-line
+argument on *both* sides with nothing checking that the two agree — its own
+README says so. That is fine for a purpose-built monitor written against one
+simulation. It is impossible for a generic consumer, because both tools ask
+for metadata before they ask for anything else: VisIt's
+`PopulateDatabaseMetaData` and ParaView's `RequestInformation` run before any
+data request, and neither can offer a user a variable that the reader could
+not enumerate.
+
+Nothing on the wire carried that. The five RPCs were `step_ready`,
+`get_current_step`, `reader_ack`, `subscribe` and `data_push`; a push carried
+a path, raw bytes and a flat `elem_start`/`elem_count`, and no rank, extent
+or datatype at all. `h5stream tail` had the same hole from the other side —
+it could report that step 7 committed and not one word about what was in it.
+
+**Shipped:** `H5Fget_stream_schema()` / `H5Ffree_stream_schema()`, a sixth
+RPC (`vol-stream:get_schema`), and `h5stream schema` — which is `h5ls` for a
+stream that is still being written, the state where `h5ls` itself reports
+`**NOT FOUND**`. `h5stream tail` now prints the variable list once at attach.
+`test/t_schema.c` is the gate: a reader that names no dimension, element
+count or datatype of its own discovers three objects, subscribes with the
+*discovered* dataspace, validates the pushed bytes through the *discovered*
+datatype, and then requires the schema to have followed both a resize and a
+newly created path.
+
+Six decisions worth recording, because each had a plausible alternative:
+
+- **Pull, not push.** The writer could broadcast its schema alongside
+  `step_ready`, reusing a proven path. It would also put metadata on the wire
+  once per step per member for something that changes on almost no step,
+  which is the exact waste the reader-driven thesis exists to remove — and
+  push-on-change alone strands a late joiner, who attaches to a steady stream
+  and then waits forever for a change to learn from. Pulling makes the
+  late-joiner case the ordinary one.
+- **Published at `end_step()`, not produced by a callback in the handler.**
+  Every other writer-side hook in `tr_mercury.h` is a callback
+  (`vs_tr_refilter_fn` and friends), so a `vs_tr_schema_fn` would have been
+  the consistent-looking choice. It would also run inside a Margo/Argobots
+  RPC handler, and encoding a datatype is an HDF5 call — which every handler
+  in that file is forbidden to make, because v1 is not
+  `H5VL_CAP_FLAG_THREADSAFE`. The writer hands over finished bytes from its
+  own thread instead, where the encoded blobs already exist because the
+  step's manifest just built them.
+- **Change detection by `H5Tequal()`/`H5Sextent_equal()`, not by comparing
+  freshly encoded bytes.** Comparing bytes means encoding every path every
+  step to discover that nothing changed, which is precisely the
+  O(steps × paths) bookkeeping the manifest's own type cache was added to
+  avoid. Two library calls per entry answer the same question, and a steady
+  stream rewriting the same objects publishes once and then pays nothing.
+- **The schema's dataspace is the extent, with everything selected.** An
+  entry's captured space carries whichever selection the write that produced
+  it used, and a consumer that copied that would silently subscribe to one
+  writer's partial write. A schema describes the object; a selection
+  describes a write.
+- **Hand-rolled little-endian framing, not flatcc.** The manifest is
+  persisted into the file and has to stay readable by later versions, which
+  is what flatcc's evolution rules buy. A schema blob lives for one RPC
+  between two processes that are talking right now, so a version byte covers
+  it — and it keeps flatcc out of the transport module, which has stayed
+  HDF5-free and schema-free on purpose.
+- **The decode bounds-checks everything.** It is the only place in the
+  connector that structurally walks a buffer produced by another process, and
+  a truncated or malformed blob has to fail the call rather than index past
+  the end of it. Lengths are compared against the remaining space
+  (`len > len - off` form) so an overflowing length cannot wrap past the
+  check.
+
+**One honest limitation, and one thing this deliberately does not do.** A
+parallel writer answers a schema query from whichever rank's group the reader
+joined — every writer rank starts a transport and publishes a group, and the
+`.vsgroup` sidecar carries the last one to write it. Under the ordinary
+parallel-HDF5 pattern — every rank creates the same
+objects and writes its own hyperslab — that rank's schema is the whole
+stream's, extents included, because an entry's dataspace is the dataset's
+own. A writer whose ranks create *different* objects (M6.5's heterogeneous
+case) therefore under-reports here, unlike the manifest, which is aggregated
+across ranks at replay. And a schema is a list of arrays, not a mesh: a
+visualization tool still needs a convention on top (Conduit Blueprint, which
+VisIt reads natively, or a VTKHDF-shaped layout) to know that one array is
+coordinates and another is a field on them. That convention belongs to the
+reader plugin, not to the connector, which has no business inventing a data
+model HDF5 does not have.
+
+**Measured, for the two tools that motivated this** (2026-08-18). ParaView
+5.12.0, as installed on the machine this was written on, ships HDF5 1.14.2 and
+exports `H5VLregister_connector`, `H5Pset_vol`, `H5VLregister_opt_operation`,
+`H5VLfind_opt_operation`, `H5VLfile_optional_op` and `H5PLappend` from its
+bundled `libhdf5.310.2.0.dylib` unmangled — so a connector built against the
+same version can be loaded into it, and the step API resolves. VisIt's current
+release builds against HDF5 **2.0.0**: `bv_hdf5.sh` pins `HDF5_VERSION=2.0.0`
+at the `v3.5.0` tag, so a current VisIt has the VOL layer too. (The VisIt 3.3.1
+build installed here ships HDF5 1.8.14, which predates the VOL entirely —
+worth knowing only for someone on an older VisIt.)
+
+Neither tool can consume a live stream without a reader plugin of its own —
+nothing here changes that — but the metadata such a plugin has to have before
+it can be written now exists, and on both tools' current releases the
+connector itself is loadable.
+
+## Stretch goals
+
+Recorded rather than scheduled: real ideas with no milestone number, no exit
+gate, and no commitment to build them. Kept here so the reasoning survives
+even if nobody picks one up for a while.
+
+### A ParaView/VisIt reader plugin
+
+**Motivation.** M9's tool-compatibility matrix already establishes that a
+live stream is unreadable by any file-opening tool, `h5dump` included —
+`h5ls` reports `**NOT FOUND**` against a file a writer still holds open. A
+purpose-built visualization or analysis tool coupled to a running simulation
+hits exactly this wall, which M10 (live schema discovery) was built to
+answer: `H5Fget_stream_schema()` gives a reader with no prior knowledge of
+the stream a variable list before it subscribes to anything.
+
+**What is already measured, not assumed.** ParaView 5.12.0 ships HDF5 1.14.2
+and exports `H5VLregister_connector`, `H5Pset_vol`,
+`H5VLregister_opt_operation`, `H5VLfind_opt_operation`,
+`H5VLfile_optional_op` and `H5PLappend` unmangled from its bundled
+`libhdf5.310.2.0.dylib` — a connector built against the same version loads
+into it and the step API resolves. VisIt's current release (`v3.5.0`) builds
+against HDF5 2.0.0 per `bv_hdf5.sh`, so it has the VOL layer too. Neither
+ships a reader that speaks `H5Fsubscribe()`/`H5Fget_stream_schema()` — that
+plugin does not exist yet in either tool, and writing one is the actual
+stretch goal.
+
+**Shape of the plugin, if built.** `VisIt`'s `PopulateDatabaseMetaData` and
+ParaView's `RequestInformation` both run before any data request and need a
+variable list to offer a user — precisely what `H5Fget_stream_schema()`
+provides. `examples/heat_diffusion/heat_monitor.c` is already the minimal
+version of this: it discovers `/temperature`'s dataspace from the schema
+rather than trusting a command-line argument, subscribes with the discovered
+space, and redraws on every `H5Fget_subscribed_data()` push. A real plugin
+is the same loop wearing the tool's own reader interface instead of an ASCII
+heatmap.
+
+### Conduit Blueprint as the data-model convention
+
+A schema entry is a typed array at a path; it has no notion of "this is a
+coordinate array" or "this field lives on that mesh." Blueprint supplies
+exactly that, and unlike netCDF or CGNS it costs nothing to make legal here:
+Blueprint is a set of conventional HDF5 paths and attributes
+(`/coordsets/<name>/values/{x,y,z}`, `/topologies/<name>/type`,
+`/fields/<name>/{association,topology,values}`), not a separate C library
+with its own `H5Fopen`-equivalent. `conduit_relay_io_hdf5` reads and writes
+that convention with ordinary `H5D`/`H5G`/`H5A` calls, so nothing about the
+connector needs to change for a writer to legally produce it — a simulation
+that names its `H5Dcreate2()`/`H5Awrite()` calls at Blueprint paths already
+gets a Blueprint-shaped stream, no bridge required.
+
+Confirmed rather than assumed: `H5VL_stream_group_create()` always passes
+groups straight through, live, uncaptured in the step manifest — its own
+comment says a group "exist[s] only to supply path bookkeeping for their
+children's manifest entries," and replay rebuilds any needed ancestor group
+via `H5Pset_create_intermediate_group()`. The nested `/coordsets/coords/...`
+hierarchy Blueprint wants therefore needs no special handling; it is already
+exercised by every nested-path test in this suite.
+
+**The real gap, not glossed over.** `H5Fget_stream_schema()` reports a
+path's *type and extent*, never its *value* — so a Blueprint descriptor like
+`/topologies/mesh/type` (a string: `"structured"` vs `"unstructured"`) is
+visible to a reader as "an attribute of this datatype exists" but its actual
+content still has to arrive over `H5Fsubscribe()` + `H5Fget_subscribed_data()`,
+which delivers on the *next write*, not retroactively. Nothing in the
+subscription protocol replays a push that happened before a reader
+subscribed, so a reader either has to attach before the writer's first step,
+or the writer has to cheaply re-declare small Blueprint metadata every step
+so a late joiner eventually catches one. Real, and worth solving properly if
+this is picked up — not a one-line fix, since it would mean either a
+retroactive-delivery mode for a subscription (a genuine protocol change) or
+a documented convention that Blueprint descriptors are written every step.
+
+**Precedent.** This is structurally what Ascent already does for in-situ
+visualization: export a Blueprint-conforming Conduit node each cycle, hand
+it to a VisIt or ParaView Catalyst back end. A vol-stream reader plugin
+would be a different, reader-driven transport for the same Conduit-node
+shape — replacing Ascent's typically co-located, in-memory hand-off with
+`H5Fsubscribe()` over the wire — not a new data model.
 
 ## CI matrix
 

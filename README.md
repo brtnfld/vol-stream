@@ -28,7 +28,7 @@ Two documents carry the reasoning:
 | | |
 |---|---|
 | [`docs/design-plan.md`](docs/design-plan.md) | Why the VOL and not a VFD, where ADIOS2 is beatable, what to borrow |
-| [`docs/dev-plan.md`](docs/dev-plan.md) | The nine milestones, resolved design decisions, CI matrix |
+| [`docs/dev-plan.md`](docs/dev-plan.md) | The milestones, resolved design decisions, CI matrix |
 
 ## Design in one paragraph
 
@@ -107,11 +107,14 @@ VOL, which also ships `H5F*` calls from an out-of-tree connector.
 | `H5Fstep_status(fid, &st)` | Query step state (`NOT_IN_STEP`, `IN_STEP`, `COMMITTING`, `EOS`) |
 | `H5Fsubscribe(fid, n, paths, spaces, plists)` | Reader declares interest |
 | `H5Fsubscribe_predicate(fid, path, op, type, value)` | Narrow a subscription to elements passing a value test, evaluated writer-side |
+| `H5Fget_stream_schema(fid, timeout, &step, &n, &vars)` | Ask a live writer what the stream carries — every path, its datatype and extent |
 
 `h5stream` inspects a stream from outside: `list` (steps and their contents),
-`tail` (follow a live writer, needs the transport), `export` (collapse to one
-ordinary HDF5 file), and `history` (an onion-VFD archive where every step is a
-re-openable revision).
+`tail` (follow a live writer, needs the transport), `schema` (what a live
+writer says it carries — `h5ls` for a stream still being written, which `h5ls`
+itself reports as `NOT FOUND`), `export` (collapse to one ordinary HDF5 file),
+and `history` (an onion-VFD archive where every step is a re-openable
+revision).
 
 The logical ids are deliberately separate from the connector's monotone physical
 step counter. Restarting from a checkpoint replays ids already seen — openPMD hit
@@ -184,6 +187,15 @@ is meant to catch. It needs an HDF5 built with `-DHDF5_TEST_API=ON`:
 | M7 | Queue policy and BAKE spill | |
 | M8 | Subscription protocol | |
 | M9 | Tools, bindings, and the long tail | |
+| M10 | Live schema discovery | |
+
+Stretch goals — real ideas, no milestone number or exit gate — are recorded
+in [`docs/dev-plan.md`](docs/dev-plan.md#stretch-goals): a ParaView/VisIt
+reader plugin (both tools' current releases can already load the connector;
+what's missing is a plugin speaking `H5Fsubscribe()`/
+`H5Fget_stream_schema()`), and Conduit Blueprint as the data-model convention
+on top of a schema entry, which costs nothing to make legal here since
+Blueprint is HDF5 paths and attributes, not a separate library.
 
 Only four things are written here rather than borrowed: step semantics, queue
 policy, the subscription protocol, and the HDF5-to-step mapping. Everything else

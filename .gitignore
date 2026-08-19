@@ -12,3 +12,7 @@ keystore/
 *.h5
 api-suite-results/
 parallel-test-results/
+
+
+#Ignore vscode AI rules
+.github/instructions/codacy.instructions.md

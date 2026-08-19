@@ -52,6 +52,7 @@ usage(void)
                     "       h5stream export FILE OUT\n"
                     "       h5stream history FILE OUT\n"
                     "       h5stream tail FILE [--max-steps N] [--timeout-ms T]   (needs VOL_STREAM_NA)\n"
+                    "       h5stream schema FILE [--timeout-ms T]                 (needs VOL_STREAM_NA)\n"
                     "\n"
                     "  list     Steps in FILE: physical step, logical ids, objects written.\n"
                     "  export   Write OUT: each object at its logical path, newest version.\n"
@@ -60,7 +61,10 @@ usage(void)
                     "           step with H5Pset_fapl_onion(revision_num = step + 1).\n"
                     "  tail     Follow a live stream, reporting each step as it commits.\n"
                     "           Requires the transport (VOL_STREAM_NA) -- a live writer's file\n"
-                    "           cannot be read by another process.\n");
+                    "           cannot be read by another process.\n"
+                    "  schema   What a *live* writer says its stream carries: every path, its\n"
+                    "           datatype and its current extent. This is `h5ls` for a stream that\n"
+                    "           is still being written, which h5ls itself reports as NOT FOUND.\n");
 }
 
 /* H5Literate2 callback: print one object inside a step group, skipping the
@@ -841,6 +845,166 @@ done:
     return rc;
 }
 
+/* A short, readable name for a datatype: what someone reading a variable
+ * list wants, rather than H5Tencode()'s truth. Falls back to the class name
+ * plus a byte count for anything composite, which is enough to tell two
+ * variables apart and honest about not being the whole story. */
+static void
+type_name(hid_t type_id, char *out, size_t out_len)
+{
+    H5T_class_t cls  = H5Tget_class(type_id);
+    size_t      size = H5Tget_size(type_id);
+
+    switch (cls) {
+        case H5T_INTEGER: {
+            H5T_sign_t sign = H5Tget_sign(type_id);
+
+            snprintf(out, out_len, "%sint%zu", sign == H5T_SGN_NONE ? "u" : "", size * 8);
+            break;
+        }
+        case H5T_FLOAT:
+            snprintf(out, out_len, "float%zu", size * 8);
+            break;
+        case H5T_STRING:
+            snprintf(out, out_len, "string");
+            break;
+        case H5T_COMPOUND:
+            snprintf(out, out_len, "compound(%zuB)", size);
+            break;
+        case H5T_ENUM:
+            snprintf(out, out_len, "enum(%zuB)", size);
+            break;
+        case H5T_ARRAY:
+            snprintf(out, out_len, "array(%zuB)", size);
+            break;
+        case H5T_VLEN:
+            snprintf(out, out_len, "vlen");
+            break;
+        default:
+            snprintf(out, out_len, "%zuB", size);
+            break;
+    }
+}
+
+static void
+shape_name(hid_t space_id, char *out, size_t out_len)
+{
+    int     rank = H5Sget_simple_extent_ndims(space_id);
+    hsize_t dims[H5S_MAX_RANK];
+    size_t  used = 0;
+    int     d;
+
+    if (rank <= 0 || H5Sget_simple_extent_dims(space_id, dims, NULL) < 0) {
+        snprintf(out, out_len, "scalar");
+        return;
+    }
+    out[0] = '\0';
+    for (d = 0; d < rank && used < out_len; d++)
+        used += (size_t)snprintf(out + used, out_len - used, "%s%llu", d ? "x" : "",
+                                  (unsigned long long)dims[d]);
+}
+
+/* Attach to a live writer as a reader. Both `tail` and `schema` need exactly
+ * this, including the diagnostic: "cannot open" is the single most likely
+ * thing to happen to someone trying either, and the reason is almost never
+ * the file. */
+static int
+attach_reader(const char *fname, const char *subcmd, hid_t *vol_id, hid_t *fapl, hid_t *fid)
+{
+    *vol_id = H5I_INVALID_HID;
+    *fapl   = H5I_INVALID_HID;
+    *fid    = H5I_INVALID_HID;
+
+    if ((*vol_id = H5VL_stream_register()) < 0) {
+        fprintf(stderr, "h5stream: cannot register the vol-stream connector\n");
+        return -1;
+    }
+    if ((*fapl = H5Pcreate(H5P_FILE_ACCESS)) < 0 || H5Pset_vol(*fapl, *vol_id, NULL) < 0 ||
+        H5Pset_file_locking(*fapl, false, true) < 0) {
+        fprintf(stderr, "h5stream: cannot build a file-access property list\n");
+        return -1;
+    }
+
+    H5E_BEGIN_TRY
+    {
+        *fid = H5Fopen(fname, H5F_ACC_RDONLY, *fapl);
+    }
+    H5E_END_TRY
+    if (*fid < 0) {
+        fprintf(stderr,
+                "h5stream: cannot attach to '%s' as a reader.\n"
+                "  %s needs a *live* writer, which requires the transport: set VOL_STREAM_NA\n"
+                "  (e.g. na+sm or ofi+tcp) and make sure the writer is running and has published\n"
+                "  its group file. For a stream that is already finished, use `h5stream list`.\n",
+                fname, subcmd);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * schema: ask a live writer what its stream carries.
+ *
+ * The answer `h5ls` cannot give. A writer holds the file open, so no
+ * file-reading tool can enumerate a running stream -- h5ls reports
+ * **NOT FOUND** against a file plainly on disk with content in it (measured;
+ * see docs/dev-plan.md's tool-compatibility matrix). The variable list
+ * therefore has to come over the transport, from the writer's own published
+ * schema, which is exactly what H5Fget_stream_schema() asks for.
+ */
+static int
+print_schema(hid_t fid, long timeout_ms)
+{
+    H5F_stream_var_t *vars  = NULL;
+    size_t            n_vars = 0;
+    uint64_t          step   = 0;
+    size_t            i;
+
+    if (H5Fget_stream_schema(fid, (uint64_t)(timeout_ms > 0 ? timeout_ms : 5000), &step, &n_vars, &vars) <
+        0) {
+        fprintf(stderr, "h5stream: the writer published no schema within the timeout.\n"
+                         "  A writer publishes one when it commits its first step, so this usually\n"
+                         "  means no step has committed yet -- retry, or raise --timeout-ms.\n");
+        return -1;
+    }
+
+    printf("schema as of step %llu -- %zu object(s)\n", (unsigned long long)step, n_vars);
+    for (i = 0; i < n_vars; i++) {
+        char tname[32], shape[128];
+
+        type_name(vars[i].type_id, tname, sizeof(tname));
+        shape_name(vars[i].space_id, shape, sizeof(shape));
+        printf("  %-9s %-28s %-12s %s\n", vars[i].is_attr ? "attribute" : "dataset", vars[i].path, tname,
+               shape);
+    }
+    fflush(stdout);
+
+    H5Ffree_stream_schema(n_vars, vars);
+    return 0;
+}
+
+static int
+cmd_schema(const char *fname, long timeout_ms)
+{
+    hid_t vol_id, fapl, fid;
+    int   rc;
+
+    if (attach_reader(fname, "schema", &vol_id, &fapl, &fid) < 0) {
+        rc = 1;
+        goto done;
+    }
+    rc = print_schema(fid, timeout_ms) < 0 ? 1 : 0;
+
+done:
+    if (fid >= 0)
+        H5Fclose(fid);
+    if (fapl >= 0)
+        H5Pclose(fapl);
+    if (vol_id >= 0)
+        H5VLclose(vol_id);
+    return rc;
+}
+
 /*
  * tail: follow a live stream, reporting each step as it commits.
  *
@@ -873,29 +1037,23 @@ cmd_tail(const char *fname, long max_steps, long interval_ms, long timeout_ms)
 
     (void)interval_ms; /* the wait is driven by the transport, not a poll */
 
-    if ((vol_id = H5VL_stream_register()) < 0) {
-        fprintf(stderr, "h5stream: cannot register the vol-stream connector\n");
+    if (attach_reader(fname, "tail", &vol_id, &fapl, &fid) < 0)
         goto done;
-    }
-    if ((fapl = H5Pcreate(H5P_FILE_ACCESS)) < 0 || H5Pset_vol(fapl, vol_id, NULL) < 0 ||
-        H5Pset_file_locking(fapl, false, true) < 0) {
-        fprintf(stderr, "h5stream: cannot build a file-access property list\n");
-        goto done;
-    }
 
-    H5E_BEGIN_TRY
+    /* M10: what the stream contains, once, before following it. Printed at
+     * attach rather than re-queried per step deliberately -- a schema is
+     * pulled precisely because it changes rarely, and one metadata RPC per
+     * step against a running simulation is the cost this design exists to
+     * avoid. Best-effort: a writer that has not committed anything yet has
+     * nothing to describe, and following it is still perfectly useful. */
     {
-        fid = H5Fopen(fname, H5F_ACC_RDONLY, fapl);
-    }
-    H5E_END_TRY
-    if (fid < 0) {
-        fprintf(stderr,
-                "h5stream: cannot attach to '%s' as a reader.\n"
-                "  tail follows a *live* writer, which requires the transport: set VOL_STREAM_NA\n"
-                "  (e.g. na+sm or ofi+tcp) and make sure the writer is running and has published\n"
-                "  its group file. For a stream that is already finished, use `h5stream list`.\n",
-                fname);
-        goto done;
+        long schema_wait = timeout_ms > 0 ? timeout_ms : 2000;
+
+        H5E_BEGIN_TRY
+        {
+            (void)print_schema(fid, schema_wait);
+        }
+        H5E_END_TRY
     }
 
     for (;;) {
@@ -956,6 +1114,20 @@ main(int argc, char **argv)
         if (interval_ms <= 0)
             interval_ms = 200;
         return cmd_tail(argv[2], max_steps, interval_ms, timeout_ms);
+    }
+    if (strcmp(argv[1], "schema") == 0) {
+        long timeout_ms = 0;
+        int  a2;
+
+        for (a2 = 3; a2 < argc; a2++) {
+            if (strcmp(argv[a2], "--timeout-ms") == 0 && a2 + 1 < argc)
+                timeout_ms = strtol(argv[++a2], NULL, 10);
+            else {
+                usage();
+                return 2;
+            }
+        }
+        return cmd_schema(argv[2], timeout_ms);
     }
     if (strcmp(argv[1], "export") == 0) {
         if (argc < 4) {

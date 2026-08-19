@@ -8,7 +8,7 @@
  * Purpose: Implementation of tr_mercury.h. See that header for the design
  *          note on scope and the M5 SSG integration.
  *
- *          Both RPCs are answered on a plain Argobots handler pool that
+ *          Every RPC is answered on a plain Argobots handler pool that
  *          Margo owns (rpc_thread_count in vs_tr_start()); the connector
  *          contributes only the pthread mutex/condvar pairs guarding the
  *          reader-side pending-notification queue and the writer-side
@@ -150,6 +150,17 @@ MERCURY_GEN_PROC(vs_data_push_in_t,
                       (uint32_t)(filter_mask)))
 MERCURY_GEN_PROC(vs_data_push_out_t, ((int32_t)(status)))
 
+/* M10: reader -> writer, "what is in this stream?". The reply's is_writer is
+ * separate from status for the reason vs_subscribe_out_t's `matched` field
+ * records: status is what identifies the writer while probing members, so it
+ * cannot also mean "and I had a schema to give you" -- a fresh writer that
+ * has not committed a step yet must still identify itself, or the reader
+ * keeps hunting for a writer that already answered. schema is a 0-length
+ * blob in that case. */
+MERCURY_GEN_PROC(vs_get_schema_in_t, ((int32_t)(unused)))
+MERCURY_GEN_PROC(vs_get_schema_out_t,
+                  ((int32_t)(status))((int32_t)(is_writer))((uint64_t)(physical_step))((vs_blob_t)(schema)))
+
 typedef struct vs_tr_pending_t {
     uint64_t physical_step;
     uint64_t wall_time_ns;
@@ -262,6 +273,7 @@ struct vs_tr_t {
     hg_id_t            reader_ack_rpc_id;
     hg_id_t            subscribe_rpc_id;
     hg_id_t            data_push_rpc_id;
+    hg_id_t            get_schema_rpc_id;
 
     /* M5: SSG group this process created (writer) or joined (reader).
      * SSG_GROUP_ID_INVALID until vs_tr_writer_start_group()/
@@ -278,6 +290,16 @@ struct vs_tr_t {
     int             has_last_step;
     uint64_t        last_physical_step;
     uint64_t        last_wall_time_ns;
+
+    /* M10, writer side: the schema blob most recently handed over by
+     * vs_tr_writer_publish_schema(), served verbatim to a get_schema RPC.
+     * Opaque bytes -- this module never looks inside. NULL until the first
+     * end_step() publishes one, which is why the reply carries is_writer
+     * separately from status. */
+    pthread_mutex_t schema_lock;
+    uint8_t        *schema_blob;
+    uint64_t        schema_len;
+    uint64_t        schema_step;
 
     /* Reader side: queue of step_ready notifications (including a
      * late-joiner seed from vs_tr_reader_join_group()) not yet consumed by
@@ -715,6 +737,58 @@ vs_get_current_step_ult(hg_handle_t handle)
 }
 DEFINE_MARGO_RPC_HANDLER(vs_get_current_step_ult)
 
+/* M10: writer-side handler for vs_get_schema_in_t. Copies the published blob
+ * out from under schema_lock and answers with the copy rather than holding
+ * the lock across margo_respond(): the encode happens inside that call, and
+ * blocking a concurrent H5Fend_step()'s publish for the length of a network
+ * respond would put this module's own bookkeeping in the writer's critical
+ * path. Touches nothing but schema_lock -- no HDF5, the same rule every
+ * handler here follows (see vs_reader_ack_ult()). */
+static void
+vs_get_schema_ult(hg_handle_t handle)
+{
+    margo_instance_id      mid = margo_hg_handle_get_instance(handle);
+    hg_id_t                 id  = margo_get_info(handle)->id;
+    vs_tr_t                *tr  = (vs_tr_t *)margo_registered_data(mid, id);
+    vs_get_schema_in_t      in;
+    vs_get_schema_out_t     out;
+    uint8_t                *copy = NULL;
+
+    memset(&out, 0, sizeof(out));
+    out.status = -1;
+
+    if (tr && HG_SUCCESS == margo_get_input(handle, &in)) {
+        pthread_mutex_lock(&tr->schema_lock);
+        /* is_writer is set once, by vs_tr_writer_start_group(), and Margo is
+         * already listening by then -- so a query can arrive just before it
+         * is set and be answered "not the writer". That costs the reader one
+         * more attempt of vs_tr_reader_get_schema()'s retry loop and nothing
+         * else, which is why this reads it without pretending the write side
+         * is synchronized. */
+        if (tr->is_writer) {
+            out.status     = 0;
+            out.is_writer  = 1;
+            if (tr->schema_blob && tr->schema_len > 0 &&
+                NULL != (copy = (uint8_t *)malloc((size_t)tr->schema_len))) {
+                memcpy(copy, tr->schema_blob, (size_t)tr->schema_len);
+                out.physical_step = tr->schema_step;
+                out.schema.buf     = copy;
+                out.schema.size    = tr->schema_len;
+            }
+        }
+        pthread_mutex_unlock(&tr->schema_lock);
+        margo_free_input(handle, &in);
+    }
+
+    margo_respond(handle, &out);
+    /* Ours to free: Mercury frees a *decoded* blob (the far side's, via
+     * margo_free_output()), never one the responder encoded from its own
+     * memory. */
+    free(copy);
+    margo_destroy(handle);
+}
+DEFINE_MARGO_RPC_HANDLER(vs_get_schema_ult)
+
 /* M7: writer-side handler for vs_reader_ack_in_t. Runs on a Margo/Argobots
  * RPC-handler thread, not the application's own -- touches only lag_table
  * under lag_lock, never HDF5 (v1 is not H5VL_CAP_FLAG_THREADSAFE; see
@@ -1048,6 +1122,7 @@ vs_tr_start(const char *na_str)
     pthread_mutex_init(&tr->sub_lock, NULL);
     pthread_mutex_init(&tr->data_lock, NULL);
     pthread_cond_init(&tr->data_cond, NULL);
+    pthread_mutex_init(&tr->schema_lock, NULL);
 
     tr->step_ready_rpc_id =
         MARGO_REGISTER(tr->mid, "vol-stream:step_ready", vs_step_ready_in_t, vs_step_ready_out_t,
@@ -1064,12 +1139,16 @@ vs_tr_start(const char *na_str)
     tr->data_push_rpc_id =
         MARGO_REGISTER(tr->mid, "vol-stream:data_push", vs_data_push_in_t, vs_data_push_out_t,
                         vs_data_push_ult);
+    tr->get_schema_rpc_id =
+        MARGO_REGISTER(tr->mid, "vol-stream:get_schema", vs_get_schema_in_t, vs_get_schema_out_t,
+                        vs_get_schema_ult);
 
     margo_register_data(tr->mid, tr->step_ready_rpc_id, tr, NULL);
     margo_register_data(tr->mid, tr->get_current_step_rpc_id, tr, NULL);
     margo_register_data(tr->mid, tr->reader_ack_rpc_id, tr, NULL);
     margo_register_data(tr->mid, tr->subscribe_rpc_id, tr, NULL);
     margo_register_data(tr->mid, tr->data_push_rpc_id, tr, NULL);
+    margo_register_data(tr->mid, tr->get_schema_rpc_id, tr, NULL);
 
     return tr;
 }
@@ -1177,6 +1256,8 @@ vs_tr_stop(vs_tr_t *tr)
     pthread_mutex_destroy(&tr->sub_lock);
     pthread_mutex_destroy(&tr->data_lock);
     pthread_cond_destroy(&tr->data_cond);
+    pthread_mutex_destroy(&tr->schema_lock);
+    free(tr->schema_blob);
     free(tr->pending);
     free(tr->lag_table);
     {
@@ -1357,6 +1438,146 @@ vs_tr_reader_get_current_step(vs_tr_t *tr, uint64_t *physical_step, uint64_t *wa
 
     free(members);
     return ret;
+}
+
+int
+vs_tr_writer_publish_schema(vs_tr_t *tr, uint64_t physical_step, const uint8_t *blob, uint64_t len)
+{
+    uint8_t *copy = NULL;
+
+    if (!tr)
+        return -1;
+
+    if (blob && len > 0) {
+        if (NULL == (copy = (uint8_t *)malloc((size_t)len)))
+            return -1;
+        memcpy(copy, blob, (size_t)len);
+    }
+
+    pthread_mutex_lock(&tr->schema_lock);
+    free(tr->schema_blob);
+    tr->schema_blob = copy;
+    tr->schema_len   = copy ? len : 0;
+    tr->schema_step  = physical_step;
+    pthread_mutex_unlock(&tr->schema_lock);
+
+    return 0;
+}
+
+/* One get_schema forward to one member. Returns 0 only when that member both
+ * identified itself as the writer and had a schema published; *out_is_writer
+ * separates the two, so a probe can stop hunting once the writer has answered
+ * even though it had nothing yet. */
+static int
+vs_forward_get_schema(vs_tr_t *tr, ssg_member_id_t member_id, int *out_is_writer, uint64_t *out_step,
+                       uint8_t **out_blob, uint64_t *out_len)
+{
+    hg_addr_t           addr;
+    hg_handle_t          handle;
+    vs_get_schema_in_t  in;
+    int                  ret = -1;
+
+    memset(&in, 0, sizeof(in));
+
+    if (SSG_SUCCESS != ssg_get_group_member_addr(tr->group_id, member_id, &addr))
+        return -1;
+
+    if (HG_SUCCESS == margo_create(tr->mid, addr, tr->get_schema_rpc_id, &handle)) {
+        if (HG_SUCCESS == margo_forward_timed(handle, &in, 1000.0)) {
+            vs_get_schema_out_t out;
+
+            if (HG_SUCCESS == margo_get_output(handle, &out)) {
+                if (out.status == 0 && out.is_writer) {
+                    if (out_is_writer)
+                        *out_is_writer = 1;
+                    /* Only the writer ever answers status == 0, so cache it
+                     * the same way vs_tr_reader_get_current_step() does --
+                     * a second query then targets it directly. */
+                    tr->writer_member_id     = member_id;
+                    tr->has_writer_member_id = 1;
+
+                    if (out.schema.size > 0 && out.schema.buf) {
+                        uint8_t *copy = (uint8_t *)malloc((size_t)out.schema.size);
+
+                        /* Copied rather than stolen: margo_free_output()
+                         * below runs hg_proc_vs_blob_t()'s HG_FREE over the
+                         * decoded buffer, and a schema is small metadata --
+                         * not worth teaching the proc about ownership
+                         * transfer for. */
+                        if (copy) {
+                            memcpy(copy, out.schema.buf, (size_t)out.schema.size);
+                            *out_blob = copy;
+                            *out_len  = out.schema.size;
+                            if (out_step)
+                                *out_step = out.physical_step;
+                            ret = 0;
+                        }
+                    }
+                }
+                margo_free_output(handle, &out);
+            }
+        }
+        margo_destroy(handle);
+    }
+    margo_addr_free(tr->mid, addr);
+
+    return ret;
+}
+
+int
+vs_tr_reader_get_schema(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *out_physical_step, uint8_t **out_blob,
+                         uint64_t *out_len)
+{
+    ssg_member_id_t self_id;
+    uint64_t         deadline_ns;
+
+    if (!tr || !out_blob || !out_len || tr->group_id == SSG_GROUP_ID_INVALID)
+        return -1;
+    if (SSG_SUCCESS != ssg_get_self_id(tr->mid, &self_id))
+        return -1;
+
+    *out_blob    = NULL;
+    *out_len     = 0;
+    deadline_ns  = vs_now_ns() + timeout_ms * 1000000ull;
+
+    for (;;) {
+        int is_writer = 0;
+
+        if (tr->has_writer_member_id &&
+            0 == vs_forward_get_schema(tr, tr->writer_member_id, &is_writer, out_physical_step, out_blob,
+                                        out_len))
+            return 0;
+
+        if (!is_writer) {
+            /* Same stable-member-id snapshot every other probe here uses --
+             * see vs_tr_snapshot_members(). A member leaving mid-probe must
+             * not skip the tail of the list, which can hold the writer. */
+            ssg_member_id_t *members;
+            int               n_members, i;
+
+            if ((n_members = vs_tr_snapshot_members(tr, self_id, &members)) > 0) {
+                for (i = 0; i < n_members; i++) {
+                    if (0 == vs_forward_get_schema(tr, members[i], &is_writer, out_physical_step, out_blob,
+                                                    out_len)) {
+                        free(members);
+                        return 0;
+                    }
+                }
+                free(members);
+            }
+        }
+
+        /* Either no writer was reachable yet (a join whose local group view
+         * is still filling in -- vs_tr_reader_join_group() retries for the
+         * same reason) or the writer has not committed a step yet. Both are
+         * ordinary for a reader that attached first, and both are answered
+         * by waiting. */
+        if (vs_now_ns() >= deadline_ns)
+            break;
+        usleep(50000); /* 50ms */
+    }
+
+    return -1;
 }
 
 int

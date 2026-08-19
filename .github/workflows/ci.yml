@@ -343,7 +343,7 @@ jobs:
           VOL_STREAM_NA=ofi+tcp \
           LD_LIBRARY_PATH=$HOME/mochi-install/lib:$HOME/mochi-install/lib64:$LD_LIBRARY_PATH \
             ctest --test-dir build --output-on-failure \
-              -R 'transport|rendezvous|queue_policy|subscribe|precision$|chunk_zerocopy|subvolume_nd|strided_write'
+              -R 'transport|rendezvous|queue_policy|subscribe|precision$|chunk_zerocopy|subvolume_nd|strided_write|schema'
 
   # ---------------------------------------------------------------------------
   # Sanitizers. A background progress thread plus a step queue is the classic
