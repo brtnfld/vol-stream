@@ -262,7 +262,7 @@ run_writer(void)
 
 /* Real, observable evidence re-filtering actually ran and actually shrank
  * the wire bytes -- see this file's top comment. Returns 1 if a
- * "raw=R filtered=F" line was found with F meaningfully smaller than R
+ * "filter=I raw=R filtered=F" line was found with F meaningfully smaller than R
  * (GZIP on a maximally-compressible constant pattern should do far better
  * than half; a generous 2x margin keeps this robust without being a tight,
  * brittle ratio check), 0 otherwise. */
@@ -280,7 +280,9 @@ check_refilter_log(void)
     while (fgets(line, sizeof(line), f)) {
         unsigned long long raw = 0, filtered = 0;
 
-        if (2 == sscanf(line, "  refilter  raw=%llu filtered=%llu", &raw, &filtered)) {
+        int filter_id = 0;
+
+        if (3 == sscanf(line, "  refilter  filter=%d raw=%llu filtered=%llu", &filter_id, &raw, &filtered)) {
             printf("  info  %s\n", line);
             if (raw > 0 && filtered > 0 && filtered * 2 < raw)
                 found = 1;

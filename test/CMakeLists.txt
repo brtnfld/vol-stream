@@ -56,7 +56,7 @@ add_test(NAME retention COMMAND t_retention)
 if(VOL_STREAM_HAVE_MERCURY)
   foreach(t t_transport t_rendezvous t_queue_policy t_subscribe t_precision t_precision_dual
            t_chunk_zerocopy t_chunk_shape_split t_subvolume_nd t_strided_write t_predicate t_subvolume_strided
-           t_rendezvous_barrier t_schema)
+           t_subvolume_grow t_rendezvous_barrier t_schema)
     add_executable(${t} ${t}.c)
     target_link_libraries(${t} PRIVATE vol_stream)
   endforeach()
@@ -81,8 +81,13 @@ if(VOL_STREAM_HAVE_MERCURY)
   add_test(NAME strided_write COMMAND t_strided_write)
   add_test(NAME predicate COMMAND t_predicate)
   add_test(NAME subvolume_strided COMMAND t_subvolume_strided)
+  # The same column case as subvolume_strided, but on a GROWING extent and
+  # with a selection needing more runs than the push budget -- the two gates
+  # that silently disabled selection-exact routing on every streaming
+  # dataset. See the test's own comment.
+  add_test(NAME subvolume_grow COMMAND t_subvolume_grow)
   add_test(NAME schema COMMAND t_schema)
-  set_tests_properties(transport rendezvous queue_policy subscribe precision chunk_zerocopy chunk_shape_split subvolume_nd strided_write predicate subvolume_strided schema PROPERTIES
+  set_tests_properties(transport rendezvous queue_policy subscribe precision chunk_zerocopy chunk_shape_split subvolume_nd strided_write predicate subvolume_strided subvolume_grow schema PROPERTIES
     ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
     TIMEOUT 60
   )
@@ -127,6 +132,25 @@ if(VOL_STREAM_HAVE_MERCURY)
   set_tests_properties(push_fanout_benchmark PROPERTIES
     ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
     TIMEOUT 300
+  )
+
+  # PER-SUBSCRIBER COMPRESSION on a live detector stream, with real
+  # facility geometry (an EIGER2 module written frame-by-frame into
+  # /entry/data/data) and the real facility filter set (bslz4, zstd, zfp).
+  # Filters beyond HDF5's built-in deflate are optional -- a subscriber
+  # whose filter is missing reports itself unavailable rather than failing
+  # -- so this passes on a stock HDF5 with no plugins installed.
+  #
+  # Registered as a test, not just built: every lossless subscriber verifies
+  # what it receives against the scene it recomputes, so a narrowing that
+  # dropped or corrupted data fails here rather than looking like a
+  # spectacular compression ratio.
+  add_executable(b_detector_narrowing b_detector_narrowing.c)
+  target_link_libraries(b_detector_narrowing PRIVATE vol_stream)
+  add_test(NAME detector_narrowing_benchmark COMMAND b_detector_narrowing)
+  set_tests_properties(detector_narrowing_benchmark PROPERTIES
+    ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
+    TIMEOUT 900
   )
 
   # Every test above registers the connector explicitly, which leaves the

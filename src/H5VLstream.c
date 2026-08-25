@@ -698,6 +698,8 @@ typedef struct H5VL_stream_flat_run_t {
 } H5VL_stream_flat_run_t;
 
 static int    H5VL__stream_space_flat_runs(hid_t space_id, H5VL_stream_flat_run_t *runs, int max_runs);
+static int    H5VL__stream_space_flat_runs_range(hid_t space_id, uint64_t range_start, uint64_t range_end,
+                                                 H5VL_stream_flat_run_t *runs, int max_runs);
 static int    H5VL__stream_mem_sel_is_packed(hid_t mem_space, size_t n_elem);
 static herr_t H5VL__stream_gather_mem(const void *buf, hid_t mem_space, size_t elem_size, size_t n_elem,
                              uint8_t *out);
@@ -3001,9 +3003,25 @@ H5VL__stream_refilter_for_subscriber(const void *raw_buf, uint64_t elem_size, ui
      * changed the wire size, since H5Fget_subscribed_data() itself always
      * hands back decoded values regardless -- transparent by design, so
      * there is no other way for a caller to see this happened. */
-    if (H5VL__stream_debug_refilter())
-        fprintf(stderr, "  refilter  raw=%llu filtered=%llu bytes\n", (unsigned long long)(elem_size * count),
-                (unsigned long long)chunk_size);
+    if (H5VL__stream_debug_refilter()) {
+        /* The pipeline's leading filter id, so a reader of this log can tell
+         * WHICH subscriber a line belongs to. Without it several subscribers
+         * requesting different pipelines over the same selection produce
+         * indistinguishable lines, and the only way to attribute bytes is to
+         * run them one at a time. 0 means "no filter in the DCPL", which is
+         * a legal request and not an error. */
+        H5Z_filter_t fid0    = 0;
+        int          nfilt   = H5Pget_nfilters(dcpl);
+
+        if (nfilt > 0) {
+            unsigned flags  = 0;
+            size_t   nelmts = 0;
+
+            fid0 = H5Pget_filter2(dcpl, 0, &flags, &nelmts, NULL, 0, NULL, NULL);
+        }
+        fprintf(stderr, "  refilter  filter=%d raw=%llu filtered=%llu bytes\n", (int)fid0,
+                (unsigned long long)(elem_size * count), (unsigned long long)chunk_size);
+    }
 
     *out_buf         = filtered;
     *out_len         = (uint64_t)chunk_size;
@@ -3442,6 +3460,11 @@ H5VL__stream_selection_runs(const uint8_t *sub_space_enc, uint64_t sub_space_enc
 
     if (!sub_space_enc || sub_space_enc_len == 0 || !runs || max_runs <= 0 || range_count == 0)
         return -1;
+    /* sel_runs is the scratch the decomposition writes into, so the caller's
+     * budget can never exceed it. The transport's cap (VS_TR_MAX_PRED_RUNS)
+     * is the smaller of the two today; clamp rather than assume. */
+    if (max_runs > H5VL_STREAM_MAX_PUSH_RUNS)
+        max_runs = H5VL_STREAM_MAX_PUSH_RUNS;
     /* Without the write's own space there is nothing to check the
      * subscriber's flat indices against, so decline rather than trust them. */
     if (!write_space_enc || write_space_enc_len == 0)
@@ -3462,29 +3485,41 @@ H5VL__stream_selection_runs(const uint8_t *sub_space_enc, uint64_t sub_space_enc
             goto done;
         if (srank != wrank)
             goto done;
-        for (d = 0; d < srank; d++)
+        /* Extent COMPATIBILITY, not equality. A flat row-major index is
+         * i0*stride0 + (the rest), and stride0 is the product of dimensions
+         * 1..rank-1 -- so dimension 0 may differ freely between the two
+         * spaces without any flat index changing meaning, while a
+         * disagreement in any TRAILING dimension changes every stride and
+         * makes the indices incomparable.
+         *
+         * Requiring equality on all dimensions, as this did originally, is
+         * safe but useless on a stream: a subscription is made once against
+         * the shape the object will end up with, while the object's dim-0
+         * extent grows at every step, so the two agreed at no step but the
+         * last and this refinement declined for the entire life of every
+         * growing dataset -- silently serving the whole bounding span that
+         * it exists to avoid. Measured at a 7.9x over-send for an
+         * across-track band; see the remote-sensing case study in the RFC
+         * and test/t_subvolume_grow.c, which pins it. */
+        for (d = 1; d < srank; d++)
             if (sdims[d] != wdims[d])
                 goto done;
     }
 
-    if ((n_sel = H5VL__stream_space_flat_runs(sub, sel_runs, H5VL_STREAM_MAX_PUSH_RUNS)) < 0)
-        goto done;
+    /* Decompose only the range actually being pushed. The clipping is done
+     * inside the decomposition rather than here so that runs outside the
+     * range never consume the run budget -- the difference between a budget
+     * that bounds this answer's complexity and one that bounds the whole
+     * subscription's. */
+    if ((n_sel = H5VL__stream_space_flat_runs_range(sub, range_start, range_start + range_count, sel_runs,
+                                                     max_runs)) < 0)
+        goto done; /* too fragmented to describe -- decline, never truncate */
 
     for (i = 0; i < n_sel; i++) {
-        uint64_t s  = sel_runs[i].start;
-        uint64_t e  = s + sel_runs[i].count;
-        uint64_t rs = range_start;
-        uint64_t re = range_start + range_count;
-        uint64_t cs = (s > rs) ? s : rs;
-        uint64_t ce = (e < re) ? e : re;
-
-        if (cs >= ce)
-            continue; /* this run lies outside the range being pushed */
-        if (out == max_runs)
-            goto done; /* too fragmented to describe -- decline, never truncate */
-
-        runs[out].start = cs - range_start;
-        runs[out].count = ce - cs;
+        /* Report offsets relative to the range, which is what the caller
+         * slices its payload with. */
+        runs[out].start = sel_runs[i].start - range_start;
+        runs[out].count = sel_runs[i].count;
         out++;
     }
 
@@ -5229,11 +5264,12 @@ H5VL__stream_space_1d_bounds(hid_t space_id, uint64_t *start, uint64_t *count)
 } /* end H5VL__stream_space_1d_bounds() */
 
 /*-------------------------------------------------------------------------
- * Function:    H5VL__stream_space_flat_runs
+ * Function:    H5VL__stream_space_flat_runs_range
  *
  * Purpose:     Decompose a dataspace selection into the maximal *contiguous
  *              flat element runs* it covers, in the same row-major order
- *              HDF5 packs the corresponding memory buffer.
+ *              HDF5 packs the corresponding memory buffer, restricted to
+ *              the flat range [range_start, range_end).
  *
  *              Subscription pushes describe their payload as one flat range
  *              [elem_start, elem_start + elem_count), with the payload's
@@ -5260,8 +5296,23 @@ H5VL__stream_space_1d_bounds(hid_t space_id, uint64_t *start, uint64_t *count)
  *              irregular selection reports 0 runs, which the caller treats
  *              as "cannot describe this truthfully" rather than guessing.
  *
- * Return:      Number of runs written to runs[] (<= max_runs), or -1 on
- *              error or if the selection needs more than max_runs.
+ *              Two properties matter to callers and are load-bearing:
+ *
+ *              - Runs that abut in flat order are MERGED. A selection
+ *                spanning whole rows is one run, not one per row, so a
+ *                whole-dataset or leading-slab write costs a single push
+ *                and a single unit of budget.
+ *              - Clipping to [range_start, range_end) happens BEFORE
+ *                max_runs is consulted, so a run outside the range costs
+ *                nothing. The budget therefore bounds the complexity of
+ *                the ANSWER rather than of the selection it was derived
+ *                from. Pass [0, UINT64_MAX) -- or call
+ *                H5VL__stream_space_flat_runs() -- for the whole thing.
+ *
+ * Return:      Number of runs written to runs[] (<= max_runs), 0 if the
+ *              selection does not intersect the range at all, or -1 on
+ *              error or if the clipped decomposition needs more than
+ *              max_runs.
  *-------------------------------------------------------------------------
  */
 /* Cap on how many contiguous runs one write is split into for subscription
@@ -5271,7 +5322,8 @@ H5VL__stream_space_1d_bounds(hid_t space_id, uint64_t *start, uint64_t *count)
  * skipped entirely (the data is still durably written either way). */
 
 static int
-H5VL__stream_space_flat_runs(hid_t space_id, H5VL_stream_flat_run_t *runs, int max_runs)
+H5VL__stream_space_flat_runs_range(hid_t space_id, uint64_t range_start, uint64_t range_end,
+                                   H5VL_stream_flat_run_t *runs, int max_runs)
 {
     hsize_t  dims[H5S_MAX_RANK], stride[H5S_MAX_RANK];
     hsize_t *blocks = NULL;
@@ -5282,6 +5334,8 @@ H5VL__stream_space_flat_runs(hid_t space_id, H5VL_stream_flat_run_t *runs, int m
     if (!runs || max_runs <= 0)
         return -1;
     if (H5Sget_simple_extent_type(space_id) == H5S_SCALAR) {
+        if (range_start > 0 || range_end == 0)
+            return 0;
         runs[0].start = 0;
         runs[0].count = 1;
         return 1;
@@ -5298,11 +5352,16 @@ H5VL__stream_space_flat_runs(hid_t space_id, H5VL_stream_flat_run_t *runs, int m
 
     if (sel == H5S_SEL_ALL) {
         hssize_t npoints = H5Sget_select_npoints(space_id);
+        uint64_t cs, ce;
 
         if (npoints < 0)
             return -1;
-        runs[0].start = 0;
-        runs[0].count = (uint64_t)npoints;
+        cs = (range_start > 0) ? range_start : 0;
+        ce = ((uint64_t)npoints < range_end) ? (uint64_t)npoints : range_end;
+        if (cs >= ce)
+            return 0;
+        runs[0].start = cs;
+        runs[0].count = ce - cs;
         return 1;
     }
     if (sel != H5S_SEL_HYPERSLABS)
@@ -5319,7 +5378,8 @@ H5VL__stream_space_flat_runs(hid_t space_id, H5VL_stream_flat_run_t *runs, int m
 
     /* Each block is [start_coords..end_coords] inclusive. Within a block the
      * last dimension is contiguous, so it contributes one run per
-     * combination of the leading coordinates. */
+     * combination of the leading coordinates -- before the two refinements
+     * below, which is why a full-width block used to cost one run per row. */
     for (hssize_t b = 0; b < nblocks; b++) {
         const hsize_t *bs = blocks + (size_t)b * 2 * (size_t)rank;
         const hsize_t *be = bs + rank;
@@ -5332,18 +5392,47 @@ H5VL__stream_space_flat_runs(hid_t space_id, H5VL_stream_flat_run_t *runs, int m
 
         for (;;) {
             uint64_t flat = 0;
+            uint64_t cs, ce;
 
-            if (n_runs >= max_runs) {
-                free(blocks);
-                return -1;
-            }
             for (d = 0; d < rank; d++)
                 flat += (uint64_t)cur[d] * (uint64_t)stride[d];
 
-            runs[n_runs].start = flat;
-            runs[n_runs].count = run_len;
-            n_runs++;
+            /* Clip to the caller's range BEFORE the cap is consulted. A run
+             * outside the range contributes nothing and must therefore cost
+             * nothing: charging it against max_runs makes the budget scale
+             * with the size of the whole OBJECT rather than with the size of
+             * the range being asked about, which is how an across-track band
+             * over a tall swath used to be rejected for being complex
+             * globally while being a single run in every range it was ever
+             * evaluated against. Callers wanting the undipped decomposition
+             * pass [0, UINT64_MAX) and are unaffected. */
+            cs = (flat > range_start) ? flat : range_start;
+            ce = (flat + run_len < range_end) ? flat + run_len : range_end;
+            if (cs >= ce)
+                goto next_run;
 
+            /* Merge runs that abut in flat order. The odometer walks a block
+             * in ascending flat order, so a block spanning its whole last
+             * dimension emits rows that are flat-contiguous with each other
+             * and collapse to one run -- which is what a whole-dataset or
+             * leading-slab write actually is. Without this a 32-row scan
+             * became 32 pushes, and consumed 32 units of a budget it needed
+             * one of. Strict adjacency only, so an out-of-order blocklist
+             * merely fails to merge rather than producing a wrong run. */
+            if (n_runs > 0 && runs[n_runs - 1].start + runs[n_runs - 1].count == cs) {
+                runs[n_runs - 1].count += ce - cs;
+            }
+            else {
+                if (n_runs >= max_runs) {
+                    free(blocks);
+                    return -1;
+                }
+                runs[n_runs].start = cs;
+                runs[n_runs].count = ce - cs;
+                n_runs++;
+            }
+
+next_run:
             /* Advance the leading coordinates (all but the last, which the
              * run itself spans), odometer-style. */
             carry = 1;
@@ -5364,6 +5453,21 @@ H5VL__stream_space_flat_runs(hid_t space_id, H5VL_stream_flat_run_t *runs, int m
 
     free(blocks);
     return n_runs;
+} /* end H5VL__stream_space_flat_runs_range() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_space_flat_runs
+ *
+ * Purpose:     The whole-selection decomposition: every run, unclipped.
+ *              What the write and capture paths want, since their runs
+ *              double as offsets into the packed write buffer and so must
+ *              account for every selected element.
+ *-------------------------------------------------------------------------
+ */
+static int
+H5VL__stream_space_flat_runs(hid_t space_id, H5VL_stream_flat_run_t *runs, int max_runs)
+{
+    return H5VL__stream_space_flat_runs_range(space_id, 0, UINT64_MAX, runs, max_runs);
 } /* end H5VL__stream_space_flat_runs() */
 
 /*-------------------------------------------------------------------------

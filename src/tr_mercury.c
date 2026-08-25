@@ -1239,10 +1239,16 @@ vs_tr_stop(vs_tr_t *tr)
          * "swim_dping_req_recv_ult: Assertion `ssg_rt' failed" -- root
          * caused (not guessed) via a real stress-test crash and reading
          * mochi-ssg's swim-fd-ping.c. This was a real usage gap on our
-         * side, not purely a third-party bug: one swim-suspect-timeout
-         * window's worth of margin (matches the writer's own
-         * swim_period_length_ms=200 / swim_suspect_timeout_periods=3
-         * group config below) gives that gossip time to land. */
+         * side, not purely a third-party bug.
+         *
+         * What governs how long that takes is the SWIM *period*
+         * (swim_period_length_ms=200 below), not the suspect timeout: 750ms
+         * is a bit under four gossip periods. It was originally described
+         * as one suspect-timeout window, which was only true while that
+         * timeout was 3 periods; it is now 10, and the window deliberately
+         * did NOT grow with it -- waiting 2s here would slow every teardown
+         * to buy margin against a different quantity than the one that
+         * matters. */
         usleep(750000);
     }
 
@@ -1294,9 +1300,33 @@ vs_tr_writer_start_group(vs_tr_t *tr, const char *group_file)
 
     /* Faster than SSG's ~2s-period/10s-suspect HPC-scale defaults: this is
      * a step-notification stream, where sub-second failure detection is
-     * worth more than saving a handful of pings a minute. */
+     * worth more than saving a handful of pings a minute.
+     *
+     * The suspect timeout is 10 periods (2s) rather than the 3 (600ms) this
+     * originally used. 600ms is short enough that a subscriber merely BUSY
+     * -- re-filtering a multi-megabyte frame for its own pipeline, say --
+     * gets declared failed by its peers, and a member that believes it has
+     * failed tears its own group down from inside a SWIM handler. That is
+     * mochi-ssg's teardown use-after-free (their issue #62, open since 2022;
+     * our diagnosis in #74), and an aggressive timeout is what makes us hit
+     * it. Measured here: 3 periods crashed 6 of 24 runs of
+     * test/b_detector_narrowing, 10 periods crashed 1 of 24. That is Fisher
+     * p=0.097 -- suggestive rather than conclusive, and NOT a cure, but it
+     * is mechanistically motivated and costs only detection latency.
+     *
+     * The trade: a subscriber that dies without leaving is now noticed in
+     * ~2s instead of ~600ms. Clean departures are unaffected -- those go
+     * through ssg_group_leave() and are immediate.
+     *
+     * This is defence in depth, not the repair. The underlying SSG bug is
+     * fixed by mochi-hpc/mochi-ssg#75; measured against a patched SSG, 3
+     * periods is clean (0 crashes / 24 runs). Keep 10 while we build against
+     * a stock SSG that still has the bug -- anyone compiling vol-stream
+     * against a released mochi-ssg needs it. Revert to 3, and get the
+     * sub-second detection back, once that fix is in a release we depend
+     * on. */
     conf.swim_period_length_ms        = 200;
-    conf.swim_suspect_timeout_periods = 3;
+    conf.swim_suspect_timeout_periods = 10;
 
     addrs[0] = self_addr;
     tr->is_writer = 1;
