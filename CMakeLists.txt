@@ -150,15 +150,55 @@ set(VOL_STREAM_ENABLE_MERCURY "AUTO" CACHE STRING
   "Build the Mercury/Margo/Flock transport (M4/M5): ON, OFF, or AUTO (default; enable if found)")
 set_property(CACHE VOL_STREAM_ENABLE_MERCURY PROPERTY STRINGS AUTO ON OFF)
 
+# Minimum versions, enforced below rather than merely documented. Both floors
+# are load-bearing, and a build against anything older does not fail at
+# configure time or link time -- it builds and then crashes at teardown, which
+# is the worst way to learn about it:
+#
+#   margo 0.24.2  -- earlier releases cannot complete margo_finalize() with a
+#                    Flock provider registered. Measured on 0.24.0: a fix for a
+#                    race on (pre-)finalize callbacks landed in 0.24.1/0.24.2
+#                    and is required. On margo 0.17 the process either hangs in
+#                    __margo_timer_list_free() or segfaults in
+#                    __margo_abt_destroy(), 0 clean runs out of 320.
+#   flock 0.8.0   -- earlier releases crash when two group members call
+#                    flock_provider_destroy() concurrently, which is the normal
+#                    case here: every reader and the writer tear down together
+#                    at H5Fclose(). Fixed upstream by "make provider teardown
+#                    safe against concurrent RPCs and finalize" and the SWIM
+#                    RPC-deregistration race. On 0.7.1 our fan-out benchmarks
+#                    failed most runs; on 0.8.0 they are clean.
+set(VOL_STREAM_MARGO_MIN_VERSION "0.24.2")
+set(VOL_STREAM_FLOCK_MIN_VERSION "0.8.0")
+
 set(VOL_STREAM_HAVE_MERCURY FALSE)
 if(NOT VOL_STREAM_ENABLE_MERCURY STREQUAL "OFF")
   find_package(PkgConfig QUIET)
   if(PkgConfig_FOUND)
+    # Probe unversioned first, purely so the diagnostics below can name the
+    # version actually installed rather than just saying "not found".
     pkg_check_modules(VOL_STREAM_MERCURY QUIET mercury)
-    pkg_check_modules(VOL_STREAM_MARGO QUIET margo)
     pkg_check_modules(VOL_STREAM_ARGOBOTS QUIET argobots)
-    pkg_check_modules(VOL_STREAM_FLOCK_SERVER QUIET flock-server)
-    pkg_check_modules(VOL_STREAM_FLOCK_CLIENT QUIET flock-client)
+    pkg_check_modules(VOL_STREAM_MARGO_ANY QUIET margo)
+    pkg_check_modules(VOL_STREAM_FLOCK_SERVER_ANY QUIET flock-server)
+    pkg_check_modules(VOL_STREAM_FLOCK_CLIENT_ANY QUIET flock-client)
+
+    pkg_check_modules(VOL_STREAM_MARGO QUIET "margo>=${VOL_STREAM_MARGO_MIN_VERSION}")
+    pkg_check_modules(VOL_STREAM_FLOCK_SERVER QUIET "flock-server>=${VOL_STREAM_FLOCK_MIN_VERSION}")
+    pkg_check_modules(VOL_STREAM_FLOCK_CLIENT QUIET "flock-client>=${VOL_STREAM_FLOCK_MIN_VERSION}")
+
+    # Distinguish "too old" from "absent" -- they need different fixes, and
+    # silently disabling the transport for someone who has margo installed but
+    # a version behind is exactly the confusing case worth spelling out.
+    set(VOL_STREAM_TRANSPORT_TOO_OLD "")
+    if(VOL_STREAM_MARGO_ANY_FOUND AND NOT VOL_STREAM_MARGO_FOUND)
+      list(APPEND VOL_STREAM_TRANSPORT_TOO_OLD
+           "margo ${VOL_STREAM_MARGO_ANY_VERSION} (need >= ${VOL_STREAM_MARGO_MIN_VERSION})")
+    endif()
+    if(VOL_STREAM_FLOCK_SERVER_ANY_FOUND AND NOT VOL_STREAM_FLOCK_SERVER_FOUND)
+      list(APPEND VOL_STREAM_TRANSPORT_TOO_OLD
+           "flock ${VOL_STREAM_FLOCK_SERVER_ANY_VERSION} (need >= ${VOL_STREAM_FLOCK_MIN_VERSION})")
+    endif()
   endif()
 
   if(VOL_STREAM_MERCURY_FOUND AND VOL_STREAM_MARGO_FOUND AND VOL_STREAM_ARGOBOTS_FOUND
@@ -193,9 +233,25 @@ if(NOT VOL_STREAM_ENABLE_MERCURY STREQUAL "OFF")
 
     separate_arguments(VOL_STREAM_TRANSPORT_STATIC_LIBS UNIX_COMMAND "${VOL_STREAM_TRANSPORT_STATIC_LIBS}")
     separate_arguments(VOL_STREAM_TRANSPORT_STATIC_CFLAGS UNIX_COMMAND "${VOL_STREAM_TRANSPORT_STATIC_CFLAGS}")
+  elseif(VOL_STREAM_TRANSPORT_TOO_OLD)
+    # Installed but behind the floor. Always fatal, even under AUTO: silently
+    # building without the transport because a dependency is one release too
+    # old looks like the connector "just not supporting streaming", and the
+    # alternative -- building against it anyway -- crashes at teardown.
+    string(REPLACE ";" ", " VOL_STREAM_TRANSPORT_TOO_OLD_STR "${VOL_STREAM_TRANSPORT_TOO_OLD}")
+    message(FATAL_ERROR
+      "vol-stream transport: dependency too old -- ${VOL_STREAM_TRANSPORT_TOO_OLD_STR}.\n"
+      "These floors are not cosmetic. Older margo cannot complete "
+      "margo_finalize() with a Flock provider registered, and flock before "
+      "0.8.0 crashes when group members tear down concurrently, which happens "
+      "on every H5Fclose(). Both build and link fine and then fail at run "
+      "time, so this is checked here instead.\n"
+      "Upgrade, or configure with -DVOL_STREAM_ENABLE_MERCURY=OFF to build "
+      "without the streaming transport.")
   elseif(VOL_STREAM_ENABLE_MERCURY STREQUAL "ON")
     message(FATAL_ERROR
-      "VOL_STREAM_ENABLE_MERCURY=ON but mercury/margo/argobots/flock-server/flock-client "
+      "VOL_STREAM_ENABLE_MERCURY=ON but mercury/margo(>=${VOL_STREAM_MARGO_MIN_VERSION})/"
+      "argobots/flock-server(>=${VOL_STREAM_FLOCK_MIN_VERSION})/flock-client "
       "were not all found via pkg-config")
   endif()
 endif()
