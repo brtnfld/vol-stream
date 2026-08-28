@@ -122,24 +122,32 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
-# Mercury / Argobots / Margo / SSG -- transport, progress engine, and group
+# Mercury / Argobots / Margo / Flock -- transport, progress engine, and group
 # membership (M4/M5)
 #
 # Optional. A build with none of these installed still produces a fully
 # working connector: M0-M3's file-based capture/replay is untouched, and only
-# the step_ready notification path and SSG-based rendezvous (src/tr_mercury.c)
-# are skipped. Detection is via pkg-config, which all four ship -- borrow by
-# default, per dev-plan.md, rather than a bespoke find module.
+# the step_ready notification path and the group-based rendezvous
+# (src/tr_mercury.c) are skipped. Detection is via pkg-config, which all of
+# them ship -- borrow by default, per dev-plan.md, rather than a bespoke find
+# module.
 #
 # Data still moves through the replicated /step/<n>/ file at these
 # milestones, not over Mercury; Mercury/Margo carry the control-plane
-# notification that a step committed, and SSG (M5) carries group membership
+# notification that a step committed, and Flock (M5) carries group membership
 # and failure detection so a reader can join, leave, or die without a
 # hand-rolled attach protocol or liveness tracking. See docs/dev-plan.md's
 # M4 and M5 sections.
+#
+# Group membership was mochi-ssg through M10. SSG was declared deprecated by
+# its maintainers in August 2026 in favour of Flock, which is the maintained
+# successor and supports the same SWIM failure detection we depend on. Flock
+# splits what SSG did into a server side (flock-server: being a group member)
+# and a client side (flock-client: reading a group's view), so both are
+# required.
 # ---------------------------------------------------------------------------
 set(VOL_STREAM_ENABLE_MERCURY "AUTO" CACHE STRING
-  "Build the Mercury/Margo/SSG transport (M4/M5): ON, OFF, or AUTO (default; enable if found)")
+  "Build the Mercury/Margo/Flock transport (M4/M5): ON, OFF, or AUTO (default; enable if found)")
 set_property(CACHE VOL_STREAM_ENABLE_MERCURY PROPERTY STRINGS AUTO ON OFF)
 
 set(VOL_STREAM_HAVE_MERCURY FALSE)
@@ -149,10 +157,12 @@ if(NOT VOL_STREAM_ENABLE_MERCURY STREQUAL "OFF")
     pkg_check_modules(VOL_STREAM_MERCURY QUIET mercury)
     pkg_check_modules(VOL_STREAM_MARGO QUIET margo)
     pkg_check_modules(VOL_STREAM_ARGOBOTS QUIET argobots)
-    pkg_check_modules(VOL_STREAM_SSG QUIET ssg)
+    pkg_check_modules(VOL_STREAM_FLOCK_SERVER QUIET flock-server)
+    pkg_check_modules(VOL_STREAM_FLOCK_CLIENT QUIET flock-client)
   endif()
 
-  if(VOL_STREAM_MERCURY_FOUND AND VOL_STREAM_MARGO_FOUND AND VOL_STREAM_ARGOBOTS_FOUND AND VOL_STREAM_SSG_FOUND)
+  if(VOL_STREAM_MERCURY_FOUND AND VOL_STREAM_MARGO_FOUND AND VOL_STREAM_ARGOBOTS_FOUND
+     AND VOL_STREAM_FLOCK_SERVER_FOUND AND VOL_STREAM_FLOCK_CLIENT_FOUND)
     set(VOL_STREAM_HAVE_MERCURY TRUE)
 
     # pkg_check_modules()'s ordinary (non-static) result variables only
@@ -168,31 +178,32 @@ if(NOT VOL_STREAM_ENABLE_MERCURY STREQUAL "OFF")
     # the pkg-config binary directly -- all four modules in one call, so
     # pkg-config dedupes/orders the merged graph itself.
     execute_process(
-      COMMAND ${PKG_CONFIG_EXECUTABLE} --static --libs mercury margo argobots ssg
+      COMMAND ${PKG_CONFIG_EXECUTABLE} --static --libs mercury margo argobots flock-server flock-client
       OUTPUT_VARIABLE VOL_STREAM_TRANSPORT_STATIC_LIBS
       OUTPUT_STRIP_TRAILING_WHITESPACE
       RESULT_VARIABLE VOL_STREAM_TRANSPORT_PKGCONFIG_RC)
     execute_process(
-      COMMAND ${PKG_CONFIG_EXECUTABLE} --static --cflags mercury margo argobots ssg
+      COMMAND ${PKG_CONFIG_EXECUTABLE} --static --cflags mercury margo argobots flock-server flock-client
       OUTPUT_VARIABLE VOL_STREAM_TRANSPORT_STATIC_CFLAGS
       OUTPUT_STRIP_TRAILING_WHITESPACE)
 
     if(NOT VOL_STREAM_TRANSPORT_PKGCONFIG_RC EQUAL 0)
-      message(FATAL_ERROR "pkg-config --static failed for mercury/margo/argobots/ssg")
+      message(FATAL_ERROR "pkg-config --static failed for mercury/margo/argobots/flock-server/flock-client")
     endif()
 
     separate_arguments(VOL_STREAM_TRANSPORT_STATIC_LIBS UNIX_COMMAND "${VOL_STREAM_TRANSPORT_STATIC_LIBS}")
     separate_arguments(VOL_STREAM_TRANSPORT_STATIC_CFLAGS UNIX_COMMAND "${VOL_STREAM_TRANSPORT_STATIC_CFLAGS}")
   elseif(VOL_STREAM_ENABLE_MERCURY STREQUAL "ON")
     message(FATAL_ERROR
-      "VOL_STREAM_ENABLE_MERCURY=ON but mercury/margo/argobots/ssg were not all found via pkg-config")
+      "VOL_STREAM_ENABLE_MERCURY=ON but mercury/margo/argobots/flock-server/flock-client "
+      "were not all found via pkg-config")
   endif()
 endif()
 
 if(VOL_STREAM_HAVE_MERCURY)
   message(STATUS "Mercury transport: enabled (mercury ${VOL_STREAM_MERCURY_VERSION}, "
                   "margo ${VOL_STREAM_MARGO_VERSION}, argobots ${VOL_STREAM_ARGOBOTS_VERSION}, "
-                  "ssg ${VOL_STREAM_SSG_VERSION})")
+                  "flock ${VOL_STREAM_FLOCK_SERVER_VERSION})")
 else()
   message(STATUS "Mercury transport: disabled (set VOL_STREAM_ENABLE_MERCURY=ON to require it)")
 endif()
@@ -276,11 +287,11 @@ if(VOL_STREAM_HAVE_BAKE)
   list(APPEND VOL_STREAM_SOURCES src/tr_bake.c)
 endif()
 
-# Mercury/Margo/Argobots/SSG (and BAKE) arrive as "-L<dir> -l<name>" flags
+# Mercury/Margo/Argobots/Flock (and BAKE) arrive as "-L<dir> -l<name>" flags
 # from `pkg-config --static`, not as full library paths, so CMake has no way
 # to infer an RPATH for them -- every binary then fails at load time with
-# "libssg.so.0: cannot open shared object file" unless the caller happens to
-# have LD_LIBRARY_PATH set.  Feed those directories in explicitly.
+# "libflock-server.so.0: cannot open shared object file" unless the caller
+# happens to have LD_LIBRARY_PATH set.  Feed those directories in explicitly.
 #
 # Set before any target is created, so every target below (the connector, the
 # tests, the tools, the examples) inherits it.
@@ -289,7 +300,8 @@ if(VOL_STREAM_HAVE_MERCURY OR VOL_STREAM_HAVE_BAKE)
       ${VOL_STREAM_MERCURY_LIBRARY_DIRS}  ${VOL_STREAM_MERCURY_STATIC_LIBRARY_DIRS}
       ${VOL_STREAM_MARGO_LIBRARY_DIRS}    ${VOL_STREAM_MARGO_STATIC_LIBRARY_DIRS}
       ${VOL_STREAM_ARGOBOTS_LIBRARY_DIRS} ${VOL_STREAM_ARGOBOTS_STATIC_LIBRARY_DIRS}
-      ${VOL_STREAM_SSG_LIBRARY_DIRS}      ${VOL_STREAM_SSG_STATIC_LIBRARY_DIRS}
+      ${VOL_STREAM_FLOCK_SERVER_LIBRARY_DIRS} ${VOL_STREAM_FLOCK_SERVER_STATIC_LIBRARY_DIRS}
+      ${VOL_STREAM_FLOCK_CLIENT_LIBRARY_DIRS} ${VOL_STREAM_FLOCK_CLIENT_STATIC_LIBRARY_DIRS}
       ${VOL_STREAM_BAKE_CLIENT_LIBRARY_DIRS} ${VOL_STREAM_BAKE_CLIENT_STATIC_LIBRARY_DIRS}
       ${VOL_STREAM_BAKE_SERVER_LIBRARY_DIRS} ${VOL_STREAM_BAKE_SERVER_STATIC_LIBRARY_DIRS}
       ${VOL_STREAM_ABTIO_LIBRARY_DIRS}       ${VOL_STREAM_ABTIO_STATIC_LIBRARY_DIRS})

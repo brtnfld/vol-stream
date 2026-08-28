@@ -25,7 +25,12 @@
 #include <margo.h>
 #include <mercury_macros.h>
 #include <mercury_proc_string.h>
-#include <ssg.h>
+
+#include <flock/flock-bootstrap.h>
+#include <flock/flock-client.h>
+#include <flock/flock-group.h>
+#include <flock/flock-group-view.h>
+#include <flock/flock-server.h>
 
 #include <errno.h>
 #include <pthread.h>
@@ -34,6 +39,58 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+/* Stable per-member identity.
+ *
+ * SSG handed out an vs_member_id_t: a 64-bit value derived from a member's
+ * address, stable for as long as that member existed, and usable as a key
+ * whether or not the member was still present. This connector leaned on that
+ * heavily -- it keys the writer's subscription and lag tables, the failed
+ * list, and the cached writer ID, and it also travels on our own RPC wire
+ * format (vs_*_in_t's member_id field).
+ *
+ * Flock identifies a member by (address, provider_id) instead. Its public
+ * flock_hash_member() folds exactly that pair into a uint64_t, so it slots
+ * into the same role and the wire format is unchanged across the migration.
+ * Confirmed with Flock's maintainer (mochi-ssg#75, 2026-08-25) that this is
+ * public API and its implementation is not expected to change. */
+typedef uint64_t vs_member_id_t;
+
+#define VS_MEMBER_ID_INVALID ((vs_member_id_t)0)
+
+/* Every process in a vol-stream group registers its Flock provider at this
+ * ID. One group per stream and one provider per process, so it never varies;
+ * naming it keeps flock_hash_member() calls honest about what the pair is. */
+#define VS_FLOCK_PROVIDER_ID ((uint16_t)1)
+
+/* One known peer. This is the part of the SSG port with real design content
+ * rather than a rename.
+ *
+ * SSG kept every member's local group view continuously up to date and let us
+ * ask it anything for free: ssg_get_group_size(), _member_id_from_rank(),
+ * _member_addr() and _member_rank() were all local reads against live state.
+ * Flock 0.7.0 has no equivalent for a *member*: flock_group_subscribe() and
+ * FLOCK_MODE_SUBSCRIBE are unimplemented stubs, so a client handle's cached
+ * view is frozen at creation and only an explicit flock_group_update_view()
+ * RPC advances it. Polling that on every push would put an RPC on the hot
+ * path that SSG never charged us for.
+ *
+ * So we keep our own table instead, seeded once from the view at join and
+ * maintained from then on by the membership callback -- which we need
+ * registered anyway, to prune the subscription table when a subscriber dies.
+ * That makes every lookup below a plain local read under a mutex, which is
+ * what the call sites were written against.
+ *
+ * addr is resolved lazily and cached: SSG returned a ready hg_addr_t, while
+ * Flock hands back an address string, and margo_addr_lookup() per push would
+ * be a needless cost on the fan-out path. HG_ADDR_NULL means "not resolved
+ * yet"; it is freed when the member leaves. */
+typedef struct vs_tr_member_t {
+    vs_member_id_t id;
+    char          *addr_str;
+    uint16_t       provider_id;
+    hg_addr_t      addr;
+} vs_tr_member_t;
 
 /* Diagnostic accounting for the data-push path, enabled by setting
  * VOL_STREAM_PUSH_STATS=1 in the environment and reported once by
@@ -197,7 +254,7 @@ typedef struct vs_tr_inflight_t {
     hg_handle_t     handle;
     margo_request   req;
     void           *owned;
-    ssg_member_id_t member_id;
+    vs_member_id_t member_id;
 } vs_tr_inflight_t;
 
 /* Cap on pushes in flight at once. Reaching it completes the oldest to free
@@ -211,7 +268,7 @@ typedef struct vs_tr_inflight_t {
  * Absence from this table (never acked, or departed and pruned) means "not
  * tracked" -- see vs_tr_writer_min_acked_step(). */
 typedef struct vs_tr_lag_entry_t {
-    ssg_member_id_t member_id;
+    vs_member_id_t member_id;
     uint64_t         acked_step;
 } vs_tr_lag_entry_t;
 
@@ -228,7 +285,7 @@ typedef struct vs_tr_lag_entry_t {
  * subscriber's own H5Sencode2() selection -- what sel_start/sel_count is
  * only the bounding span of -- NULL/0 when the subscriber sent none. */
 typedef struct vs_tr_sub_entry_t {
-    ssg_member_id_t member_id;
+    vs_member_id_t member_id;
     char            *path;
     uint64_t          sel_start;
     uint64_t          sel_count;
@@ -275,13 +332,37 @@ struct vs_tr_t {
     hg_id_t            data_push_rpc_id;
     hg_id_t            get_schema_rpc_id;
 
-    /* M5: SSG group this process created (writer) or joined (reader).
-     * SSG_GROUP_ID_INVALID until vs_tr_writer_start_group()/
-     * vs_tr_reader_join_group() succeeds. is_writer only matters once
-     * group_id is valid -- it decides whether vs_tr_stop() destroys the
-     * group or leaves it. */
-    ssg_group_id_t group_id;
-    int             is_writer;
+    /* M5: the Flock group this process created (writer) or joined (reader).
+     * in_group is 0 until vs_tr_writer_start_group()/vs_tr_reader_join_group()
+     * succeeds, and is the successor to the old "group_id !=
+     * SSG_GROUP_ID_INVALID" test.
+     *
+     * Flock splits SSG's single role in two: the provider makes this process a
+     * member of the group and runs SWIM, while the client handle is what can
+     * read a group's view. We need both -- the handle only to seed the member
+     * table at join, since Flock has no push-updated view for a member (see
+     * vs_tr_member_t). is_writer decides whether vs_tr_stop() tears the group
+     * down or merely departs it. */
+    flock_client_t       flock_client;
+    flock_provider_t     flock_provider;
+    flock_group_handle_t flock_handle;
+    int                  in_group;
+    int                  had_group;
+    int                  is_writer;
+
+    /* This process's own address and derived identity, cached at start:
+     * flock_hash_member() needs the address string, and SSG's ssg_get_self_id()
+     * had no Flock equivalent. */
+    char           *self_addr_str;
+    vs_member_id_t  self_id;
+
+    /* Known peers, seeded at join and maintained by vs_membership_cb().
+     * Replaces every ssg_get_group_* query. Guarded by member_lock, which is
+     * taken from both the application thread and Flock/Margo ULTs. */
+    pthread_mutex_t member_lock;
+    vs_tr_member_t *members;
+    size_t          n_members;
+    size_t          cap_members;
 
     /* Writer side: the last step committed, answered to a
      * get_current_step RPC (a late joiner's "coherent view") and updated
@@ -316,7 +397,7 @@ struct vs_tr_t {
      * so vs_tr_reader_ack_step() does not need to re-probe every member on
      * every step. There is exactly one writer per group in this
      * connector's model, and it does not change mid-session. */
-    ssg_member_id_t writer_member_id;
+    vs_member_id_t writer_member_id;
     int              has_writer_member_id;
 
     /* M7, writer side: per-reader lag table (see vs_tr_lag_entry_t). Grown
@@ -396,7 +477,7 @@ struct vs_tr_t {
      * spelling of the member_unreachable guard (see vs_tr_drain_one()).
      * Reset at the top of every push call: a later write retries a member
      * from scratch, exactly as the synchronous version did. */
-    ssg_member_id_t *failed;
+    vs_member_id_t *failed;
     size_t            n_failed;
     size_t            cap_failed;
 };
@@ -405,60 +486,262 @@ struct vs_tr_t {
  * vs_tr_writer_push_data()'s helpers; declared here for vs_tr_stop(). */
 static void vs_tr_drain_pushes(vs_tr_t *tr);
 
+/*-------------------------------------------------------------------------
+ * Member table -- the local replacement for SSG's live group view
+ *-------------------------------------------------------------------------
+ */
+
+/* Add a peer, or refresh one we already know. Caller must NOT hold
+ * member_lock. Idempotent: Flock can report a member we already have (the
+ * seed pass and an in-flight JOINED can overlap), and re-adding must not
+ * duplicate the entry or leak the cached address. */
+static void
+vs_tr_member_add(vs_tr_t *tr, const char *addr_str, uint16_t provider_id)
+{
+    vs_member_id_t id;
+    size_t         i;
+
+    if (!tr || !addr_str)
+        return;
+
+    id = flock_hash_member(provider_id, addr_str);
+    if (id == tr->self_id)
+        return; /* every caller skips self anyway */
+
+    pthread_mutex_lock(&tr->member_lock);
+
+    for (i = 0; i < tr->n_members; i++) {
+        if (tr->members[i].id == id) {
+            pthread_mutex_unlock(&tr->member_lock);
+            return;
+        }
+    }
+
+    if (tr->n_members == tr->cap_members) {
+        size_t          new_cap = tr->cap_members ? tr->cap_members * 2 : 8;
+        vs_tr_member_t *grown   = (vs_tr_member_t *)realloc(tr->members, new_cap * sizeof(*grown));
+
+        if (!grown) {
+            pthread_mutex_unlock(&tr->member_lock);
+            return;
+        }
+        tr->members     = grown;
+        tr->cap_members = new_cap;
+    }
+
+    tr->members[tr->n_members].id          = id;
+    tr->members[tr->n_members].addr_str    = strdup(addr_str);
+    tr->members[tr->n_members].provider_id = provider_id;
+    tr->members[tr->n_members].addr        = HG_ADDR_NULL;
+    if (tr->members[tr->n_members].addr_str)
+        tr->n_members++;
+
+    pthread_mutex_unlock(&tr->member_lock);
+} /* end vs_tr_member_add() */
+
+/* Drop a departed peer and release its cached address. Caller must NOT hold
+ * member_lock. */
+static void
+vs_tr_member_remove(vs_tr_t *tr, vs_member_id_t id)
+{
+    size_t i;
+
+    if (!tr)
+        return;
+
+    pthread_mutex_lock(&tr->member_lock);
+
+    for (i = 0; i < tr->n_members; i++) {
+        if (tr->members[i].id != id)
+            continue;
+
+        free(tr->members[i].addr_str);
+        if (tr->members[i].addr != HG_ADDR_NULL)
+            margo_addr_free(tr->mid, tr->members[i].addr);
+        if (i + 1 < tr->n_members)
+            memmove(&tr->members[i], &tr->members[i + 1],
+                    (tr->n_members - i - 1) * sizeof(tr->members[0]));
+        tr->n_members--;
+        break;
+    }
+
+    pthread_mutex_unlock(&tr->member_lock);
+} /* end vs_tr_member_remove() */
+
+/* Resolve a member to an hg_addr_t, replacing ssg_get_group_member_addr().
+ *
+ * Returns 0 and stores an address in *out on success, -1 if the member is not
+ * (or is no longer) known -- exactly the "member departed" signal every caller
+ * already handles, since SSG's version failed the same way for a departed
+ * member.
+ *
+ * OWNERSHIP: the returned address belongs to the CALLER and must be released
+ * with margo_addr_free(), matching ssg_get_group_member_addr() ("the resulting
+ * address must be freed by the caller"). Every call site in this file already
+ * does that, so keeping the contract identical is what lets them stay
+ * untouched. Handing back the table's own cached handle instead would leave
+ * the table holding a dangling address the moment a caller freed it -- which
+ * is not hypothetical, it is what the first version of this function did, and
+ * it failed as "Address and context passed belong to different classes"
+ * followed by a segfault in the transport test.
+ *
+ * The table still caches the *lookup*: margo_addr_lookup() parses and resolves
+ * an address string and is the expensive part, while margo_addr_dup() is a
+ * refcount bump on an already-resolved handle. So the fan-out path pays one
+ * lookup per member per session and a dup per push, rather than a lookup per
+ * push. */
+static int
+vs_tr_member_addr(vs_tr_t *tr, vs_member_id_t id, hg_addr_t *out)
+{
+    size_t    i;
+    int       ret = -1;
+    char     *to_lookup = NULL;
+    hg_addr_t resolved;
+
+    if (!tr || !out)
+        return -1;
+
+    pthread_mutex_lock(&tr->member_lock);
+    for (i = 0; i < tr->n_members; i++) {
+        if (tr->members[i].id != id)
+            continue;
+        if (tr->members[i].addr != HG_ADDR_NULL) {
+            if (HG_SUCCESS == margo_addr_dup(tr->mid, tr->members[i].addr, out))
+                ret = 0;
+        }
+        else if (tr->members[i].addr_str) {
+            /* Copy the string and resolve with the lock dropped:
+             * margo_addr_lookup() can block, and member_lock is taken from
+             * Flock/Margo ULTs. */
+            to_lookup = strdup(tr->members[i].addr_str);
+        }
+        break;
+    }
+    pthread_mutex_unlock(&tr->member_lock);
+
+    if (ret == 0 || !to_lookup)
+        return ret;
+
+    if (HG_SUCCESS != margo_addr_lookup(tr->mid, to_lookup, &resolved)) {
+        free(to_lookup);
+        return -1;
+    }
+    free(to_lookup);
+
+    /* Re-find under the lock: the member may have left while we resolved, and
+     * a concurrent caller may have cached an address of its own. */
+    pthread_mutex_lock(&tr->member_lock);
+    for (i = 0; i < tr->n_members; i++) {
+        if (tr->members[i].id != id)
+            continue;
+        if (tr->members[i].addr == HG_ADDR_NULL) {
+            tr->members[i].addr = resolved;
+            resolved            = HG_ADDR_NULL; /* the table owns it now */
+        }
+        if (HG_SUCCESS == margo_addr_dup(tr->mid, tr->members[i].addr, out))
+            ret = 0;
+        break;
+    }
+    pthread_mutex_unlock(&tr->member_lock);
+
+    /* Either we lost the race to cache it, or the member left mid-lookup. */
+    if (resolved != HG_ADDR_NULL)
+        margo_addr_free(tr->mid, resolved);
+    return ret;
+} /* end vs_tr_member_addr() */
+
+/* Liveness predicate, replacing the ssg_get_group_member_rank() call whose
+ * rank value was always discarded. Non-zero if this member is still present. */
+static int
+vs_tr_member_is_present(vs_tr_t *tr, vs_member_id_t id)
+{
+    size_t i;
+    int    found = 0;
+
+    if (!tr)
+        return 0;
+
+    pthread_mutex_lock(&tr->member_lock);
+    for (i = 0; i < tr->n_members; i++) {
+        if (tr->members[i].id == id) {
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&tr->member_lock);
+    return found;
+} /* end vs_tr_member_is_present() */
+
+/* Release the whole table. Called from vs_tr_stop() after the provider is
+ * gone, so no callback can be racing us. */
+static void
+vs_tr_members_clear(vs_tr_t *tr)
+{
+    size_t i;
+
+    pthread_mutex_lock(&tr->member_lock);
+    for (i = 0; i < tr->n_members; i++) {
+        free(tr->members[i].addr_str);
+        if (tr->members[i].addr != HG_ADDR_NULL)
+            margo_addr_free(tr->mid, tr->members[i].addr);
+    }
+    free(tr->members);
+    tr->members     = NULL;
+    tr->n_members   = 0;
+    tr->cap_members = 0;
+    pthread_mutex_unlock(&tr->member_lock);
+} /* end vs_tr_members_clear() */
+
 /* Capture the group's current members as stable IDs, for any loop that then
  * does blocking work per member.
  *
- * An SSG *rank* is a position in a list that is re-sorted whenever a member
- * joins or leaves -- it is not an identity. Reading ssg_get_group_size()
- * once and then walking ranks 0..N-1 with a blocking RPC in the body is
- * therefore a time-of-check/time-of-use bug: a member departing mid-loop
- * shrinks the group, the top ranks stop existing, and
- * ssg_get_group_member_id_from_rank() correctly fails for them -- silently
- * skipping members that had nothing to do with the departure. That is not
- * hypothetical; it cost real, reproducible data loss in
- * vs_tr_writer_push_data() (see its comment and docs/dev-plan.md), found
- * only because test/b_push_fanout.c had eight subscribers closing while the
- * writer was still pushing.
+ * The hazard this exists for predates Flock and still applies. Walking a live
+ * group view with a blocking RPC in the loop body is a time-of-check/
+ * time-of-use bug: a member departing mid-loop shrinks the view underneath
+ * the iteration, and entries shift, silently skipping members that had
+ * nothing to do with the departure. That is not hypothetical -- it cost real,
+ * reproducible data loss in vs_tr_writer_push_data() (see its comment and
+ * docs/dev-plan.md), found only because test/b_push_fanout.c had eight
+ * subscribers closing while the writer was still pushing.
  *
- * An ssg_member_id_t, by contrast, stays valid whether or not that member is
- * still present, so resolving it later fails for that member alone. Taking
- * the whole snapshot in one tight pass with no blocking work in it is what
- * shrinks the vulnerable window to nothing.
+ * A vs_member_id_t stays meaningful whether or not that member is still
+ * present, so resolving it later fails for that member alone. Taking the whole
+ * snapshot in one tight pass with no blocking work in it is what shrinks the
+ * vulnerable window to nothing.
  *
  * Returns the number of members captured (excluding self, which every
  * caller skips anyway) and stores a malloc'd array in *out, or returns -1
  * with *out NULL. A 0 return with *out NULL just means "nobody else here",
  * which is not an error for any caller. */
 static int
-vs_tr_snapshot_members(vs_tr_t *tr, ssg_member_id_t self_id, ssg_member_id_t **out)
+vs_tr_snapshot_members(vs_tr_t *tr, vs_member_id_t self_id, vs_member_id_t **out)
 {
-    ssg_member_id_t *members;
-    int               group_size, i, n = 0;
+    vs_member_id_t *members;
+    size_t          i;
+    int             n = 0;
 
     *out = NULL;
 
-    if (tr->group_id == SSG_GROUP_ID_INVALID)
+    if (!tr || !tr->in_group)
         return -1;
-    if (SSG_SUCCESS != ssg_get_group_size(tr->group_id, &group_size))
-        return -1;
-    if (group_size <= 0)
+
+    pthread_mutex_lock(&tr->member_lock);
+
+    if (tr->n_members == 0) {
+        pthread_mutex_unlock(&tr->member_lock);
         return 0;
-    if (NULL == (members = (ssg_member_id_t *)malloc((size_t)group_size * sizeof(*members))))
-        return -1;
-
-    for (i = 0; i < group_size; i++) {
-        ssg_member_id_t member_id;
-
-        /* A failure here is now benign in a way it was not before: the loop
-         * body is pure bookkeeping, so nothing has blocked yet and the view
-         * cannot have moved much. A member missed here is picked up by the
-         * next call. */
-        if (SSG_SUCCESS != ssg_get_group_member_id_from_rank(tr->group_id, i, &member_id))
-            continue;
-        if (member_id == self_id)
-            continue;
-        members[n++] = member_id;
     }
+    if (NULL == (members = (vs_member_id_t *)malloc(tr->n_members * sizeof(*members)))) {
+        pthread_mutex_unlock(&tr->member_lock);
+        return -1;
+    }
+    for (i = 0; i < tr->n_members; i++) {
+        if (tr->members[i].id == self_id)
+            continue;
+        members[n++] = tr->members[i].id;
+    }
+
+    pthread_mutex_unlock(&tr->member_lock);
 
     if (n == 0) {
         free(members);
@@ -579,39 +862,66 @@ vs_tr_sub_entry_clear(vs_tr_sub_entry_t *e)
     memset(e, 0, sizeof(*e));
 } /* end vs_tr_sub_entry_clear() */
 
-/* M5: fires on SSG_MEMBER_JOINED/LEFT/DIED for any group this process
- * belongs to. Both ssg_group_create() and ssg_group_join() require one.
+/* M5: fires on FLOCK_MEMBER_JOINED/LEFT/DIED/MOVED for the group this process
+ * belongs to, registered on the provider by vs_tr_group_finish_join().
  *
- * vs_tr_writer_broadcast_step_ready() does not need to be told about a
- * departure, since it queries live group membership at send time, so a
- * departed member is simply absent from the next broadcast. The
- * *subscription* table is different: it is built from subscribe RPCs and
- * keyed by member, and nothing else prunes it. Left alone, a subscriber
- * that dies keeps its entries forever, and the push loop pays a full
- * margo_forward_timed() timeout against the dead peer on every subsequent
- * step -- vs_tr_member_failed()'s guard is deliberately reset at the top
- * of each push call, so it suppresses repeat attempts *within* one write,
- * never across steps. That is the difference between a bounded per-step
- * cost and an unbounded recurring one, so the purge belongs here, where
- * SWIM's own failure detector is the trigger. */
+ * This does two jobs. First, it maintains the member table, which under Flock
+ * is the *only* thing tracking group membership -- SSG kept a member's local
+ * view live for free, Flock does not (see vs_tr_member_t).
+ *
+ * Second, and unchanged from the SSG version, it purges the subscription
+ * table. vs_tr_writer_broadcast_step_ready() does not need to be told about a
+ * departure, since it re-reads membership at send time, so a departed member
+ * is simply absent from the next broadcast. The *subscription* table is
+ * different: it is built from subscribe RPCs and keyed by member, and nothing
+ * else prunes it. Left alone, a subscriber that dies keeps its entries
+ * forever, and the push loop pays a full margo_forward_timed() timeout
+ * against the dead peer on every subsequent step -- vs_tr_member_failed()'s
+ * guard is deliberately reset at the top of each push call, so it suppresses
+ * repeat attempts *within* one write, never across steps. That is the
+ * difference between a bounded per-step cost and an unbounded recurring one,
+ * so the purge belongs here, where SWIM's own failure detector is the trigger.
+ *
+ * MOVED has no SSG equivalent (a member changed address or provider id). We
+ * treat it as leave-then-rejoin, which drops the stale cached hg_addr_t and
+ * lets the next lookup resolve the new one. A subscription made under the old
+ * address is purged with it: the subscriber is expected to re-subscribe, the
+ * same contract as any other departure. */
 static void
-vs_membership_cb(void *group_data, ssg_member_id_t member_id, ssg_member_update_type_t update_type)
+vs_membership_cb(void *group_data, flock_update_t update_type, const char *addr_str, uint16_t provider_id)
 {
-    vs_tr_t *tr = (vs_tr_t *)group_data;
-    size_t    i;
+    vs_tr_t       *tr = (vs_tr_t *)group_data;
+    vs_member_id_t member_id;
+    size_t         i;
+
+    if (!tr || !addr_str)
+        return;
+
+    member_id = flock_hash_member(provider_id, addr_str);
 
 #ifdef ENABLE_STREAM_LOGGING
-    printf("------- VOL-STREAM SSG membership update: member %lu, type %d\n", (unsigned long)member_id,
-           (int)update_type);
+    printf("------- VOL-STREAM Flock membership update: member %lu (%s), type %d\n",
+           (unsigned long)member_id, addr_str, (int)update_type);
 #endif
 
-    if (!tr)
+    if (update_type == FLOCK_MEMBER_JOINED) {
+        vs_tr_member_add(tr, addr_str, provider_id);
         return;
-    if (update_type != SSG_MEMBER_DIED && update_type != SSG_MEMBER_LEFT)
+    }
+    if (update_type == FLOCK_MEMBER_MOVED) {
+        vs_tr_member_remove(tr, member_id);
+        vs_tr_member_add(tr, addr_str, provider_id);
+        /* fall through to purge subscriptions keyed by the old identity */
+    }
+    else if (update_type == FLOCK_MEMBER_DIED || update_type == FLOCK_MEMBER_LEFT) {
+        vs_tr_member_remove(tr, member_id);
+    }
+    else {
         return;
+    }
 
     /* Same lock the subscribe handler takes, and from the same kind of
-     * context (an SSG/Margo ULT rather than the application thread). */
+     * context (a Flock/Margo ULT rather than the application thread). */
     pthread_mutex_lock(&tr->sub_lock);
     i = 0;
     while (i < tr->n_sub) {
@@ -655,7 +965,7 @@ vs_tr_writer_wait_subscribers(vs_tr_t *tr, uint64_t n_expected, uint64_t timeout
 {
     uint64_t deadline_ns;
 
-    if (!tr || tr->group_id == SSG_GROUP_ID_INVALID)
+    if (!tr || !tr->in_group)
         return -1;
     if (n_expected == 0)
         return 0;
@@ -824,7 +1134,7 @@ vs_reader_ack_ult(hg_handle_t handle)
         pthread_mutex_lock(&tr->lag_lock);
 
         for (i = 0; i < tr->n_lag; i++)
-            if (tr->lag_table[i].member_id == (ssg_member_id_t)in.member_id) {
+            if (tr->lag_table[i].member_id == (vs_member_id_t)in.member_id) {
                 if (in.physical_step > tr->lag_table[i].acked_step)
                     tr->lag_table[i].acked_step = in.physical_step;
                 break;
@@ -841,7 +1151,7 @@ vs_reader_ack_ult(hg_handle_t handle)
                 }
             }
             if (tr->n_lag < tr->cap_lag) {
-                tr->lag_table[tr->n_lag].member_id  = (ssg_member_id_t)in.member_id;
+                tr->lag_table[tr->n_lag].member_id  = (vs_member_id_t)in.member_id;
                 tr->lag_table[tr->n_lag].acked_step = in.physical_step;
                 tr->n_lag++;
             }
@@ -931,7 +1241,7 @@ vs_subscribe_ult(hg_handle_t handle)
         pthread_mutex_lock(&tr->sub_lock);
 
         for (i = 0; i < tr->n_sub; i++)
-            if (tr->sub_table[i].member_id == (ssg_member_id_t)in.member_id &&
+            if (tr->sub_table[i].member_id == (vs_member_id_t)in.member_id &&
                 strcmp(tr->sub_table[i].path, in.path) == 0) {
                 uint8_t *blob_copy;
                 uint64_t blob_copy_len;
@@ -1014,7 +1324,20 @@ vs_subscribe_ult(hg_handle_t handle)
 
                 if (path_copy && vs_blob_dup(&in.dcpl_enc, &dcpl_copy, &dcpl_copy_len) == 0 &&
                     vs_blob_dup(&in.space_enc, &space_copy, &space_copy_len) == 0) {
-                    tr->sub_table[tr->n_sub].member_id     = (ssg_member_id_t)in.member_id;
+                    /* Zero first, then fill. realloc() above does not
+                     * initialize the new tail, and every field must be
+                     * definite before the entry is published by n_sub++ --
+                     * the push path reads want_type_enc_len and passes it
+                     * straight to malloc(). Assigning field-by-field was a
+                     * standing trap: want_type_enc/_len were added later
+                     * (M8.5) and never added here, so they were whatever the
+                     * allocator left behind. That read as 0 often enough on
+                     * fresh pages to look fine for a long time, and surfaced
+                     * as an allocation-size-too-big abort under ASAN and as
+                     * a ~60%-of-runs SIGSEGV in b_stream_grow once the
+                     * allocation pattern shifted. */
+                    memset(&tr->sub_table[tr->n_sub], 0, sizeof(tr->sub_table[tr->n_sub]));
+                    tr->sub_table[tr->n_sub].member_id     = (vs_member_id_t)in.member_id;
                     tr->sub_table[tr->n_sub].path          = path_copy;
                     tr->sub_table[tr->n_sub].sel_start     = in.sel_start;
                     tr->sub_table[tr->n_sub].sel_count     = in.sel_count;
@@ -1107,14 +1430,31 @@ vs_tr_start(const char *na_str)
         return NULL;
     }
 
-    if (SSG_SUCCESS != ssg_init()) {
+    /* Flock's client side. Unlike ssg_init() this is not global process state:
+     * the client is what can create a group handle, which we need only to read
+     * a view. Being a *member* is the provider, created later by
+     * vs_tr_writer_start_group()/vs_tr_reader_join_group(). */
+    if (FLOCK_SUCCESS != flock_client_init(tr->mid, ABT_POOL_NULL, &tr->flock_client)) {
         margo_finalize(tr->mid);
         free(tr);
         return NULL;
     }
 
-    tr->group_id = SSG_GROUP_ID_INVALID;
+    /* Our own identity, needed before any group exists: flock_hash_member()
+     * works off the address string, and every member-table operation compares
+     * against self. */
+    if (NULL == (tr->self_addr_str = vs_tr_self_address(tr))) {
+        flock_client_finalize(tr->flock_client);
+        margo_finalize(tr->mid);
+        free(tr);
+        return NULL;
+    }
+    tr->self_id      = flock_hash_member(VS_FLOCK_PROVIDER_ID, tr->self_addr_str);
+    tr->in_group     = 0;
+    tr->had_group    = 0;
+    tr->flock_handle = FLOCK_GROUP_HANDLE_NULL;
 
+    pthread_mutex_init(&tr->member_lock, NULL);
     pthread_mutex_init(&tr->last_step_lock, NULL);
     pthread_mutex_init(&tr->pending_lock, NULL);
     pthread_cond_init(&tr->pending_cond, NULL);
@@ -1219,42 +1559,51 @@ vs_tr_stop(vs_tr_t *tr)
     pthread_cond_broadcast(&tr->data_cond);
     pthread_mutex_unlock(&tr->data_lock);
 
-    if (tr->group_id != SSG_GROUP_ID_INVALID) {
-        if (tr->is_writer)
-            ssg_group_destroy(tr->group_id);
-        else
-            ssg_group_leave(tr->group_id);
-        tr->group_id = SSG_GROUP_ID_INVALID;
+    if (tr->in_group || tr->had_group) {
+        /* Release the view handle before the provider: the handle is a client
+         * of this same process's provider, and dropping it afterwards would
+         * leave a handle pointing at a destroyed provider. */
+        if (tr->flock_handle != FLOCK_GROUP_HANDLE_NULL) {
+            flock_group_handle_release(tr->flock_handle);
+            tr->flock_handle = FLOCK_GROUP_HANDLE_NULL;
+        }
 
-        /* Settle window before tearing down SSG's own runtime state below.
-         * This mirrors mochi-ssg's own tests/ssg-join-leave-group.c, which
-         * deliberately sleeps between leave/destroy and finalize -- not
-         * cosmetic. A peer with a SWIM ping already in flight *to* this
-         * member (sent just before our leave/destroy gossiped out) still
-         * lands here and gets dispatched to swim_dping_req_recv_ult(),
-         * which asserts SSG's global runtime pointer is non-NULL --
-         * exactly what ssg_finalize() below sets to NULL. Without giving
-         * peers time to actually process our departure first, that
-         * dispatch can race ssg_finalize() and crash the process with
-         * "swim_dping_req_recv_ult: Assertion `ssg_rt' failed" -- root
-         * caused (not guessed) via a real stress-test crash and reading
-         * mochi-ssg's swim-fd-ping.c. This was a real usage gap on our
-         * side, not purely a third-party bug.
+        /* Destroying the provider is how a process departs a Flock group; the
+         * SWIM backend announces the leave to its peers on the way out. There
+         * is no writer/reader distinction here as there was with SSG's
+         * destroy-vs-leave split -- the last member out simply leaves an empty
+         * group behind, and the sidecar file is what a later reader consults. */
+        if (tr->flock_provider) {
+            flock_provider_destroy(tr->flock_provider);
+            tr->flock_provider = NULL;
+        }
+        tr->in_group  = 0;
+        tr->had_group = 0;
+
+        /* Settle window before finalizing Margo below.
+         *
+         * Kept from the SSG implementation, where it was needed because a
+         * peer's in-flight SWIM ping could land after ssg_finalize() had
+         * nulled SSG's global runtime pointer and crash on an assertion. Flock
+         * has no such global -- its state hangs off the provider -- so the
+         * original failure mode cannot occur. It is retained because the
+         * underlying race is not SSG-specific: a peer that has not yet
+         * processed our departure can still have a SWIM ping in flight to us,
+         * and letting those drain before margo_finalize() tears down the
+         * progress engine is cheap insurance on a path that only runs once per
+         * file close.
          *
          * What governs how long that takes is the SWIM *period*
-         * (swim_period_length_ms=200 below), not the suspect timeout: 750ms
-         * is a bit under four gossip periods. It was originally described
-         * as one suspect-timeout window, which was only true while that
-         * timeout was 3 periods; it is now 10, and the window deliberately
-         * did NOT grow with it -- waiting 2s here would slow every teardown
-         * to buy margin against a different quantity than the one that
-         * matters. */
+         * (protocol_period_ms=200 below), not the suspicion timeout: 750ms is
+         * a bit under four gossip periods. */
         usleep(750000);
     }
 
-    ssg_finalize();
+    vs_tr_members_clear(tr);
+    flock_client_finalize(tr->flock_client);
     margo_finalize(tr->mid);
 
+    pthread_mutex_destroy(&tr->member_lock);
     pthread_mutex_destroy(&tr->last_step_lock);
     pthread_mutex_destroy(&tr->pending_lock);
     pthread_cond_destroy(&tr->pending_cond);
@@ -1263,6 +1612,7 @@ vs_tr_stop(vs_tr_t *tr)
     pthread_mutex_destroy(&tr->data_lock);
     pthread_cond_destroy(&tr->data_cond);
     pthread_mutex_destroy(&tr->schema_lock);
+    free(tr->self_addr_str);
     free(tr->schema_blob);
     free(tr->pending);
     free(tr->lag_table);
@@ -1285,95 +1635,206 @@ vs_tr_stop(vs_tr_t *tr)
     free(tr);
 }
 
-int
-vs_tr_writer_start_group(vs_tr_t *tr, const char *group_file)
+/* SWIM tuning, shared by the writer that creates the group and every reader
+ * that joins it -- Flock takes this as backend JSON where SSG took a struct.
+ *
+ * Faster than the HPC-scale defaults: this is a step-notification stream,
+ * where sub-second failure detection is worth more than saving a handful of
+ * pings a minute.
+ *
+ * suspicion_timeout_ms is 2s (ten 200ms periods) rather than the 600ms this
+ * originally used under SSG. 600ms is short enough that a subscriber merely
+ * BUSY -- re-filtering a multi-megabyte frame for its own pipeline, say --
+ * gets declared failed by its peers. Under SSG that was actively dangerous,
+ * because a member that believed it had failed tore its own group down from
+ * inside a SWIM handler, hitting mochi-ssg's teardown use-after-free (their
+ * #62, open since 2022; our diagnosis in #74, whose fix was closed unmerged
+ * when SSG was deprecated). Flock's SWIM is a separate implementation and does
+ * not inherit that bug, so the value is no longer defending against a crash --
+ * but a false failure still costs a subscriber its subscription and forces a
+ * re-subscribe, so the generous timeout is kept on its own merits.
+ *
+ * The trade: a subscriber that dies without leaving is noticed in ~2s rather
+ * than ~600ms. Clean departures are unaffected -- those announce immediately
+ * when the departing process destroys its provider. */
+#define VS_FLOCK_GROUP_CONFIG                     \
+    "{\"group\":{\"type\":\"swim\",\"config\":{"  \
+    "\"protocol_period_ms\":200.0,"               \
+    "\"ping_timeout_ms\":100.0,"                  \
+    "\"ping_req_timeout_ms\":200.0,"              \
+    "\"ping_req_members\":2,"                     \
+    "\"suspicion_timeout_ms\":2000.0"             \
+    "}}"
+
+/* Register this process's provider and finish wiring up group membership.
+ * Shared by the writer's create path and the reader's join path, which differ
+ * only in how the initial view was bootstrapped and whether the provider owns
+ * the sidecar file.
+ *
+ * Takes ownership of *view either way: flock_provider_register() consumes it.
+ *
+ * The order here matters. The membership callback is registered immediately
+ * after the provider exists, before the view is seeded, so a JOINED arriving
+ * during the seed is not lost -- vs_tr_member_add() is idempotent, so the
+ * overlap is harmless in the other direction too. */
+static int
+vs_tr_group_finish_join(vs_tr_t *tr, flock_group_view_t *view, const char *group_file)
 {
-    char               *self_addr;
-    ssg_group_config_t   conf = SSG_GROUP_CONFIG_INITIALIZER;
-    const char          *addrs[1];
-    int                  ret = -1;
+    char                       config[512];
+    struct flock_provider_args args = FLOCK_PROVIDER_ARGS_INIT;
+    hg_addr_t                  self = HG_ADDR_NULL;
+    size_t                     i, n;
 
-    if (!tr || !group_file)
+    if (group_file)
+        snprintf(config, sizeof(config), VS_FLOCK_GROUP_CONFIG ",\"file\":\"%s\"}", group_file);
+    else
+        snprintf(config, sizeof(config), VS_FLOCK_GROUP_CONFIG "}");
+
+    args.initial_view = view;
+    if (FLOCK_SUCCESS !=
+        flock_provider_register(tr->mid, VS_FLOCK_PROVIDER_ID, config, &args, &tr->flock_provider)) {
+        tr->flock_provider = NULL;
         return -1;
-    if (NULL == (self_addr = vs_tr_self_address(tr)))
+    }
+
+    if (FLOCK_SUCCESS !=
+        flock_provider_add_update_callbacks(tr->flock_provider, vs_membership_cb, NULL, tr)) {
+        flock_provider_destroy(tr->flock_provider);
+        tr->flock_provider = NULL;
         return -1;
+    }
 
-    /* Faster than SSG's ~2s-period/10s-suspect HPC-scale defaults: this is
-     * a step-notification stream, where sub-second failure detection is
-     * worth more than saving a handful of pings a minute.
-     *
-     * The suspect timeout is 10 periods (2s) rather than the 3 (600ms) this
-     * originally used. 600ms is short enough that a subscriber merely BUSY
-     * -- re-filtering a multi-megabyte frame for its own pipeline, say --
-     * gets declared failed by its peers, and a member that believes it has
-     * failed tears its own group down from inside a SWIM handler. That is
-     * mochi-ssg's teardown use-after-free (their issue #62, open since 2022;
-     * our diagnosis in #74), and an aggressive timeout is what makes us hit
-     * it. Measured here: 3 periods crashed 6 of 24 runs of
-     * test/b_detector_narrowing, 10 periods crashed 1 of 24. That is Fisher
-     * p=0.097 -- suggestive rather than conclusive, and NOT a cure, but it
-     * is mechanistically motivated and costs only detection latency.
-     *
-     * The trade: a subscriber that dies without leaving is now noticed in
-     * ~2s instead of ~600ms. Clean departures are unaffected -- those go
-     * through ssg_group_leave() and are immediate.
-     *
-     * This is defence in depth, not the repair. The underlying SSG bug is
-     * fixed by mochi-hpc/mochi-ssg#75; measured against a patched SSG, 3
-     * periods is clean (0 crashes / 24 runs). Keep 10 while we build against
-     * a stock SSG that still has the bug -- anyone compiling vol-stream
-     * against a released mochi-ssg needs it. Revert to 3, and get the
-     * sub-second detection back, once that fix is in a release we depend
-     * on. */
-    conf.swim_period_length_ms        = 200;
-    conf.swim_suspect_timeout_periods = 10;
+    /* A handle pointed at our own provider. Its only job is the one-shot seed
+     * below: Flock has no push-updated view for a member, so from here on the
+     * member table is maintained entirely by vs_membership_cb(). */
+    if (HG_SUCCESS != margo_addr_self(tr->mid, &self)) {
+        flock_provider_destroy(tr->flock_provider);
+        tr->flock_provider = NULL;
+        return -1;
+    }
+    if (FLOCK_SUCCESS != flock_group_handle_create(tr->flock_client, self, VS_FLOCK_PROVIDER_ID,
+                                                   FLOCK_MODE_INIT_UPDATE, &tr->flock_handle)) {
+        margo_addr_free(tr->mid, self);
+        flock_provider_destroy(tr->flock_provider);
+        tr->flock_provider = NULL;
+        tr->flock_handle   = FLOCK_GROUP_HANDLE_NULL;
+        return -1;
+    }
+    margo_addr_free(tr->mid, self);
 
-    addrs[0] = self_addr;
-    tr->is_writer = 1;
+    tr->in_group  = 1;
+    tr->had_group = 1;
 
-    if (SSG_SUCCESS ==
-        ssg_group_create(tr->mid, "vol-stream", addrs, 1, &conf, vs_membership_cb, tr, &tr->group_id)) {
-        if (SSG_SUCCESS == ssg_group_id_store(group_file, tr->group_id, SSG_ALL_MEMBERS))
-            ret = 0;
-        else {
-            ssg_group_destroy(tr->group_id);
-            tr->group_id = SSG_GROUP_ID_INVALID;
+    /* Seed the member table from whoever is already in the group. Done through
+     * flock_group_get_view() rather than flock_group_access_view() so the copy
+     * is ours to walk without holding Flock's view lock across
+     * vs_tr_member_add(), which takes member_lock. */
+    {
+        flock_group_view_t seed = FLOCK_GROUP_VIEW_INITIALIZER;
+
+        if (FLOCK_SUCCESS == flock_group_get_view(tr->flock_handle, &seed)) {
+            n = flock_group_view_member_count(&seed);
+            for (i = 0; i < n; i++) {
+                flock_member_t *m = flock_group_view_member_at(&seed, i);
+
+                if (m && m->address)
+                    vs_tr_member_add(tr, m->address, m->provider_id);
+            }
+            flock_group_view_clear(&seed);
         }
     }
 
-    free(self_addr);
-    return ret;
+    return 0;
+} /* end vs_tr_group_finish_join() */
+
+int
+vs_tr_writer_start_group(vs_tr_t *tr, const char *group_file)
+{
+    flock_group_view_t view = FLOCK_GROUP_VIEW_INITIALIZER;
+
+    if (!tr || !group_file)
+        return -1;
+
+    /* A group of one, containing only this process. Flock takes that as the
+     * provider's initial view; because we ARE in it, the provider treats this
+     * as creating rather than joining. */
+    if (FLOCK_SUCCESS != flock_group_view_init_from_self(tr->mid, VS_FLOCK_PROVIDER_ID, &view))
+        return -1;
+
+    tr->is_writer = 1;
+
+    /* The writer owns the sidecar file. Passing it as the provider's "file"
+     * replaces ssg_group_id_store(): Flock rewrites it on every membership
+     * change, so it stays current instead of being a one-shot snapshot, and
+     * only the first member of the view is allowed to write it. */
+    return vs_tr_group_finish_join(tr, &view, group_file);
 }
 
 int
 vs_tr_reader_join_group(vs_tr_t *tr, const char *group_file)
 {
-    int      num_addrs = SSG_ALL_MEMBERS;
-    uint64_t phys, wall_ns;
+    flock_group_view_t view = FLOCK_GROUP_VIEW_INITIALIZER;
+    uint64_t           phys, wall_ns;
 
     if (!tr || !group_file)
         return -1;
 
-    if (SSG_SUCCESS != ssg_group_id_load(group_file, &num_addrs, &tr->group_id)) {
-        tr->group_id = SSG_GROUP_ID_INVALID;
-        return -1;
+    /* The sidecar file the writer's provider maintains. Replaces
+     * ssg_group_id_load(); the view it yields holds the group's current
+     * members and does NOT hold us, which is exactly what makes
+     * flock_provider_register() treat this as a join and gossip a SWIM join
+     * announcement rather than creating a fresh group.
+     *
+     * Retried, because this read races the writer rewriting the same path.
+     * The writer's provider re-serializes the group file on *every* membership
+     * change, so with several subscribers joining at once a joiner can read it
+     * mid-update. Flock does write it atomically (a ".swp" file plus rename),
+     * but flock_group_view_from_file() takes the size from ftell() and then
+     * ignores fread()'s return value, parsing that many bytes regardless -- so
+     * a short read or a momentarily empty file is handed to the JSON parser as
+     * a truncated document over uninitialised memory. That surfaces as
+     * "[flock] JSON parse error: continue" followed by a garbage address, and
+     * it cost one failure in four of test/b_detector_narrowing at 12
+     * subscribers before this retry existed.
+     *
+     * A failed read here is transient by nature -- the writer is mid-rename,
+     * not gone -- so retrying is the right response either way, independent of
+     * that upstream detail. */
+    {
+        int attempt;
+        int ok = 0;
+
+        for (attempt = 0; attempt < 20; attempt++) {
+            flock_group_view_clear(&view);
+            if (FLOCK_SUCCESS == flock_group_view_init_from_file(group_file, &view) &&
+                flock_group_view_member_count(&view) > 0) {
+                ok = 1;
+                break;
+            }
+            usleep(50000); /* 50ms; 20 attempts is a 1s budget */
+        }
+        if (!ok) {
+            flock_group_view_clear(&view);
+            return -1;
+        }
     }
-    if (SSG_SUCCESS != ssg_group_join(tr->mid, tr->group_id, vs_membership_cb, tr)) {
-        tr->group_id = SSG_GROUP_ID_INVALID;
-        return -1;
-    }
+
     tr->is_writer = 0;
+
+    /* No group_file here: only the writer owns the sidecar. A reader that also
+     * declared it would race the writer rewriting the same path on every
+     * membership change. */
+    if (0 != vs_tr_group_finish_join(tr, &view, NULL))
+        return -1;
 
     /* Late-joiner "coherent view": seed whatever the writer already
      * committed so the first vs_tr_reader_wait_step_ready() returns
      * immediately instead of blocking for the next write. Retried briefly:
-     * right after ssg_group_join() returns, this process's own local group
-     * view is not always populated yet (observed directly -- the very next
-     * ssg_get_group_member_addr() call for the writer's rank can transiently
-     * fail), so the first attempt or two can fail even though the writer
-     * has, in fact, already committed something. Not an error either way if
-     * every attempt fails or the writer has not committed anything yet --
-     * nothing to seed, matching an ordinary non-late join. */
+     * the seed above captures whoever was in the view at join time, but the
+     * writer may not have finished processing our own join, and a
+     * get_current_step forwarded a moment too early simply times out. Not an
+     * error either way if every attempt fails or the writer has not committed
+     * anything yet -- nothing to seed, matching an ordinary non-late join. */
     {
         int i;
 
@@ -1392,27 +1853,34 @@ vs_tr_reader_join_group(vs_tr_t *tr, const char *group_file)
 int
 vs_tr_reader_leave_group(vs_tr_t *tr)
 {
-    if (!tr || tr->group_id == SSG_GROUP_ID_INVALID)
+    if (!tr || !tr->in_group)
         return -1;
-    if (SSG_SUCCESS != ssg_group_leave(tr->group_id))
-        return -1;
-    tr->group_id = SSG_GROUP_ID_INVALID;
+
+    /* Destroying the provider is the departure; the SWIM backend announces it
+     * on the way out. The handle goes first, since it is a client of the
+     * provider we are about to destroy. */
+    if (tr->flock_handle != FLOCK_GROUP_HANDLE_NULL) {
+        flock_group_handle_release(tr->flock_handle);
+        tr->flock_handle = FLOCK_GROUP_HANDLE_NULL;
+    }
+    flock_provider_destroy(tr->flock_provider);
+    tr->flock_provider = NULL;
+    tr->in_group       = 0;
     return 0;
 }
 
 int
 vs_tr_reader_get_current_step(vs_tr_t *tr, uint64_t *physical_step, uint64_t *wall_time_ns)
 {
-    ssg_member_id_t self_id;
-    ssg_member_id_t *members;
+    vs_member_id_t self_id;
+    vs_member_id_t *members;
     int              n_members, i;
     vs_get_current_step_in_t in;
     int              ret = -1;
 
-    if (!tr || tr->group_id == SSG_GROUP_ID_INVALID)
+    if (!tr || !tr->in_group)
         return -1;
-    if (SSG_SUCCESS != ssg_get_self_id(tr->mid, &self_id))
-        return -1;
+    self_id = tr->self_id;
     if ((n_members = vs_tr_snapshot_members(tr, self_id, &members)) <= 0)
         return -1;
 
@@ -1427,11 +1895,11 @@ vs_tr_reader_get_current_step(vs_tr_t *tr, uint64_t *physical_step, uint64_t *wa
      * response a genuinely fresh writer gives), and there is exactly one
      * writer per group in this connector's model. */
     for (i = 0; i < n_members && ret != 0; i++) {
-        ssg_member_id_t member_id = members[i];
+        vs_member_id_t member_id = members[i];
         hg_addr_t        addr;
         hg_handle_t       handle;
 
-        if (SSG_SUCCESS != ssg_get_group_member_addr(tr->group_id, member_id, &addr))
+        if (0 != vs_tr_member_addr(tr, member_id, &addr))
             continue;
 
         if (HG_SUCCESS == margo_create(tr->mid, addr, tr->get_current_step_rpc_id, &handle)) {
@@ -1499,7 +1967,7 @@ vs_tr_writer_publish_schema(vs_tr_t *tr, uint64_t physical_step, const uint8_t *
  * separates the two, so a probe can stop hunting once the writer has answered
  * even though it had nothing yet. */
 static int
-vs_forward_get_schema(vs_tr_t *tr, ssg_member_id_t member_id, int *out_is_writer, uint64_t *out_step,
+vs_forward_get_schema(vs_tr_t *tr, vs_member_id_t member_id, int *out_is_writer, uint64_t *out_step,
                        uint8_t **out_blob, uint64_t *out_len)
 {
     hg_addr_t           addr;
@@ -1509,7 +1977,7 @@ vs_forward_get_schema(vs_tr_t *tr, ssg_member_id_t member_id, int *out_is_writer
 
     memset(&in, 0, sizeof(in));
 
-    if (SSG_SUCCESS != ssg_get_group_member_addr(tr->group_id, member_id, &addr))
+    if (0 != vs_tr_member_addr(tr, member_id, &addr))
         return -1;
 
     if (HG_SUCCESS == margo_create(tr->mid, addr, tr->get_schema_rpc_id, &handle)) {
@@ -1558,13 +2026,12 @@ int
 vs_tr_reader_get_schema(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *out_physical_step, uint8_t **out_blob,
                          uint64_t *out_len)
 {
-    ssg_member_id_t self_id;
+    vs_member_id_t self_id;
     uint64_t         deadline_ns;
 
-    if (!tr || !out_blob || !out_len || tr->group_id == SSG_GROUP_ID_INVALID)
+    if (!tr || !out_blob || !out_len || !tr->in_group)
         return -1;
-    if (SSG_SUCCESS != ssg_get_self_id(tr->mid, &self_id))
-        return -1;
+    self_id = tr->self_id;
 
     *out_blob    = NULL;
     *out_len     = 0;
@@ -1582,7 +2049,7 @@ vs_tr_reader_get_schema(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *out_physical
             /* Same stable-member-id snapshot every other probe here uses --
              * see vs_tr_snapshot_members(). A member leaving mid-probe must
              * not skip the tail of the list, which can hold the writer. */
-            ssg_member_id_t *members;
+            vs_member_id_t *members;
             int               n_members, i;
 
             if ((n_members = vs_tr_snapshot_members(tr, self_id, &members)) > 0) {
@@ -1613,8 +2080,8 @@ vs_tr_reader_get_schema(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *out_physical
 int
 vs_tr_writer_broadcast_step_ready(vs_tr_t *tr, uint64_t physical_step, uint64_t wall_time_ns)
 {
-    ssg_member_id_t     self_id;
-    ssg_member_id_t    *members;
+    vs_member_id_t     self_id;
+    vs_member_id_t    *members;
     int                  n_members, i;
     vs_step_ready_in_t  in;
 
@@ -1646,10 +2113,9 @@ vs_tr_writer_broadcast_step_ready(vs_tr_t *tr, uint64_t physical_step, uint64_t 
 
     /* "A writer starts with no readers and proceeds": no group yet is not
      * an error, just nothing to push to. */
-    if (tr->group_id == SSG_GROUP_ID_INVALID)
+    if (!tr->in_group)
         return 0;
-    if (SSG_SUCCESS != ssg_get_self_id(tr->mid, &self_id))
-        return 0;
+    self_id = tr->self_id;
     /* Stable member IDs, not ranks -- a reader closing mid-broadcast would
      * otherwise cost *other* readers their step_ready notification, leaving
      * them blocked in H5Fwait_step_ready(). Same defect the data push had;
@@ -1661,11 +2127,11 @@ vs_tr_writer_broadcast_step_ready(vs_tr_t *tr, uint64_t physical_step, uint64_t 
     in.wall_time_ns   = wall_time_ns;
 
     for (i = 0; i < n_members; i++) {
-        ssg_member_id_t member_id = members[i];
+        vs_member_id_t member_id = members[i];
         hg_addr_t        addr;
         hg_handle_t       handle;
 
-        if (SSG_SUCCESS != ssg_get_group_member_addr(tr->group_id, member_id, &addr))
+        if (0 != vs_tr_member_addr(tr, member_id, &addr))
             continue;
 
         /* A stalled or gone reader must not stall the writer: a bounded
@@ -1752,14 +2218,13 @@ vs_tr_get_mid(vs_tr_t *tr)
 int
 vs_tr_reader_ack_step(vs_tr_t *tr, uint64_t physical_step)
 {
-    ssg_member_id_t    self_id;
+    vs_member_id_t    self_id;
     vs_reader_ack_in_t in;
     int                 ret = -1;
 
-    if (!tr || tr->group_id == SSG_GROUP_ID_INVALID)
+    if (!tr || !tr->in_group)
         return -1;
-    if (SSG_SUCCESS != ssg_get_self_id(tr->mid, &self_id))
-        return -1;
+    self_id = tr->self_id;
 
     in.member_id     = (uint64_t)self_id;
     in.physical_step = physical_step;
@@ -1771,7 +2236,7 @@ vs_tr_reader_ack_step(vs_tr_t *tr, uint64_t physical_step)
         hg_addr_t  addr;
         hg_handle_t handle;
 
-        if (SSG_SUCCESS == ssg_get_group_member_addr(tr->group_id, tr->writer_member_id, &addr)) {
+        if (0 == vs_tr_member_addr(tr, tr->writer_member_id, &addr)) {
             if (HG_SUCCESS == margo_create(tr->mid, addr, tr->reader_ack_rpc_id, &handle)) {
                 if (HG_SUCCESS == margo_forward_timed(handle, &in, 1000.0)) {
                     vs_reader_ack_out_t out;
@@ -1796,18 +2261,18 @@ vs_tr_reader_ack_step(vs_tr_t *tr, uint64_t physical_step)
          * member leaving while this probe is forwarding would otherwise
          * skip the tail of the list, which can include the writer this is
          * hunting for. */
-        ssg_member_id_t *members;
+        vs_member_id_t *members;
         int               n_members, i;
 
         if ((n_members = vs_tr_snapshot_members(tr, self_id, &members)) <= 0)
             return ret;
 
         for (i = 0; i < n_members && ret != 0; i++) {
-            ssg_member_id_t member_id = members[i];
+            vs_member_id_t member_id = members[i];
             hg_addr_t         addr;
             hg_handle_t        handle;
 
-            if (SSG_SUCCESS != ssg_get_group_member_addr(tr->group_id, member_id, &addr))
+            if (0 != vs_tr_member_addr(tr, member_id, &addr))
                 continue;
 
             if (HG_SUCCESS == margo_create(tr->mid, addr, tr->reader_ack_rpc_id, &handle)) {
@@ -1843,19 +2308,18 @@ vs_tr_writer_min_acked_step(vs_tr_t *tr, uint64_t *min_acked_step)
     if (!tr)
         return 0;
 
-    /* Deliberately NOT in the rank-snapshot class vs_tr_snapshot_members()
-     * exists for: this walks lag_table, which is already keyed by
-     * ssg_member_id_t, and does no blocking work per entry --
-     * ssg_get_group_member_rank() below is only a liveness predicate whose
-     * rank value is discarded. Correct by construction rather than by
-     * snapshotting. (It previously also read ssg_get_group_size() into a
-     * variable it never used, which read like rank logic that was not
+    /* Deliberately NOT in the snapshot class vs_tr_snapshot_members() exists
+     * for: this walks lag_table, which is already keyed by vs_member_id_t, and
+     * does no blocking work per entry -- vs_tr_member_is_present() below is
+     * only a liveness predicate. Correct by construction rather than by
+     * snapshotting. (Under SSG this was ssg_get_group_member_rank() with the
+     * rank value discarded, and it previously also read ssg_get_group_size()
+     * into a variable it never used, which read like rank logic that was not
      * there.) */
 
     pthread_mutex_lock(&tr->lag_lock);
     for (i = 0; i < tr->n_lag; i++) {
-        int      rank;
-        int      still_member = (SSG_SUCCESS == ssg_get_group_member_rank(tr->group_id, tr->lag_table[i].member_id, &rank));
+        int      still_member = vs_tr_member_is_present(tr, tr->lag_table[i].member_id);
 
         if (!still_member)
             continue; /* departed -- not pruned, just skipped (see struct comment) */
@@ -1881,7 +2345,7 @@ vs_tr_writer_min_acked_step(vs_tr_t *tr, uint64_t *min_acked_step)
  * vs_tr_reader_subscribe() so the predicate path inherits the probing
  * rather than duplicating it. */
 static int
-vs_send_subscribe(vs_tr_t *tr, ssg_member_id_t self_id, vs_subscribe_in_t *in, int *out_matched)
+vs_send_subscribe(vs_tr_t *tr, vs_member_id_t self_id, vs_subscribe_in_t *in, int *out_matched)
 {
     int ret = -1;
 
@@ -1892,7 +2356,7 @@ vs_send_subscribe(vs_tr_t *tr, ssg_member_id_t self_id, vs_subscribe_in_t *in, i
         hg_addr_t  addr;
         hg_handle_t handle;
 
-        if (SSG_SUCCESS == ssg_get_group_member_addr(tr->group_id, tr->writer_member_id, &addr)) {
+        if (0 == vs_tr_member_addr(tr, tr->writer_member_id, &addr)) {
             if (HG_SUCCESS == margo_create(tr->mid, addr, tr->subscribe_rpc_id, &handle)) {
                 if (HG_SUCCESS == margo_forward_timed(handle, in, 1000.0)) {
                     vs_subscribe_out_t out;
@@ -1917,18 +2381,18 @@ vs_send_subscribe(vs_tr_t *tr, ssg_member_id_t self_id, vs_subscribe_in_t *in, i
          * member leaving while this probe is forwarding would otherwise
          * skip the tail of the list, which can include the writer this is
          * hunting for. */
-        ssg_member_id_t *members;
+        vs_member_id_t *members;
         int               n_members, i;
 
         if ((n_members = vs_tr_snapshot_members(tr, self_id, &members)) <= 0)
             return ret;
 
         for (i = 0; i < n_members && ret != 0; i++) {
-            ssg_member_id_t member_id = members[i];
+            vs_member_id_t member_id = members[i];
             hg_addr_t         addr;
             hg_handle_t        handle;
 
-            if (SSG_SUCCESS != ssg_get_group_member_addr(tr->group_id, member_id, &addr))
+            if (0 != vs_tr_member_addr(tr, member_id, &addr))
                 continue;
 
             if (HG_SUCCESS == margo_create(tr->mid, addr, tr->subscribe_rpc_id, &handle)) {
@@ -1961,13 +2425,12 @@ vs_tr_reader_subscribe(vs_tr_t *tr, const char *path, uint64_t sel_start, uint64
                         const uint8_t *dcpl_enc, uint64_t dcpl_enc_len, const uint8_t *space_enc,
                         uint64_t space_enc_len)
 {
-    ssg_member_id_t     self_id;
+    vs_member_id_t     self_id;
     vs_subscribe_in_t in;
 
-    if (!tr || !path || tr->group_id == SSG_GROUP_ID_INVALID)
+    if (!tr || !path || !tr->in_group)
         return -1;
-    if (SSG_SUCCESS != ssg_get_self_id(tr->mid, &self_id))
-        return -1;
+    self_id = tr->self_id;
 
     in.member_id = (uint64_t)self_id;
     in.path       = (hg_string_t)path;
@@ -1994,14 +2457,13 @@ int
 vs_tr_reader_subscribe_predicate(vs_tr_t *tr, const char *path, const uint8_t *pred_enc,
                                    uint64_t pred_enc_len)
 {
-    ssg_member_id_t     self_id;
+    vs_member_id_t     self_id;
     vs_subscribe_in_t in;
     int                  matched = 0;
 
-    if (!tr || !path || tr->group_id == SSG_GROUP_ID_INVALID)
+    if (!tr || !path || !tr->in_group)
         return -1;
-    if (SSG_SUCCESS != ssg_get_self_id(tr->mid, &self_id))
-        return -1;
+    self_id = tr->self_id;
 
     in.member_id = (uint64_t)self_id;
     in.path       = (hg_string_t)path;
@@ -2030,14 +2492,13 @@ vs_tr_reader_subscribe_predicate(vs_tr_t *tr, const char *path, const uint8_t *p
 int
 vs_tr_reader_subscribe_type(vs_tr_t *tr, const char *path, const uint8_t *type_enc, uint64_t type_enc_len)
 {
-    ssg_member_id_t     self_id;
+    vs_member_id_t     self_id;
     vs_subscribe_in_t in;
     int                  matched = 0;
 
-    if (!tr || !path || tr->group_id == SSG_GROUP_ID_INVALID)
+    if (!tr || !path || !tr->in_group)
         return -1;
-    if (SSG_SUCCESS != ssg_get_self_id(tr->mid, &self_id))
-        return -1;
+    self_id = tr->self_id;
 
     in.member_id = (uint64_t)self_id;
     in.path       = (hg_string_t)path;
@@ -2069,7 +2530,7 @@ vs_tr_reader_subscribe_type(vs_tr_t *tr, const char *path, const uint8_t *type_e
  * it. */
 static int
 vs_tr_inflight_add(vs_tr_t *tr, hg_handle_t handle, margo_request req, void *owned,
-                    ssg_member_id_t member_id)
+                    vs_member_id_t member_id)
 {
     if (tr->n_inflight == tr->cap_inflight) {
         size_t            new_cap = tr->cap_inflight ? tr->cap_inflight * 2 : 8;
@@ -2091,7 +2552,7 @@ vs_tr_inflight_add(vs_tr_t *tr, hg_handle_t handle, margo_request req, void *own
 
 /* Has a push to this member already failed during the current write? */
 static int
-vs_tr_member_failed(vs_tr_t *tr, ssg_member_id_t member_id)
+vs_tr_member_failed(vs_tr_t *tr, vs_member_id_t member_id)
 {
     size_t i;
 
@@ -2102,16 +2563,16 @@ vs_tr_member_failed(vs_tr_t *tr, ssg_member_id_t member_id)
 } /* end vs_tr_member_failed() */
 
 static void
-vs_tr_member_failed_add(vs_tr_t *tr, ssg_member_id_t member_id)
+vs_tr_member_failed_add(vs_tr_t *tr, vs_member_id_t member_id)
 {
     if (vs_tr_member_failed(tr, member_id))
         return;
 
     if (tr->n_failed == tr->cap_failed) {
         size_t           new_cap = tr->cap_failed ? tr->cap_failed * 2 : 4;
-        ssg_member_id_t *grown;
+        vs_member_id_t *grown;
 
-        if (NULL == (grown = (ssg_member_id_t *)realloc(tr->failed, new_cap * sizeof(*grown))))
+        if (NULL == (grown = (vs_member_id_t *)realloc(tr->failed, new_cap * sizeof(*grown))))
             return; /* best-effort: without the note this member just gets
                      * the rest of the write's pushes attempted anyway. */
         tr->failed     = grown;
@@ -2182,7 +2643,7 @@ vs_tr_drain_pushes(vs_tr_t *tr)
  * covers a synchronous failure to issue plus anything vs_tr_drain_one()
  * has since reported for this member -- see tr->failed. */
 static int
-vs_tr_push_one_item(vs_tr_t *tr, hg_addr_t addr, ssg_member_id_t member_id, uint64_t physical_step,
+vs_tr_push_one_item(vs_tr_t *tr, hg_addr_t addr, vs_member_id_t member_id, uint64_t physical_step,
                      const char *path, uint64_t elem_start, uint64_t elem_count, const void *payload_buf,
                      uint64_t payload_len, const uint8_t *dcpl_enc, uint64_t dcpl_enc_len,
                      const uint8_t *type_enc, uint64_t type_enc_len, uint32_t filter_mask,
@@ -2278,15 +2739,14 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
                         const uint8_t *native_dcpl_enc, uint64_t native_dcpl_enc_len, void *native_ctx,
                         const uint8_t *space_enc, uint64_t space_enc_len)
 {
-    ssg_member_id_t   self_id;
+    vs_member_id_t   self_id;
     uint64_t           write_end;
 
     if (!tr || !path || elem_size == 0)
         return -1;
-    if (tr->group_id == SSG_GROUP_ID_INVALID)
+    if (!tr->in_group)
         return 0; /* no group -- no subscribers possible, same "proceed" tolerance as broadcast */
-    if (SSG_SUCCESS != ssg_get_self_id(tr->mid, &self_id))
-        return 0;
+    self_id = tr->self_id;
 
     write_end = write_start + write_count;
 
@@ -2306,7 +2766,7 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
      * with one lock acquisition instead of up to group_size. */
     {
         typedef struct {
-            ssg_member_id_t member_id;
+            vs_member_id_t member_id;
             uint64_t        sel_start;
             uint64_t        sel_count;
             uint8_t        *dcpl_enc;
@@ -2400,7 +2860,7 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
          * O(group_size * n_snapshot) match loop, since subscribers to one
          * path are typically far fewer than group members. */
         for (si = 0; si < n_snapshot; si++) {
-        ssg_member_id_t member_id;
+        vs_member_id_t member_id;
         hg_addr_t         addr;
         hg_handle_t        handle;
         uint64_t           sub_start = 0, sub_end = 0, overlap_start, overlap_end, overlap_count;
@@ -2508,7 +2968,7 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
             continue;
         }
 
-        if (SSG_SUCCESS != ssg_get_group_member_addr(tr->group_id, member_id, &addr)) {
+        if (0 != vs_tr_member_addr(tr, member_id, &addr)) {
             free(sub_dcpl_enc);
             free(sub_pred_enc);
             free(sub_want_type_enc);
