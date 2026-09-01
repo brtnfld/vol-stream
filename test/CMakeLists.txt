@@ -148,8 +148,25 @@ if(VOL_STREAM_HAVE_MERCURY)
   add_executable(b_detector_narrowing b_detector_narrowing.c)
   target_link_libraries(b_detector_narrowing PRIVATE vol_stream)
   add_test(NAME detector_narrowing_benchmark COMMAND b_detector_narrowing)
+  # ctest's ENVIRONMENT property REPLACES the inherited variable, it does not
+  # extend it -- so pinning HDF5_PLUGIN_PATH to the connector directory made it
+  # impossible to run this benchmark against bslz4/zstd/zfp at all, however the
+  # caller's environment was set up. The codec-comparison benchmark measured no
+  # codecs: five of its twelve subscribers exit when their filter is missing, and
+  # it silently reported "filter NNNNN unavailable -- not measured" while the
+  # remaining seven produced a writer cost roughly 2.5x too low on sparse scenes
+  # (1.40x measured vs 2.27x with all twelve).
+  #
+  # The connector's own directory must stay first: the tests load vol-stream as
+  # a plugin from there. Colon-separated, and deliberately NOT a CMake list --
+  # a ';' would split the ENVIRONMENT property into two entries.
+  if(VOL_STREAM_EXTRA_PLUGIN_PATH)
+    set(_vs_plugin_path "$<TARGET_FILE_DIR:vol_stream>:${VOL_STREAM_EXTRA_PLUGIN_PATH}")
+  else()
+    set(_vs_plugin_path "$<TARGET_FILE_DIR:vol_stream>")
+  endif()
   set_tests_properties(detector_narrowing_benchmark PROPERTIES
-    ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
+    ENVIRONMENT "HDF5_PLUGIN_PATH=${_vs_plugin_path}"
     TIMEOUT 900
   )
 

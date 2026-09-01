@@ -50,6 +50,15 @@ endif()
 
 option(VOL_STREAM_ENABLE_LOGGING "Log every VOL callback to stdout" OFF)
 option(VOL_STREAM_BUILD_TESTS "Build the test programs" ON)
+
+# Third-party HDF5 filter plugins (bslz4 32008, zstd 32015, zfp 32013) live
+# outside this project and outside HDF5's built-ins. b_detector_narrowing needs
+# them: without them five of its twelve subscribers exit and it measures a
+# writer cost far below the truth. Colon-separated, appended after the
+# connector's own directory. Empty by default -- the benchmark still runs and
+# still says which filters it could not find.
+set(VOL_STREAM_EXTRA_PLUGIN_PATH "" CACHE STRING
+  "Colon-separated HDF5 filter plugin directories appended to HDF5_PLUGIN_PATH for tests")
 option(VOL_STREAM_BUILD_EXAMPLES "Build the example programs" ON)
 
 # ---------------------------------------------------------------------------
