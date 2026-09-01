@@ -140,18 +140,24 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # M4: Mercury transport, Margo progress, deferred I/O.
-  # M5: SSG rendezvous and late joiners.
+  # M5: Flock rendezvous and late joiners (SSG through M10; SSG was
+  # deprecated by its own maintainers and migrated off -- see tr_mercury.c
+  # and CMakeLists.txt's version-floor comment).
   # M7: queue policy and BAKE spill (M6 needs no transport -- it rides the
   # main `build` job's parallel HDF5 instead, see that job's own comment).
   # M8 (first increment): subscription protocol -- Mercury's first RPC
   # carrying actual payload bytes, not just control-plane scalars.
   #
-  # mercury, argobots, mochi-margo, mochi-ssg, mochi-abt-io and mochi-bake are
-  # not Ubuntu packages, so build them from source -- the exact versions and
-  # configure flags verified locally: argobots 1.2, mercury 2.3.1 (+sm +ofi),
-  # mochi-margo 0.17.0, mochi-ssg 0.5.4 (--disable-mpi --disable-pmix -- this
-  # connector never co-launches writer and reader under one MPI job, so
-  # neither is needed), mochi-abt-io 0.9.0, mochi-bake 0.6.4.
+  # mercury, argobots, mochi-margo, mochi-thallium, mochi-flock,
+  # mochi-abt-io and mochi-bake are not Ubuntu packages, so build them from
+  # source -- the exact versions verified locally: argobots 1.2, mercury
+  # 2.3.1 (+sm +ofi), mochi-margo 0.24.2 (CMake as of this release, not
+  # autotools -- see below), mochi-thallium 0.17.1 (flock's C++ dependency;
+  # needs only cereal, apt-installed as libcereal-dev), mochi-flock 0.8.0,
+  # mochi-abt-io 0.9.0, mochi-bake 0.6.4. margo and flock floors are
+  # enforced again at vol-stream's own configure time
+  # (CMakeLists.txt: margo >= 0.24.2, flock >= 0.8.0) because older
+  # releases build and link fine and fail only at run time.
   #
   # PMDK 2.1.1 is a real, heavier dependency (BAKE's build hard-requires
   # libpmemobj) -- Ubuntu does not package a version new enough either, so it
@@ -211,7 +217,7 @@ jobs:
             /etc/apt/sources.list.d/microsoft-prod.list
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build zlib1g-dev \
-            libfabric-dev libjson-c-dev libboost-dev pkg-config autoconf automake libtool \
+            libfabric-dev libjson-c-dev libboost-dev libcereal-dev pkg-config autoconf automake libtool \
             uuid-dev pandoc
 
       # HDF5_ENABLE_ZLIB_SUPPORT=ON is required, not cosmetic: HDF5 defaults
@@ -259,23 +265,46 @@ jobs:
           cmake --build mercury-build --parallel
           cmake --install mercury-build
 
-      - name: Build mochi-margo 0.17.0
+      - name: Build mochi-margo 0.24.2
+        # Autotools (./prepare.sh + ./configure) is gone as of this release --
+        # margo build from CMake now, same as mercury and abt-io below.
         run: |
-          curl -sSL https://github.com/mochi-hpc/mochi-margo/archive/v0.17.0.tar.gz | tar xz
-          cd mochi-margo-0.17.0
-          ./prepare.sh
+          curl -sSL https://github.com/mochi-hpc/mochi-margo/archive/refs/tags/v0.24.2.tar.gz | tar xz
           PKG_CONFIG_PATH=$HOME/mochi-install/lib/pkgconfig:$HOME/mochi-install/lib64/pkgconfig:$PKG_CONFIG_PATH \
-            ./configure --prefix=$HOME/mochi-install
-          make -j"$(nproc)" && make install
+            cmake -S mochi-margo-0.24.2 -B margo-build -G Ninja \
+              -DCMAKE_INSTALL_PREFIX=$HOME/mochi-install \
+              -DCMAKE_PREFIX_PATH=$HOME/mochi-install \
+              -DCMAKE_BUILD_TYPE=Release
+          cmake --build margo-build --parallel
+          cmake --install margo-build
 
-      - name: Build mochi-ssg 0.5.4
+      - name: Build mochi-thallium 0.17.1
+        # Flock's C++ dependency (find_package(thallium REQUIRED)). Needs
+        # only cereal (apt, above) and margo (just built) -- no MPI/Python/
+        # tests/examples, all off by default.
         run: |
-          curl -sSL https://github.com/mochi-hpc/mochi-ssg/archive/refs/tags/v0.5.4.tar.gz | tar xz
-          cd mochi-ssg-0.5.4
-          ./prepare.sh
+          curl -sSL https://github.com/mochi-hpc/mochi-thallium/archive/refs/tags/v0.17.1.tar.gz | tar xz
           PKG_CONFIG_PATH=$HOME/mochi-install/lib/pkgconfig:$HOME/mochi-install/lib64/pkgconfig:$PKG_CONFIG_PATH \
-            ./configure --prefix=$HOME/mochi-install --disable-mpi --disable-pmix
-          make -j"$(nproc)" && make install
+            cmake -S mochi-thallium-0.17.1 -B thallium-build -G Ninja \
+              -DCMAKE_INSTALL_PREFIX=$HOME/mochi-install \
+              -DCMAKE_PREFIX_PATH=$HOME/mochi-install \
+              -DCMAKE_BUILD_TYPE=Release
+          cmake --build thallium-build --parallel
+          cmake --install thallium-build
+
+      - name: Build mochi-flock 0.8.0
+        # SSG's replacement (src/tr_mercury.c, migrated behind the vs_tr_*
+        # seam). Needs margo, json-c (apt, above) and thallium, all already
+        # in place; bedrock/MPI/Python/tests/examples stay off by default.
+        run: |
+          curl -sSL https://github.com/mochi-hpc/mochi-flock/archive/refs/tags/v0.8.0.tar.gz | tar xz
+          PKG_CONFIG_PATH=$HOME/mochi-install/lib/pkgconfig:$HOME/mochi-install/lib64/pkgconfig:$PKG_CONFIG_PATH \
+            cmake -S mochi-flock-0.8.0 -B flock-build -G Ninja \
+              -DCMAKE_INSTALL_PREFIX=$HOME/mochi-install \
+              -DCMAKE_PREFIX_PATH=$HOME/mochi-install \
+              -DCMAKE_BUILD_TYPE=Release
+          cmake --build flock-build --parallel
+          cmake --install flock-build
 
       - name: Build PMDK 2.1.1
         run: |
@@ -317,7 +346,7 @@ jobs:
             -DVOL_STREAM_H5DIFF=$PWD/hdf5-install/bin/h5diff
           cmake --build build --parallel
 
-      - name: Test (Mercury round trip, SSG rendezvous, M7 queue policy, and M8 subscription, each as two processes)
+      - name: Test (Mercury round trip, Flock rendezvous, M7 queue policy, and M8 subscription, each as two processes)
         run: |
           LD_LIBRARY_PATH=$HOME/mochi-install/lib:$HOME/mochi-install/lib64:$LD_LIBRARY_PATH \
             ctest --test-dir build --output-on-failure
