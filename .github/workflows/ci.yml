@@ -62,6 +62,13 @@ jobs:
       # workarounds for 4.2.0's hydra.
       - name: Install build dependencies
         run: |
+          # The runner image preinstalls an azure-cli apt source that is
+          # unrelated to anything this build needs and has started 403ing
+          # ("no longer signed"), which fails the whole `apt-get update`
+          # and takes down every package below it with it. Drop it rather
+          # than chase Microsoft's repo signing.
+          sudo rm -f /etc/apt/sources.list.d/azure-cli.list \
+            /etc/apt/sources.list.d/microsoft-prod.list
           sudo apt-get update
           if [ "${{ matrix.mpi }}" = "mpich" ]; then
             curl -sSL https://www.mpich.org/static/downloads/5.0.0/mpich-5.0.0.tar.gz | tar xz
@@ -197,6 +204,11 @@ jobs:
 
       - name: Install build dependencies
         run: |
+          # See the mpich/openmpi leg's comment: the preinstalled azure-cli
+          # apt source has started 403ing and takes `apt-get update` down
+          # with it, so drop it before updating.
+          sudo rm -f /etc/apt/sources.list.d/azure-cli.list \
+            /etc/apt/sources.list.d/microsoft-prod.list
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build zlib1g-dev \
             libfabric-dev libjson-c-dev libboost-dev pkg-config autoconf automake libtool \
@@ -373,6 +385,11 @@ jobs:
 
       - name: Install build dependencies
         run: |
+          # See the mpich/openmpi leg's comment: the preinstalled azure-cli
+          # apt source has started 403ing and takes `apt-get update` down
+          # with it, so drop it before updating.
+          sudo rm -f /etc/apt/sources.list.d/azure-cli.list \
+            /etc/apt/sources.list.d/microsoft-prod.list
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build zlib1g-dev
 
