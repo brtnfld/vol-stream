@@ -368,6 +368,55 @@ run_writer(void)
         printf("writer: FAIL end_step\n");
         return 1;
     }
+    /* The writer-side half of the core thesis. run_reader() checks that
+     * /unsub never *arrived*; that alone is satisfied just as well by a
+     * transport which sends everything and lets the reader discard it -- a
+     * Diaspora-backed build measured 16020 bytes on the wire to deliver 20,
+     * and passed the reader-side check cleanly. So assert here on what was
+     * actually sent: /sub's payload should cross, /unsub's should not.
+     *
+     * Bound rather than an exact figure: what a subscriber is owed is
+     * /sub plus the attribute, and a transport is free to add framing or
+     * split a run across pushes. The discrimination that matters is the
+     * three orders of magnitude between that and /unsub. */
+    {
+        uint64_t     pushed    = 0;
+        const size_t range_sz  = SUB_RANGE_COUNT * sizeof(int); /* what was subscribed */
+        const size_t sub_sz    = NSUB * sizeof(int);            /* the whole object */
+        const size_t unsub_sz  = NUNSUB * sizeof(double);
+        /* Slack over the subscribed range for the attribute push and any
+         * framing a transport folds into the payload. Small enough that
+         * sending the whole of /sub instead of the subscribed range would
+         * still be caught if it ever grew, and nowhere near /unsub. */
+        const size_t ceiling   = sub_sz + 64;
+
+        if (H5Fget_stream_bytes_pushed(fid, &pushed) < 0) {
+            printf("writer: FAIL get_stream_bytes_pushed\n");
+            return 1;
+        }
+        if (pushed < range_sz) {
+            printf("writer: FAIL only %llu bytes pushed, the subscribed range alone is %zu -- "
+                   "under-sent\n",
+                   (unsigned long long)pushed, range_sz);
+            return 1;
+        }
+        if (pushed > ceiling) {
+            printf("writer: FAIL %llu bytes pushed, more than %zu -- over-sent for a %zu-byte "
+                   "subscription\n",
+                   (unsigned long long)pushed, ceiling, range_sz);
+            return 1;
+        }
+        if (pushed >= unsub_sz) {
+            printf("writer: FAIL %llu bytes pushed, >= /unsub's %zu -- /unsub crossed the wire "
+                   "even though no reader received it\n",
+                   (unsigned long long)pushed, unsub_sz);
+            return 1;
+        }
+        printf("  ok    writer emitted %llu bytes for a %zu-byte subscription; /unsub's %zu "
+               "never left the writer\n",
+               (unsigned long long)pushed, range_sz, unsub_sz);
+    }
+
     touch_sentinel(WRITES_DONE_SENTINEL);
 
     H5Sclose(sub_space);

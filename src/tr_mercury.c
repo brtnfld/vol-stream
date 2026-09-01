@@ -460,6 +460,12 @@ struct vs_tr_t {
      * bounding span a subscription's bounds describe. */
     vs_tr_selection_fn selection_fn;
 
+    /* Writer side: total payload bytes actually forwarded, for
+     * vs_tr_writer_bytes_pushed(). Same threading argument as the inflight
+     * list below -- only the application's own step thread ever pushes -- so
+     * it needs no lock. */
+    uint64_t bytes_pushed;
+
     /* Writer side: data pushes forwarded but not yet completed (see
      * vs_tr_inflight_t and vs_tr_push_one_item()). Touched only by the
      * application's own step thread -- the thread that runs replay, and so
@@ -2209,6 +2215,12 @@ vs_tr_reader_wait_step_ready(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physica
     return ret;
 }
 
+uint64_t
+vs_tr_writer_bytes_pushed(vs_tr_t *tr)
+{
+    return tr ? tr->bytes_pushed : 0;
+} /* end vs_tr_writer_bytes_pushed() */
+
 margo_instance_id
 vs_tr_get_mid(vs_tr_t *tr)
 {
@@ -2661,6 +2673,13 @@ vs_tr_push_one_item(vs_tr_t *tr, hg_addr_t addr, vs_member_id_t member_id, uint6
     in.filter_mask     = filter_mask;
     in.payload.buf     = (void *)(uintptr_t)payload_buf;
     in.payload.size    = payload_len;
+
+    /* Counted here rather than in vs_tr_writer_push_data(): this is the one
+     * place a payload actually goes to a recipient, so per-subscriber
+     * fan-out, predicate runs and chunk splits are all accounted naturally,
+     * and a write nobody subscribed to contributes nothing. */
+    if (tr)
+        tr->bytes_pushed += payload_len;
     in.dcpl_enc.buf    = (void *)(uintptr_t)dcpl_enc;
     in.dcpl_enc.size   = dcpl_enc_len;
     in.type_enc.buf    = (void *)(uintptr_t)type_enc;

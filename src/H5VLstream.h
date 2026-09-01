@@ -259,6 +259,7 @@ H5VL_STREAM_API extern hid_t H5VL_STREAM_g;
 #define H5VL_STREAM_OP_SET_RETENTION       "vol-stream:set_retention"
 #define H5VL_STREAM_OP_SUBSCRIBE_TYPE      "vol-stream:subscribe_type"
 #define H5VL_STREAM_OP_GET_STREAM_SCHEMA   "vol-stream:get_stream_schema"
+#define H5VL_STREAM_OP_GET_BYTES_PUSHED    "vol-stream:get_bytes_pushed"
 
 /** Status of the current step */
 typedef enum H5F_step_status_t {
@@ -774,6 +775,29 @@ H5VL_STREAM_API herr_t H5Fsubscribe_type(hid_t file_id, const char *path, hid_t 
  *       call it.
  */
 H5VL_STREAM_API herr_t H5Fwait_subscribers(hid_t file_id, uint64_t n_expected, uint64_t timeout_ms);
+
+/**
+ * \brief Total payload bytes this writer has actually put on the wire.
+ *
+ * Summed per recipient after every narrowing the transport applies, so a
+ * dataset no subscriber asked for contributes nothing, and a subscriber taking
+ * half of a write contributes half. Payload only -- RPC framing, metadata and
+ * the encoded type/space blobs are excluded.
+ *
+ * This is the writer-side half of a claim the suite could previously only make
+ * from the reader. "The unsubscribed dataset never crossed the wire" was
+ * asserted by checking that no reader received it -- which a transport that
+ * sends everything and lets readers discard it satisfies exactly as well as
+ * one that sends nothing. Assert on this when what you mean is that the bytes
+ * were never sent.
+ *
+ * Writer-only, and needs the transport (VOL_STREAM_NA set).
+ *
+ * \param file_id      Stream file, opened for writing
+ * \param bytes_pushed Out: payload bytes forwarded since the file was opened
+ * \return herr_t
+ */
+H5VL_STREAM_API herr_t H5Fget_stream_bytes_pushed(hid_t file_id, uint64_t *bytes_pushed);
 
 /**
  * \brief Writer only. Bound how much committed step history the file retains.

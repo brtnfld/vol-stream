@@ -965,6 +965,7 @@ static int H5VL_stream_op_wait_subscribers    = -1;
 static int H5VL_stream_op_set_retention       = -1;
 static int H5VL_stream_op_subscribe_type      = -1;
 static int H5VL_stream_op_get_stream_schema  = -1;
+static int H5VL_stream_op_get_bytes_pushed   = -1;
 
 /* Argument structs for the step operations. */
 typedef struct H5VL_stream_args_begin_step_t {
@@ -1026,6 +1027,10 @@ typedef struct H5VL_stream_args_wait_subscribers_t {
     uint64_t n_expected;
     uint64_t timeout_ms;
 } H5VL_stream_args_wait_subscribers_t;
+
+typedef struct H5VL_stream_args_get_bytes_pushed_t {
+    uint64_t *bytes_pushed; /* out */
+} H5VL_stream_args_get_bytes_pushed_t;
 
 /* Step retention: writer-side bound on retained committed steps. */
 typedef struct H5VL_stream_args_set_retention_t {
@@ -8657,6 +8662,8 @@ H5VL_stream_init(hid_t vipl_id)
         return -1;
     if (H5VL__stream_register_op(H5VL_STREAM_OP_WAIT_SUBSCRIBERS, &H5VL_stream_op_wait_subscribers) < 0)
         return -1;
+    if (H5VL__stream_register_op(H5VL_STREAM_OP_GET_BYTES_PUSHED, &H5VL_stream_op_get_bytes_pushed) < 0)
+        return -1;
     if (H5VL__stream_register_op(H5VL_STREAM_OP_SET_RETENTION, &H5VL_stream_op_set_retention) < 0)
         return -1;
     if (H5VL__stream_register_op(H5VL_STREAM_OP_SUBSCRIBE_TYPE, &H5VL_stream_op_subscribe_type) < 0)
@@ -11351,6 +11358,30 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
                              "this connector was built without the Mercury transport", -1);
 #endif
     }
+    else if (args->op_type == H5VL_stream_op_get_bytes_pushed) {
+#ifdef VOL_STREAM_HAVE_MERCURY
+        H5VL_stream_args_get_bytes_pushed_t *bargs =
+            (H5VL_stream_args_get_bytes_pushed_t *)args->args;
+
+        if (!bargs || !bargs->bytes_pushed || !o->file_state || o->file_state->is_reader)
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g,
+                                 "H5Fget_stream_bytes_pushed() is a writer-only call", -1);
+        if (!o->file_state->transport)
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                                 "H5Fget_stream_bytes_pushed() needs the transport -- set "
+                                 "VOL_STREAM_NA",
+                                 -1);
+
+        *bargs->bytes_pushed = vs_tr_writer_bytes_pushed(o->file_state->transport);
+        return 0;
+#else
+        (void)args;
+        H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                             "H5Fget_stream_bytes_pushed() needs the Mercury transport, which this "
+                             "build does not have",
+                             -1);
+#endif
+    }
     else if (args->op_type == H5VL_stream_op_wait_subscribers) {
 #ifdef VOL_STREAM_HAVE_MERCURY
         H5VL_stream_args_wait_subscribers_t *sargs =
@@ -12442,6 +12473,10 @@ H5VL_stream_introspect_opt_query(void *obj, H5VL_subclass_t cls, int opt_type, u
         *flags = H5VL_OPT_QUERY_SUPPORTED | H5VL_OPT_QUERY_QUERY_METADATA;
         return 0;
     }
+    else if (cls == H5VL_SUBCLS_FILE && opt_type == H5VL_stream_op_get_bytes_pushed) {
+        *flags = H5VL_OPT_QUERY_SUPPORTED | H5VL_OPT_QUERY_QUERY_METADATA;
+        return 0;
+    }
     else if (cls == H5VL_SUBCLS_FILE && opt_type == H5VL_stream_op_set_retention) {
         *flags = H5VL_OPT_QUERY_SUPPORTED | H5VL_OPT_QUERY_MODIFY_METADATA;
         return 0;
@@ -13141,6 +13176,18 @@ H5Fwait_subscribers(hid_t file_id, uint64_t n_expected, uint64_t timeout_ms)
 
     return H5VL__stream_file_op(file_id, H5VL_stream_op_wait_subscribers, &op_args);
 } /* end H5Fwait_subscribers() */
+
+herr_t
+H5Fget_stream_bytes_pushed(hid_t file_id, uint64_t *bytes_pushed)
+{
+    H5VL_stream_args_get_bytes_pushed_t op_args;
+
+    if (!bytes_pushed)
+        return -1;
+    op_args.bytes_pushed = bytes_pushed;
+
+    return H5VL__stream_file_op(file_id, H5VL_stream_op_get_bytes_pushed, &op_args);
+} /* end H5Fget_stream_bytes_pushed() */
 
 herr_t
 H5Fset_stream_retention_policy(hid_t file_id, size_t max_steps, uint64_t max_bytes)

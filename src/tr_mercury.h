@@ -466,6 +466,23 @@ int vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path
                             const uint8_t *native_dcpl_enc, uint64_t native_dcpl_enc_len, void *native_ctx,
                             const uint8_t *space_enc, uint64_t space_enc_len);
 
+/* Writer side: total payload bytes this transport has actually put on the
+ * wire since vs_tr_start() -- summed per recipient after narrowing, so a
+ * write of N bytes that two subscribers each take half of counts N, and one
+ * no subscriber wants counts 0.
+ *
+ * Exists because the test suite could not otherwise see over-sending. Every
+ * subscription test asserted only on what the *reader* received, which a
+ * backend that ships everything and lets the reader discard it passes just as
+ * cleanly as one that sends nothing -- measured, 16020 bytes to deliver 20.
+ * "Never crossed the wire" is a claim about the writer, and now it can be
+ * checked on the writer.
+ *
+ * Payload only: RPC framing, metadata and the encoded type/space blobs are
+ * not counted, since the point is to catch bulk data being sent needlessly,
+ * not to audit protocol overhead. */
+uint64_t vs_tr_writer_bytes_pushed(vs_tr_t *tr);
+
 /* Reader side: block up to timeout_ms for a pushed data item (one may
  * already be queued), filling *physical_step, *out_path (newly malloc'd,
  * caller frees), *out_buf, *out_size (newly malloc'd, caller frees), and
