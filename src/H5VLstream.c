@@ -1753,6 +1753,17 @@ H5VL__stream_transport_start_reader(H5VL_stream_file_state_t *fs, const char *na
         return;
     if (NULL == (fs->transport = vs_tr_start(na_str)))
         return;
+
+    /* Also registered on the reader, not just the writer. The selection
+     * callback is a pure decode -- given a subscriber's encoded space, the
+     * write's encoded space and a range, it returns the runs where they
+     * intersect -- so it is equally usable from whichever side happens to be
+     * doing the narrowing. tr_mercury.c narrows in the writer and never calls
+     * it here; a transport whose narrowing can only happen at the consumer
+     * (a broker-backed one, where the producer cannot know what any consumer
+     * wants) needs it on this side or it is stuck routing bounding boxes. */
+    vs_tr_set_selection_cb(fs->transport, H5VL__stream_selection_runs);
+
     if (NULL == (group_file = H5VL__stream_ssg_group_path(name)))
         return;
 

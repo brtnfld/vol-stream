@@ -274,6 +274,80 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# Which transport implementation backs the vs_tr_*() surface (EVALUATION).
+#
+# Both src/tr_mercury.c and src/tr_diaspora.cpp define the same symbols, so
+# exactly one is linked -- hence a configure-time choice, not a runtime one.
+# Making it runtime-selectable would mean putting vs_tr_*() behind a vtable,
+# which is a refactor worth doing only once the second backend has earned its
+# place.
+#
+#   mercury  -- src/tr_mercury.c. Mercury/Margo/Flock directly. The default,
+#               and the only backend that implements the whole surface.
+#   diaspora -- src/tr_diaspora.cpp, on the Diaspora Stream API, which
+#               reaches Mofka and (through the same API) Kafka/Redpanda/MSK
+#               plus a built-in "files" driver for testing. Eight of the 24
+#               vs_tr_*() entry points have no counterpart in a
+#               consumer-oblivious broker model -- notably the five
+#               writer-side narrowing callbacks, vs_tr_writer_min_acked_step()
+#               (which the whole queue policy is driven from) and
+#               vs_tr_reader_get_current_step() (late-joiner seeding). They
+#               return failure rather than a plausible-looking wrong answer.
+#               See src/tr_diaspora.cpp's header comment.
+#
+# Deliberately NOT dropping the Mercury dependencies from a diaspora build,
+# even though tr_diaspora.cpp does not use them: tr_mercury.h includes
+# <margo.h> for the one type vs_tr_get_mid() returns, and keeping the
+# dependency environment identical between the two backends means an A/B
+# comparison isolates the transport implementation rather than the whole dep
+# closure. A production diaspora build would guard that include and drop
+# them.
+#
+# VOL_STREAM_HAVE_MERCURY stays the compile define in both cases. It gates 32
+# call sites in H5VLstream.c and has always meant "a transport is present"
+# rather than "Mercury specifically"; renaming it would mean editing
+# H5VLstream.c, and whether H5VLstream.c needs editing is precisely the claim
+# this backend exists to test.
+# ---------------------------------------------------------------------------
+set(VOL_STREAM_TRANSPORT "mercury" CACHE STRING
+  "Transport backend behind vs_tr_*(): mercury (default) or diaspora")
+set_property(CACHE VOL_STREAM_TRANSPORT PROPERTY STRINGS mercury diaspora)
+
+if(NOT VOL_STREAM_TRANSPORT MATCHES "^(mercury|diaspora)$")
+  message(FATAL_ERROR
+    "VOL_STREAM_TRANSPORT must be 'mercury' or 'diaspora', got '${VOL_STREAM_TRANSPORT}'")
+endif()
+
+set(VOL_STREAM_HAVE_DIASPORA FALSE)
+if(VOL_STREAM_TRANSPORT STREQUAL "diaspora")
+  if(NOT VOL_STREAM_HAVE_MERCURY)
+    message(FATAL_ERROR
+      "VOL_STREAM_TRANSPORT=diaspora still needs the Mercury/Margo/Flock probe to "
+      "succeed, for <margo.h> and for dependency parity with the mercury backend "
+      "(see the comment above this check)")
+  endif()
+
+  # The Diaspora Stream API is C++17; the connector is otherwise pure C.
+  enable_language(CXX)
+  set(CMAKE_CXX_STANDARD 17)
+  set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+  # Unversioned on purpose: the installed diaspora-stream-api.pc has an empty
+  # Version field, so any version constraint here fails to match at all.
+  pkg_check_modules(VOL_STREAM_DIASPORA QUIET diaspora-stream-api)
+  if(NOT VOL_STREAM_DIASPORA_FOUND)
+    message(FATAL_ERROR
+      "VOL_STREAM_TRANSPORT=diaspora but diaspora-stream-api was not found by "
+      "pkg-config. Add its prefix's lib/pkgconfig to PKG_CONFIG_PATH.")
+  endif()
+  set(VOL_STREAM_HAVE_DIASPORA TRUE)
+  message(STATUS "Transport backend:  diaspora (src/tr_diaspora.cpp, "
+                  "diaspora-stream-api at ${VOL_STREAM_DIASPORA_PREFIX})")
+else()
+  message(STATUS "Transport backend:  mercury (src/tr_mercury.c)")
+endif()
+
+# ---------------------------------------------------------------------------
 # M7's Spill queue policy: BAKE (a Mochi provider for node-local
 # byte-addressable regions) embedded on the same margo instance
 # tr_mercury.c already drives -- src/tr_bake.c. Separate from the Mercury
@@ -288,7 +362,14 @@ set(VOL_STREAM_ENABLE_BAKE "AUTO" CACHE STRING
 set_property(CACHE VOL_STREAM_ENABLE_BAKE PROPERTY STRINGS AUTO ON OFF)
 
 set(VOL_STREAM_HAVE_BAKE FALSE)
-if(VOL_STREAM_HAVE_MERCURY AND NOT VOL_STREAM_ENABLE_BAKE STREQUAL "OFF")
+# BAKE is excluded on the diaspora backend regardless of what is installed:
+# tr_bake.c embeds a BAKE provider on the transport's margo instance, and
+# tr_diaspora.cpp has none to give (vs_tr_get_mid() returns
+# MARGO_INSTANCE_NULL). Under Mofka, persistence is the partition manager's
+# job (Warabi + abt-io), so the right end state on that path is for
+# tr_bake.c not to be built at all rather than ported.
+if(VOL_STREAM_HAVE_MERCURY AND NOT VOL_STREAM_HAVE_DIASPORA
+   AND NOT VOL_STREAM_ENABLE_BAKE STREQUAL "OFF")
   if(PkgConfig_FOUND)
     pkg_check_modules(VOL_STREAM_BAKE_CLIENT QUIET bake-client)
     pkg_check_modules(VOL_STREAM_BAKE_SERVER QUIET bake-server)
@@ -346,7 +427,13 @@ add_custom_target(vol_stream_fbs_gen DEPENDS ${VOL_STREAM_FBS_GEN_HDR})
 
 set(VOL_STREAM_SOURCES src/H5VLstream.c)
 if(VOL_STREAM_HAVE_MERCURY)
-  list(APPEND VOL_STREAM_SOURCES src/tr_mercury.c)
+  # Exactly one of these defines the vs_tr_*() symbols -- see
+  # VOL_STREAM_TRANSPORT above.
+  if(VOL_STREAM_HAVE_DIASPORA)
+    list(APPEND VOL_STREAM_SOURCES src/tr_diaspora.cpp)
+  else()
+    list(APPEND VOL_STREAM_SOURCES src/tr_mercury.c)
+  endif()
 endif()
 if(VOL_STREAM_HAVE_BAKE)
   list(APPEND VOL_STREAM_SOURCES src/tr_bake.c)
@@ -369,7 +456,8 @@ if(VOL_STREAM_HAVE_MERCURY OR VOL_STREAM_HAVE_BAKE)
       ${VOL_STREAM_FLOCK_CLIENT_LIBRARY_DIRS} ${VOL_STREAM_FLOCK_CLIENT_STATIC_LIBRARY_DIRS}
       ${VOL_STREAM_BAKE_CLIENT_LIBRARY_DIRS} ${VOL_STREAM_BAKE_CLIENT_STATIC_LIBRARY_DIRS}
       ${VOL_STREAM_BAKE_SERVER_LIBRARY_DIRS} ${VOL_STREAM_BAKE_SERVER_STATIC_LIBRARY_DIRS}
-      ${VOL_STREAM_ABTIO_LIBRARY_DIRS}       ${VOL_STREAM_ABTIO_STATIC_LIBRARY_DIRS})
+      ${VOL_STREAM_ABTIO_LIBRARY_DIRS}       ${VOL_STREAM_ABTIO_STATIC_LIBRARY_DIRS}
+      ${VOL_STREAM_DIASPORA_LIBRARY_DIRS}    ${VOL_STREAM_DIASPORA_STATIC_LIBRARY_DIRS})
   if(VOL_STREAM_DEP_LIBDIRS)
     list(REMOVE_DUPLICATES VOL_STREAM_DEP_LIBDIRS)
     list(APPEND CMAKE_BUILD_RPATH ${VOL_STREAM_DEP_LIBDIRS})
@@ -412,6 +500,12 @@ if(VOL_STREAM_HAVE_MERCURY)
   # above where these are computed.
   target_compile_options(vol_stream PUBLIC ${VOL_STREAM_TRANSPORT_STATIC_CFLAGS})
   target_link_libraries(vol_stream PUBLIC ${VOL_STREAM_TRANSPORT_STATIC_LIBS} Threads::Threads)
+endif()
+
+if(VOL_STREAM_HAVE_DIASPORA)
+  target_compile_definitions(vol_stream PRIVATE VOL_STREAM_HAVE_DIASPORA)
+  target_include_directories(vol_stream PRIVATE ${VOL_STREAM_DIASPORA_INCLUDE_DIRS})
+  target_link_libraries(vol_stream PUBLIC ${VOL_STREAM_DIASPORA_LDFLAGS})
 endif()
 
 if(VOL_STREAM_HAVE_BAKE)
@@ -543,6 +637,7 @@ message(STATUS "  HDF5:            ${HDF5_VERSION}")
 message(STATUS "  flatcc:          ${VOL_STREAM_FLATCC_EXE}")
 message(STATUS "  mercury:         ${VOL_STREAM_HAVE_MERCURY}")
 message(STATUS "  bake:            ${VOL_STREAM_HAVE_BAKE}")
+message(STATUS "  transport:       ${VOL_STREAM_TRANSPORT}")
 message(STATUS "  vfd swmr:        ${VOL_STREAM_HAVE_VFD_SWMR} (examples/vfd_swmr only)")
 message(STATUS "  logging:         ${VOL_STREAM_ENABLE_LOGGING}")
 message(STATUS "  tests:           ${VOL_STREAM_BUILD_TESTS}")
