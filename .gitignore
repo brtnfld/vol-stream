@@ -1,7 +1,7 @@
 # build trees
 bld/
 bld*/
-build/
+build*/
 _build/
 
 # never commit signing keys
