@@ -1,0 +1,37 @@
+examples/detector_pipeline/detector_common.h
+  s_c6407296b4879b::t_fcbbb354e9eb23 1-83
+docs/blog-vol-stream-asapo.md
+  s_c6407296b4879b::t_28ec92c5d9b3bf 1-62,64,70,76,78,80,106-112,120,125-166
+  s_c6407296b4879b::t_578e9d0bf356bc 63,65-69,71-75,77,79,81-105,113-119,121-124
+examples/detector_pipeline/pipeline_consumer.c
+  s_c6407296b4879b::t_a8729da8d3a581 1-387
+examples/detector_pipeline/CMakeLists.txt
+  s_c6407296b4879b::t_4536efa7e4f053 1-8
+examples/detector_pipeline/README.md
+  s_c6407296b4879b::t_0e49bb9ce0ddd5 1-142
+examples/detector_pipeline/run_pipeline.sh
+  s_c6407296b4879b::t_7b309df6b5da12 1-75
+examples/CMakeLists.txt
+  s_c6407296b4879b::t_ca164d6c87389c 8
+examples/detector_pipeline/detector_writer.c
+  s_c6407296b4879b::t_b3c48d825574c9 1-87,164-316
+  s_c6407296b4879b::t_96a3b96d7394c7 88-163
+.gitignore
+  s_c6407296b4879b::t_5dd2d6e89d1ab1 4
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1633aa95b0d88c1e322f63dd73c57689e312990a",
+  "prompts": {},
+  "sessions": {
+    "s_c6407296b4879b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3acdb98f-0a6f-4a45-a6bd-d5680c3554ca",
+        "model": "claude-opus-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
