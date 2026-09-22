@@ -56,7 +56,7 @@
 #include "H5VLstream.h"
 #include "detector_common.h"
 
-#define N_CONSUMERS 4
+#define N_CONSUMERS 5
 
 /* Bright spots scattered across the frame, rotating with the frame index so
  * successive hits are not identical. Deterministic, so a run is reproducible.

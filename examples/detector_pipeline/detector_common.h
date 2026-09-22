@@ -54,6 +54,29 @@
  * pipeline_consumer.c, which sizes its miss counter against it. */
 #define DETECTOR_BARRIER_TIMEOUT_MS 15000
 
+/*
+ * The first DETECTOR_HIT_FRAMES frames carry signal; every frame at or after
+ * that is blank -- a decaying acquisition, not an alternating one. This is
+ * what lets MODE_MONITOR's two decisions ("signal established" / "signal
+ * lost") both actually fire in a normal run, rather than one of them being
+ * merely described and never exercised. It has a real referent, not just a
+ * demo-friendly shape: RFC appendix A cites serial femtosecond
+ * crystallography, where a crystal's useful diffraction window is short and
+ * facilities veto once it closes rather than keep collecting blank frames
+ * -- this is that pattern, compressed to DETECTOR_NFRAMES frames.
+ */
+#define DETECTOR_HIT_FRAMES 4
+
+/*
+ * MODE_MONITOR's decision thresholds -- see pipeline_consumer.c. Both small
+ * on purpose, so both decisions fire inside the default eight-frame run.
+ */
+#define DETECTOR_MONITOR_GOOD_HITS   2 /* hits observed before declaring
+                                         * signal established              */
+#define DETECTOR_MONITOR_MISS_STREAK 2 /* consecutive misses, after signal
+                                         * was established, before declaring
+                                         * it lost                         */
+
 static int
 detector_wait_for_file(const char *path, int timeout_ms)
 {
@@ -73,11 +96,13 @@ detector_wait_for_file(const char *path, int timeout_ms)
     }
 }
 
-/* Even frames are hits, odd frames are blank. */
+/* Frames [0, DETECTOR_HIT_FRAMES) carry signal; every frame at or after that
+ * is blank. See DETECTOR_HIT_FRAMES above for why this decays rather than
+ * alternates. */
 static int
 detector_frame_is_hit(int f)
 {
-    return (f % 2) == 0;
+    return f < DETECTOR_HIT_FRAMES;
 }
 
 #endif /* DETECTOR_COMMON_H */

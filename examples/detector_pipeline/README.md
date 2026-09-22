@@ -7,8 +7,11 @@ At PETRA III beamline P02.2, a twelve-module LAMBDA detector streams into
 ASAP::O, and the pipeline hanging off it has the shape every photon-facility
 detector pipeline has: something archives at full fidelity, something shows a
 live view, something processes one panel, something decides which frames are
-worth keeping. That part is not in dispute and this example does not claim to
-improve on it.
+worth keeping, and something watches what is happening right now and feeds
+that back into running the experiment -- ASAP::O's own stated purpose
+includes exactly this: "online analysis, monitoring, and feedback" for
+"automated experiments." That part is not in dispute and this example does
+not claim to improve on it.
 
 What this example is about is narrower, and it is the one architectural
 difference A.2 identifies. In the P02.2 integration the detector PC sends
@@ -40,7 +43,7 @@ The important thing is what it does **not** do: it never describes its layout
 to anybody. No schema message, no structure channel, no side agreement. It
 calls `H5Dcreate2()` and `H5Dwrite()`, and that is the entire interface.
 
-**`pipeline_consumer`** is one binary with five modes, four of them the P02.2
+**`pipeline_consumer`** is one binary with six modes, five of them the P02.2
 components and one of them the point:
 
 | mode | role at P02.2 | what it asks for |
@@ -50,6 +53,7 @@ components and one of them the point:
 | `viewer` | the live view | `H5Fsubscribe_type(int16)` + a deflate DCPL |
 | `analysis` | the stitcher's per-panel input | one module's row band |
 | `hitfinder` | the veto / Cheetah role | `H5Fsubscribe_predicate(GT)` |
+| `monitor` | monitoring / feedback for automated experiments | the same predicate, paired with `H5Fwait_step_ready()` |
 
 ## What makes this different from `narrowing_demo`
 
@@ -81,18 +85,19 @@ cmake --build build          # a build dir with VOL_STREAM_HAVE_MERCURY on
 examples/detector_pipeline/run_pipeline.sh build/examples/detector_pipeline
 ```
 
-That starts the writer and all four consumer roles at once and prints what
+That starts the writer and all five consumer roles at once and prints what
 each measured. Or by hand:
 
 ```
 # terminal 1
 VOL_STREAM_NA=ofi+tcp VOL_STREAM_DEBUG_REFILTER=1 ./detector_writer
 
-# terminals 2-5
+# terminals 2-6
 VOL_STREAM_NA=ofi+tcp ./pipeline_consumer archive
 VOL_STREAM_NA=ofi+tcp ./pipeline_consumer viewer
 VOL_STREAM_NA=ofi+tcp ./pipeline_consumer analysis 2 4
 VOL_STREAM_NA=ofi+tcp ./pipeline_consumer hitfinder
+VOL_STREAM_NA=ofi+tcp ./pipeline_consumer monitor
 ```
 
 `detector_writer [nframes] [delay-ms]` -- defaults 8, 500.
@@ -115,6 +120,66 @@ independent cadence **with an explicit dependency**, meaning a consumer can
 resolve a given frame against the correct calibration. This example shows the
 cadence. It does not by itself demonstrate the dependency, which is decision 1
 in the RFC's design-decisions section.
+
+## `monitor`: checking status and driving the next experimental step
+
+This is the role ASAP::O's own introduction names directly: "online analysis,
+monitoring, and feedback" in support of "automated experiments." The other
+four consumers each answer "what does this frame look like." `monitor`
+answers a different question -- "is this acquisition worth continuing" --
+and prints an explicit decision at the point it changes its mind, the way a
+real facility's automation would act on it.
+
+**The scene it watches is not the alternating one.** `detector_frame_is_hit()`
+now gives the first `DETECTOR_HIT_FRAMES` frames signal and every frame after
+that none -- a decaying acquisition, not an alternating one (see
+`detector_common.h`). The referent is real: RFC appendix A cites serial
+femtosecond crystallography, where a crystal's useful diffraction window is
+short and facilities veto once it closes rather than keep collecting past it.
+This changes nothing for `archive`/`viewer`/`analysis`/`hitfinder` -- they
+never depended on the specific temporal pattern, only on some frames being
+hits and some blank -- but it is what lets `monitor`'s two decisions both
+actually fire in the default eight-frame run instead of one of them being
+merely described.
+
+**Why it needs a different loop than the other four.** `archive` and
+`hitfinder` drain a push queue: `H5Fget_subscribed_data()` timing out just
+means "no push arrived," which does not distinguish "this frame had no
+signal" from "the writer has not reached the next frame yet." That
+ambiguity does not matter to a consumer that only cares what it delivers.
+It matters a great deal to one whose job is *checking status*. So `monitor`
+pairs two calls per frame: `H5Fwait_step_ready()` first, which reports that
+the writer's transport announced a newly committed step regardless of
+whether any subscription matched it, and only once that confirms a step
+really happened does it poll `H5Fget_subscribed_data()` to see whether the
+predicate matched. A miss immediately after a confirmed commit is now a
+real "no signal this frame," not silence that could mean anything.
+
+**The decision it drives.** Two thresholds, both in `detector_common.h`:
+`DETECTOR_MONITOR_GOOD_HITS` hits observed declares signal established;
+`DETECTOR_MONITOR_MISS_STREAK` consecutive misses *after* that declares it
+lost. Against the default scene this prints a `DECISION -- signal
+established` line around frame 2 and a `DECISION -- signal lost` line
+around frame 5 -- both genuinely triggered by what the writer sent, not
+scripted separately.
+
+**What this is not.** `monitor` does not call into any real control system
+-- no Tango, no EPICS, no Bluesky. What it prints is what a real deployment
+would *do* with the decision, clearly labeled as such. This example
+demonstrates the status-checking mechanism honestly; the automation hook is
+the integration point it exists for, not something it implements.
+
+**A documented capability this does not exercise.** vol-stream's own header
+names a "monitoring/latest-only reader" pattern -- jumping to the newest
+frame by logical id via `H5Fbegin_logical_step()` rather than draining
+sequentially (see `H5Fset_stream_queue_policy()`'s doc comment), which is
+also what exempts such a reader from queue-policy backpressure entirely.
+That would be the more scalable design for `monitor` at real frame rates:
+sample the latest, skip whatever was missed, never fall behind. It is not
+built here. Verifying exactly how it interacts with the subscription push
+queue needs a machine that can actually run this connector with the Mochi
+stack (mercury, margo, argobots, flock) present, which the one this was
+written on does not have -- left as a documented gap rather than a guess.
 
 ## Honest notes
 
@@ -140,3 +205,16 @@ in the RFC's design-decisions section.
 - **This is not a benchmark.** No timing, no sustained rate, no comparison
   against ASAP::O or anything else. It demonstrates a capability;
   `test/b_detector_narrowing.c` is where the measured numbers live.
+- **`monitor`'s decision thresholds are small on purpose, not because that is
+  the right size for a real deployment.** `DETECTOR_MONITOR_GOOD_HITS` and
+  `DETECTOR_MONITOR_MISS_STREAK` are set to 2 specifically so both decisions
+  fire inside an eight-frame demo run. A real facility would size these
+  against real frame rates and real false-positive costs; nothing here
+  argues for these particular numbers.
+- **Compiled, not run.** Every mode here has been syntax-checked against a
+  real HDF5 build, not built, linked, or executed -- the Mochi stack is not
+  available on the machine this was written on. `monitor`'s paired
+  `H5Fwait_step_ready()`/`H5Fget_subscribed_data()` design follows both
+  calls' documented contracts, but the actual timing between a step commit
+  and its subscription push has not been observed end to end. Treat the
+  ordering as reasoned from the API docs, not as verified.

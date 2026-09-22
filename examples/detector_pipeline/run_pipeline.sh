@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs detector_writer plus all four pipeline_consumer roles against it, then
+# Runs detector_writer plus all five pipeline_consumer roles against it, then
 # prints what each one measured -- plus a standalone "discover" run first,
 # which is the part RFC section A.2 is actually about. See README.md.
 # Usage: run_pipeline.sh [build-dir] [nframes] [delay-ms]
@@ -28,7 +28,7 @@ NMODULES=4
 
 RUNDIR="$(mktemp -d)"
 cd "$RUNDIR" || exit 1
-trap 'kill $WPID $APID $VPID $NPID $HPID 2>/dev/null; wait 2>/dev/null; rm -rf "$RUNDIR"' EXIT
+trap 'kill $WPID $APID $VPID $NPID $HPID $MPID 2>/dev/null; wait 2>/dev/null; rm -rf "$RUNDIR"' EXIT
 
 # Same rationale as narrowing_demo/run_demo.sh: na+sm's zero-copy path needs
 # cross-memory attach, which some kernels disable (kernel.yama.ptrace_scope).
@@ -49,9 +49,11 @@ VPID=$!
 NPID=$!
 "$CONSUMER" hitfinder 0 "$NMODULES" "$NFRAMES" "$STEP_TIMEOUT_MS" > hitfinder.log 2>&1 &
 HPID=$!
+"$CONSUMER" monitor   0 "$NMODULES" "$NFRAMES" "$STEP_TIMEOUT_MS" > monitor.log   2>&1 &
+MPID=$!
 
 wait "$WPID"
-wait "$APID" "$VPID" "$NPID" "$HPID" 2>/dev/null
+wait "$APID" "$VPID" "$NPID" "$HPID" "$MPID" 2>/dev/null
 
 show() {
     echo
@@ -66,6 +68,7 @@ show "archive   -- full fidelity (the NeXus writer's role)"                archi
 show "viewer    -- int16 + deflate (the live view)"                        viewer.log
 show "analysis  -- one panel by row band (the stitcher's input)"           analysis.log
 show "hitfinder -- predicate GT (the veto role)"                           hitfinder.log
+show "monitor   -- status + decision (the automated-feedback role)"        monitor.log
 
 echo
 echo "Every consumer above printed a schema it DISCOVERED -- no shape constant"

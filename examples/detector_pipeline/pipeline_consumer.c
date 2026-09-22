@@ -5,7 +5,7 @@
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
 /*
- * The consumer half of the RFC section A.2 use case: the four components
+ * The consumer half of the RFC section A.2 use case: the five components
  * hanging off one detector in the deployed P02.2 pipeline, each getting its
  * own view of one acquisition, and every one of them discovering the stream's
  * structure rather than being told it.
@@ -25,6 +25,11 @@
  *               input.
  *   hitfinder   H5Fsubscribe_predicate(GT) -- the veto/Cheetah role, where a
  *               blank frame must cost zero bytes rather than few.
+ *   monitor     Watches signal status frame by frame and prints an explicit
+ *               DECISION when it changes -- the "monitoring and feedback for
+ *               automated experiments" role, named as such in ASAP::O's own
+ *               stated motivation. See its own comment below for why it
+ *               needs a different consumption loop than the four above.
  *
  * What makes this more than a rerun of examples/narrowing_demo is where the
  * shapes come from. narrowing_demo's subscriber builds its dataspace out of
@@ -51,7 +56,7 @@
 #include "H5VLstream.h"
 #include "detector_common.h"
 
-enum mode { MODE_DISCOVER, MODE_ARCHIVE, MODE_VIEWER, MODE_ANALYSIS, MODE_HITFINDER };
+enum mode { MODE_DISCOVER, MODE_ARCHIVE, MODE_VIEWER, MODE_ANALYSIS, MODE_HITFINDER, MODE_MONITOR };
 
 static const char *
 class_name(H5T_class_t c)
@@ -158,11 +163,15 @@ main(int argc, char **argv)
         mode  = MODE_HITFINDER;
         label = "hitfinder (predicate GT)";
     }
+    else if (strcmp(argv[1], "monitor") == 0) {
+        mode  = MODE_MONITOR;
+        label = "monitor (status + decision)";
+    }
     else {
     usage:
         fprintf(stderr,
-                "usage: %s discover|archive|viewer|analysis|hitfinder "
-                "[module] [nmodules] [max-pushes] [step-timeout-ms]\n",
+                "usage: %s discover|archive|viewer|analysis|hitfinder|monitor "
+                "[module] [nmodules] [max-steps] [step-timeout-ms]\n",
                 argv[0]);
         return 1;
     }
@@ -314,65 +323,185 @@ main(int argc, char **argv)
         if (H5Fsubscribe_type(fid, DETECTOR_IMAGE_PATH, H5T_NATIVE_INT16) < 0)
             fprintf(stderr, "viewer: WARNING could not narrow to int16; taking native width\n");
     }
-    if (mode == MODE_HITFINDER) {
+    if (mode == MODE_HITFINDER || mode == MODE_MONITOR) {
         int32_t threshold = DETECTOR_HIT_THRESHOLD;
 
         /* The predicate's type is the image's own DISCOVERED type, not a
          * constant -- H5T_NATIVE_INT32 would be an assumption this program
-         * has no business making. */
+         * has no business making. Same mechanism for both roles: hitfinder
+         * uses it to decide what to DELIVER, monitor uses it to decide what
+         * to DECIDE. */
         if (H5Fsubscribe_predicate(fid, DETECTOR_IMAGE_PATH, H5VL_STREAM_PRED_GT, img->type_id,
                                     &threshold) < 0) {
-            fprintf(stderr, "hitfinder: FAIL H5Fsubscribe_predicate\n");
+            fprintf(stderr, "%s: FAIL H5Fsubscribe_predicate\n", argv[1]);
             return 1;
         }
-        printf("hitfinder: only elements > %d will be marshaled; a frame with none sends nothing\n",
-               DETECTOR_HIT_THRESHOLD);
+        if (mode == MODE_HITFINDER)
+            printf("hitfinder: only elements > %d will be marshaled; a frame with none sends nothing\n",
+                   DETECTOR_HIT_THRESHOLD);
+        else
+            printf("monitor: watching for elements > %d as the signal-present test\n", DETECTOR_HIT_THRESHOLD);
     }
 
-    printf("%s: subscribed as %s -- watching up to %d push(es)\n", argv[1], label, max_pushes);
+    if (mode == MODE_MONITOR) {
+        /*
+         * A different loop than the four modes above, for a real reason,
+         * not a stylistic one. archive/viewer/analysis/hitfinder each drain
+         * a push queue: H5Fget_subscribed_data() timing out just means "no
+         * push arrived in time," which is genuinely ambiguous between "this
+         * frame had no signal" and "the writer has not reached the next
+         * frame yet." hitfinder does not need to tell those apart -- it
+         * only cares what it delivers. monitor does: "check the status"
+         * only means something if a timeout can be read as a real
+         * observation, not as noise.
+         *
+         * So monitor pairs two calls per frame instead of one:
+         * H5Fwait_step_ready() first, which blocks on the writer's own
+         * step-commit notification and is independent of any subscription
+         * -- it fires whether or not this reader's predicate matched. Once
+         * that confirms a step actually committed, an H5Fget_subscribed_data()
+         * poll asks whether the predicate matched for it. A timeout there,
+         * immediately after a confirmed commit, is now a real "no signal
+         * this frame" -- not "still waiting."
+         *
+         * NOT demonstrated here: vol-stream also documents a genuinely
+         * latest-only reader that jumps by logical id via
+         * H5Fbegin_logical_step() rather than draining sequentially (see
+         * H5Fset_stream_queue_policy()'s own doc comment: "a
+         * monitoring/latest-only reader"). That would be the more scalable
+         * design at real frame rates -- sample the newest frame, skip
+         * whatever was missed, never fall behind. Left undemonstrated
+         * rather than guessed at: how it interacts with the subscription
+         * push queue needs verifying on a machine with the Mochi stack
+         * present, which this one was not written on (see README.md's
+         * "Honest notes").
+         */
+        int hit_count    = 0;
+        int miss_streak  = 0;
+        int decided_good = 0;
+        int decided_lost = 0;
+        int steps_seen   = 0;
+        int idle_misses  = 0;
+        int max_idle     = (DETECTOR_BARRIER_TIMEOUT_MS + 5000) / step_timeout + 1;
 
-    {
-        int misses     = 0;
-        int max_misses = (DETECTOR_BARRIER_TIMEOUT_MS + 5000) / step_timeout + 1;
+        printf("monitor: subscribed -- watching status for up to %d step(s)\n", max_pushes);
 
         for (;;) {
-            uint64_t phys = 0, elem_start = 0, elem_count = 0;
-            char    *path = NULL;
-            void    *buf  = NULL;
-            size_t   size = 0;
+            uint64_t phys = 0, wall_ns = 0;
 
-            if (H5Fget_subscribed_data(fid, (uint64_t)step_timeout, &phys, &path, &buf, &size, &elem_start,
-                                        &elem_count) < 0) {
-                if (++misses < max_misses)
+            if (H5Fwait_step_ready(fid, (uint64_t)step_timeout, &phys, &wall_ns) < 0) {
+                if (++idle_misses < max_idle)
                     continue;
-                printf("%s: no further data (writer finished or idle) after %d push(es)\n", argv[1],
-                       pushes);
+                printf("monitor: no further steps (writer finished or idle) after %d observed\n",
+                       steps_seen);
                 break;
             }
-            misses = 0;
+            idle_misses = 0;
+            steps_seen++;
 
-            pushes++;
-            total_bytes += size;
-            total_elems += (size_t)elem_count;
-            printf("%s: push %2d  step %llu  %llu element(s)  %zu byte(s)\n", argv[1], pushes,
-                   (unsigned long long)phys, (unsigned long long)elem_count, size);
+            {
+                uint64_t data_phys = 0, elem_start = 0, elem_count = 0;
+                char    *path = NULL;
+                void    *buf  = NULL;
+                size_t   size = 0;
+                int      got;
 
-            free(path);
-            free(buf);
-            if (max_pushes > 0 && pushes >= max_pushes)
+                /* "got" (the call succeeded) and "matched" (it was THIS
+                 * step) are tracked separately so a success on an
+                 * unexpected phys -- not expected in this sequential,
+                 * one-subscriber setup, but not ruled out either -- still
+                 * gets its allocation freed rather than leaked. */
+                got = (H5Fget_subscribed_data(fid, (uint64_t)step_timeout, &data_phys, &path, &buf, &size,
+                                               &elem_start, &elem_count) >= 0);
+
+                if (got && data_phys == phys) {
+                    hit_count++;
+                    miss_streak = 0;
+                    printf("monitor: step %llu  SIGNAL  (%llu element(s) above threshold, %zu byte(s))\n",
+                           (unsigned long long)phys, (unsigned long long)elem_count, size);
+                }
+                else {
+                    miss_streak++;
+                    printf("monitor: step %llu  no signal\n", (unsigned long long)phys);
+                }
+                if (got) {
+                    free(path);
+                    free(buf);
+                }
+            }
+
+            if (!decided_good && hit_count >= DETECTOR_MONITOR_GOOD_HITS) {
+                decided_good = 1;
+                printf("monitor: DECISION -- signal established (%d hit(s) observed) -- a real\n"
+                       "monitor:           deployment would now signal the control system to proceed\n"
+                       "monitor:           with this acquisition\n",
+                       hit_count);
+            }
+            if (decided_good && !decided_lost && miss_streak >= DETECTOR_MONITOR_MISS_STREAK) {
+                decided_lost = 1;
+                printf("monitor: DECISION -- signal lost (%d consecutive frame(s) with nothing above\n"
+                       "monitor:           threshold) -- a real deployment would now signal the control\n"
+                       "monitor:           system to stop this acquisition and move on\n",
+                       miss_streak);
+            }
+
+            if (max_pushes > 0 && steps_seen >= max_pushes)
                 break;
         }
-    }
 
-    printf("\n%s: summary -- %d push(es), %zu element(s), %zu byte(s) delivered\n", argv[1], pushes,
-           total_elems, total_bytes);
-    if (mode == MODE_VIEWER)
-        printf("viewer: delivered bytes are DECODED -- H5Fget_subscribed_data() never hands back\n"
-               "viewer: compressed values, so the real wire size is in the writer's own\n"
-               "viewer: \"refilter\" line (VOL_STREAM_DEBUG_REFILTER=1). See RFC appendix A, F7.\n");
-    if (mode == MODE_HITFINDER)
-        printf("hitfinder: frames whose elements were all below %d produced no push at all\n",
-               DETECTOR_HIT_THRESHOLD);
+        printf("\nmonitor: summary -- %d step(s) observed, %d signal, decisions reached: %s%s%s\n",
+               steps_seen, hit_count, decided_good ? "established" : "none",
+               decided_good && decided_lost ? " + " : "", decided_lost ? "lost" : "");
+        printf("monitor: this prints what a real deployment would DO next -- it does not call into any\n"
+               "monitor: actual control system (Tango/EPICS/Bluesky/...); that integration is the hook\n"
+               "monitor: this decision point exists for, not something this example implements.\n");
+    }
+    else {
+        printf("%s: subscribed as %s -- watching up to %d push(es)\n", argv[1], label, max_pushes);
+
+        {
+            int misses     = 0;
+            int max_misses = (DETECTOR_BARRIER_TIMEOUT_MS + 5000) / step_timeout + 1;
+
+            for (;;) {
+                uint64_t phys = 0, elem_start = 0, elem_count = 0;
+                char    *path = NULL;
+                void    *buf  = NULL;
+                size_t   size = 0;
+
+                if (H5Fget_subscribed_data(fid, (uint64_t)step_timeout, &phys, &path, &buf, &size,
+                                            &elem_start, &elem_count) < 0) {
+                    if (++misses < max_misses)
+                        continue;
+                    printf("%s: no further data (writer finished or idle) after %d push(es)\n", argv[1],
+                           pushes);
+                    break;
+                }
+                misses = 0;
+
+                pushes++;
+                total_bytes += size;
+                total_elems += (size_t)elem_count;
+                printf("%s: push %2d  step %llu  %llu element(s)  %zu byte(s)\n", argv[1], pushes,
+                       (unsigned long long)phys, (unsigned long long)elem_count, size);
+
+                free(path);
+                free(buf);
+                if (max_pushes > 0 && pushes >= max_pushes)
+                    break;
+            }
+        }
+
+        printf("\n%s: summary -- %d push(es), %zu element(s), %zu byte(s) delivered\n", argv[1], pushes,
+               total_elems, total_bytes);
+        if (mode == MODE_VIEWER)
+            printf("viewer: delivered bytes are DECODED -- H5Fget_subscribed_data() never hands back\n"
+                   "viewer: compressed values, so the real wire size is in the writer's own\n"
+                   "viewer: \"refilter\" line (VOL_STREAM_DEBUG_REFILTER=1). See RFC appendix A, F7.\n");
+        if (mode == MODE_HITFINDER)
+            printf("hitfinder: frames whose elements were all below %d produced no push at all\n",
+                   DETECTOR_HIT_THRESHOLD);
+    }
 
     if (sub_space != H5I_INVALID_HID)
         H5Sclose(sub_space);
