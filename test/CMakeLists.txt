@@ -1,6 +1,6 @@
 foreach(t t_smoke t_step t_replay t_reader t_deferred t_vl_reject t_manifest_cache t_ref_path t_ref_roundtrip
            t_vl_roundtrip t_attr_convert t_payload_compress t_step_rewrite t_reregister t_memspace t_manypaths
-           t_dset_resize t_retention t_config t_flush_refresh t_open_step_objects)
+           t_dset_resize t_retention t_config t_flush_refresh t_open_step_objects t_overlay)
   add_executable(${t} ${t}.c)
   target_link_libraries(${t} PRIVATE vol_stream)
 endforeach()
@@ -20,6 +20,8 @@ add_test(NAME flush_refresh COMMAND t_flush_refresh)
 # Library walks of open objects (a file close's flush, object counts, a second
 # handle) while a dataset created in the open step is still open.
 add_test(NAME open_step_objects COMMAND t_open_step_objects)
+# The /stream overlay: a timeline view for tools that read the file natively.
+add_test(NAME overlay COMMAND t_overlay)
 add_test(NAME step COMMAND t_step)
 add_test(NAME replay COMMAND t_replay)
 add_test(NAME reader COMMAND t_reader)

@@ -203,6 +203,14 @@ typedef struct H5VL_stream_path_steps_t {
     size_t    cap_steps;
 } H5VL_stream_path_steps_t;
 
+/* One dataset the /stream overlay covers (or has given up on): see
+ * H5VL__stream_overlay_step(). */
+typedef struct H5VL_stream_overlay_t {
+    char    *path;       /* the dataset's logical path */
+    uint64_t first_step; /* the step of its row 0 */
+    int      dead;       /* not eligible, or its shape changed: no more rows */
+} H5VL_stream_overlay_t;
+
 /* M6.5/dictionary caching: the last type_enc (H5Tencode() bytes) sent for a
  * given DsetWrite path, on both the writer side (H5VL__stream_build_
  * manifest(), to decide whether this step's type_enc can be omitted) and
@@ -350,6 +358,10 @@ struct H5VL_stream_file_state_t {
     char                        *cfg_spill_dir;      /* NULL: /tmp */
     unsigned                     cfg_concentration;  /* 0/1: off */
     int64_t                      cfg_bulk_threshold; /* -1: default */
+    int                          cfg_overlay;        /* 1: build the /stream overlay */
+    struct H5VL_stream_overlay_t *overlay;           /* datasets the overlay covers, or gave up on */
+    size_t                       n_overlay, cap_overlay;
+    int                          warned_overlay_retention;
     uint64_t                    *retain_bytes;
     size_t                       n_retain;
     size_t                       cap_retain;
@@ -1446,6 +1458,7 @@ H5VL__stream_apply_config(H5VL_stream_file_state_t *fs, const H5VL_stream_config
     fs->cfg_max_pending    = c->max_pending_bytes;
     fs->cfg_concentration  = c->concentration;
     fs->cfg_bulk_threshold = c->bulk_threshold < 0 ? -1 : c->bulk_threshold;
+    fs->cfg_overlay        = c->overlay == 1;
 } /* end H5VL__stream_apply_config() */
 
 static void
@@ -1611,6 +1624,13 @@ H5VL__stream_file_state_decref(H5VL_stream_file_state_t *fs)
 #endif
     free(fs->cfg_na);
     free(fs->cfg_spill_dir);
+    {
+        size_t k;
+
+        for (k = 0; k < fs->n_overlay; k++)
+            free(fs->overlay[k].path);
+        free(fs->overlay);
+    }
 
 #ifdef VOL_STREAM_HAVE_MERCURY
     H5VL__stream_schema_clear(fs);
@@ -9037,6 +9057,8 @@ H5VL_stream_info_cmp(int *cmp_value, const void *_info1, const void *_info2)
             *cmp_value = a->concentration < b->concentration ? -1 : 1;
         else if (a->bulk_threshold != b->bulk_threshold)
             *cmp_value = a->bulk_threshold < b->bulk_threshold ? -1 : 1;
+        else if (a->overlay != b->overlay)
+            *cmp_value = a->overlay < b->overlay ? -1 : 1;
     }
 
     return 0;
@@ -9138,7 +9160,10 @@ H5VL_stream_info_to_str(const void *_info, char **str)
             if (c->concentration > 1)
                 len += (size_t)snprintf(*str + len, strSize - len, ";concentration=%u", c->concentration);
             if (c->bulk_threshold >= 0)
-                snprintf(*str + len, strSize - len, ";bulk_threshold=%lld", (long long)c->bulk_threshold);
+                len += (size_t)snprintf(*str + len, strSize - len, ";bulk_threshold=%lld",
+                                        (long long)c->bulk_threshold);
+            if (c->overlay >= 0)
+                snprintf(*str + len, strSize - len, ";overlay=%d", c->overlay);
         }
     }
     H5free_memory(under_vol_string);
@@ -9228,6 +9253,8 @@ H5VL_stream_str_to_info(const char *str, void **_info)
                 info->config.concentration = (unsigned)strtoul(eq, NULL, 10);
             else if (!strcmp(tok, "bulk_threshold"))
                 info->config.bulk_threshold = (int64_t)strtoll(eq, NULL, 10);
+            else if (!strcmp(tok, "overlay"))
+                info->config.overlay = atoi(eq);
             else
                 bad = 1;
         }
@@ -10779,6 +10806,265 @@ H5VL_stream_dataset_get(void *dset, H5VL_dataset_get_args_t *args, hid_t dxpl_id
 } /* end H5VL_stream_dataset_get() */
 
 /*-------------------------------------------------------------------------
+ * The /stream overlay: a timeline view of each dataset, for tools that read
+ * the file natively (h5py, h5dump, H5Web through h5grove or h5wasm), which
+ * otherwise see only the /step/<n>/ layout.
+ *
+ * /stream<path> is a virtual dataset shaped [rows, dims...]. Row j is the
+ * dataset's state as of step first_step + j (an attribute on it). It reads
+ * /stream/.steps<path>/j, a hard link to the step's own copy -- or, for a
+ * step that did not write the dataset, to the last copy that did. So a row
+ * is "the state as of that step", no data is copied, and there is never a
+ * gap. The mapping is one "printf" source name, /stream/.steps<path>/%b,
+ * with an unlimited first dimension, so the view grows by itself as links
+ * are added: one hard link per covered dataset per step.
+ *
+ * Covered: datasets whose shape cannot change (current dims == max dims) and
+ * whose type is not variable-length. Not with a retention policy (the links
+ * would keep pruned steps alive), and not for a parallel writer (every rank
+ * would have to create the same objects collectively). Opt-in:
+ * H5VL_stream_config_t.overlay or VOL_STREAM_OVERLAY.
+ *-------------------------------------------------------------------------
+ */
+static int
+H5VL__stream_overlay_enabled(const H5VL_stream_file_state_t *fs)
+{
+    const char *s = getenv("VOL_STREAM_OVERLAY");
+
+    if (s)
+        return !(s[0] == '\0' || s[0] == '0' || s[0] == 'n' || s[0] == 'N' || s[0] == 'f' || s[0] == 'F');
+    return fs->cfg_overlay;
+} /* end H5VL__stream_overlay_enabled() */
+
+/* A name for H5Pset_virtual()'s source: '%' is its escape character. */
+static void
+H5VL__stream_overlay_src_name(char *out, size_t out_len, const char *path)
+{
+    size_t o = 0;
+
+    o += (size_t)snprintf(out, out_len, "/stream/.steps");
+    for (; *path && o + 3 < out_len; path++) {
+        if (*path == '%')
+            out[o++] = '%';
+        out[o++] = *path;
+    }
+    snprintf(out + o, out_len - o, "/%%b");
+} /* end H5VL__stream_overlay_src_name() */
+
+/* Start covering path, first written in step k. Returns the new entry,
+ * dead if the dataset is not eligible or the objects could not be made. */
+static H5VL_stream_overlay_t *
+H5VL__stream_overlay_start(H5VL_stream_file_state_t *fs, const char *path, uint64_t k)
+{
+    H5VL_stream_overlay_t *e, *grown;
+    H5VL_loc_params_t      loc;
+    char                   name[1100], src[1200];
+    void                  *ds = NULL, *vds = NULL, *grp = NULL, *attr = NULL;
+    hid_t                  type = H5I_INVALID_HID, space = H5I_INVALID_HID, vspace = H5I_INVALID_HID;
+    hid_t                  dcpl = H5I_INVALID_HID, lcpl = H5I_INVALID_HID, ascalar = H5I_INVALID_HID;
+    hsize_t                dims[H5S_MAX_RANK], maxdims[H5S_MAX_RANK];
+    hsize_t                vdims[H5S_MAX_RANK + 1], vmax[H5S_MAX_RANK + 1];
+    hsize_t                vstart[H5S_MAX_RANK + 1], vcount[H5S_MAX_RANK + 1], vblock[H5S_MAX_RANK + 1];
+    int                    rank, d, ok = 0;
+
+    if (fs->n_overlay == fs->cap_overlay) {
+        size_t new_cap = fs->cap_overlay ? fs->cap_overlay * 2 : 8;
+
+        if (NULL == (grown = (H5VL_stream_overlay_t *)realloc(fs->overlay, new_cap * sizeof(*grown))))
+            return NULL;
+        fs->overlay     = grown;
+        fs->cap_overlay = new_cap;
+    }
+    e             = &fs->overlay[fs->n_overlay];
+    e->path       = strdup(path);
+    e->first_step = k;
+    e->dead       = 1;
+    if (!e->path)
+        return NULL;
+    fs->n_overlay++;
+
+    memset(&loc, 0, sizeof(loc));
+    loc.obj_type = H5I_FILE;
+    loc.type     = H5VL_OBJECT_BY_SELF;
+
+    /* The step's own copy says what the dataset is. */
+    snprintf(name, sizeof(name), "/step/%llu%s", (unsigned long long)k, path);
+    if (NULL == (ds = H5VLdataset_open(H5VL__stream_file_under(fs), &loc, fs->file_under_vol_id, name,
+                                        H5P_DATASET_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL)))
+        return e;
+    {
+        H5VL_dataset_get_args_t g;
+
+        g.op_type = H5VL_DATASET_GET_TYPE;
+        if (H5VLdataset_get(ds, fs->file_under_vol_id, &g, H5P_DATASET_XFER_DEFAULT, NULL) < 0)
+            goto done;
+        type      = g.args.get_type.type_id;
+        g.op_type = H5VL_DATASET_GET_SPACE;
+        if (H5VLdataset_get(ds, fs->file_under_vol_id, &g, H5P_DATASET_XFER_DEFAULT, NULL) < 0)
+            goto done;
+        space = g.args.get_space.space_id;
+    }
+    if (H5VL__stream_type_vl_kind(type) != H5VL_STREAM_VL_NONE ||
+        (rank = H5Sget_simple_extent_dims(space, dims, maxdims)) < 0 || rank >= H5S_MAX_RANK)
+        goto done;
+    for (d = 0; d < rank; d++)
+        if (maxdims[d] != dims[d])
+            goto done; /* its shape can change: rows would not line up */
+
+    /* The virtual dataset: [rows, dims...], rows unlimited. */
+    vdims[0] = 0;
+    vmax[0]  = H5S_UNLIMITED;
+    vstart[0] = 0;
+    vcount[0] = H5S_UNLIMITED;
+    vblock[0] = 1;
+    for (d = 0; d < rank; d++) {
+        vdims[d + 1] = vmax[d + 1] = vblock[d + 1] = dims[d];
+        vstart[d + 1]                              = 0;
+        vcount[d + 1]                              = 1;
+    }
+    H5VL__stream_overlay_src_name(src, sizeof(src), path);
+    if ((vspace = H5Screate_simple(rank + 1, vdims, vmax)) < 0 ||
+        H5Sselect_hyperslab(vspace, H5S_SELECT_SET, vstart, NULL, vcount, vblock) < 0 ||
+        (dcpl = H5Pcreate(H5P_DATASET_CREATE)) < 0 || H5Pset_virtual(dcpl, vspace, ".", src, space) < 0 ||
+        (lcpl = H5Pcreate(H5P_LINK_CREATE)) < 0 || H5Pset_create_intermediate_group(lcpl, 1) < 0)
+        goto done;
+
+    /* Where its rows' links live, and the overlay dataset's parent. Made
+     * with the replay's own helper: H5VLgroup_create() does not honor an
+     * LCPL's intermediate-group setting, which only an API call applies. */
+    snprintf(name, sizeof(name), "/stream/.steps%s", path);
+    if (NULL == (grp = H5VL__stream_replay_ensure_group(H5VL__stream_file_under(fs), fs->file_under_vol_id,
+                                                          name)))
+        goto done;
+    {
+        const char *slash = strrchr(path, '/');
+
+        if (slash && slash != path) {
+            void *parent;
+
+            snprintf(name, sizeof(name), "/stream%.*s", (int)(slash - path), path);
+            if (NULL == (parent = H5VL__stream_replay_ensure_group(H5VL__stream_file_under(fs),
+                                                                     fs->file_under_vol_id, name)))
+                goto done;
+            H5VLgroup_close(parent, fs->file_under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+        }
+    }
+
+    snprintf(name, sizeof(name), "/stream%s", path);
+    if (H5Sset_extent_simple(vspace, rank + 1, vdims, vmax) < 0 ||
+        NULL == (vds = H5VLdataset_create(H5VL__stream_file_under(fs), &loc, fs->file_under_vol_id, name, lcpl,
+                                           type, vspace, dcpl, H5P_DATASET_ACCESS_DEFAULT,
+                                           H5P_DATASET_XFER_DEFAULT, NULL)))
+        goto done;
+
+    /* Row j is step first_step + j. */
+    {
+        H5VL_loc_params_t self;
+        uint64_t          first = k;
+
+        memset(&self, 0, sizeof(self));
+        self.obj_type = H5I_DATASET;
+        self.type     = H5VL_OBJECT_BY_SELF;
+        if ((ascalar = H5Screate(H5S_SCALAR)) < 0 ||
+            NULL == (attr = H5VLattr_create(vds, &self, fs->file_under_vol_id, "first_step",
+                                             H5T_NATIVE_UINT64, ascalar, H5P_ATTRIBUTE_CREATE_DEFAULT,
+                                             H5P_ATTRIBUTE_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL)) ||
+            H5VLattr_write(attr, fs->file_under_vol_id, H5T_NATIVE_UINT64, &first, H5P_DATASET_XFER_DEFAULT,
+                           NULL) < 0)
+            goto done;
+    }
+    ok = 1;
+
+done:
+    if (attr)
+        H5VLattr_close(attr, fs->file_under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+    if (vds)
+        H5VLdataset_close(vds, fs->file_under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+    if (grp)
+        H5VLgroup_close(grp, fs->file_under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+    H5VLdataset_close(ds, fs->file_under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+    if (ascalar >= 0)
+        H5Sclose(ascalar);
+    if (lcpl >= 0)
+        H5Pclose(lcpl);
+    if (dcpl >= 0)
+        H5Pclose(dcpl);
+    if (vspace >= 0)
+        H5Sclose(vspace);
+    if (space >= 0)
+        H5Sclose(space);
+    if (type >= 0)
+        H5Tclose(type);
+    e->dead = !ok;
+    return e;
+} /* end H5VL__stream_overlay_start() */
+
+/* Step n just committed: start covering datasets it wrote first, and give
+ * every covered dataset its row for n. */
+static void
+H5VL__stream_overlay_step(H5VL_stream_file_state_t *fs, uint64_t n)
+{
+    size_t i, k;
+
+    if (!fs || fs->is_reader || !H5VL__stream_overlay_enabled(fs))
+        return;
+#ifdef H5_HAVE_PARALLEL
+    if (fs->has_comm)
+        return;
+#endif
+    if (fs->retain_max_steps > 0 || fs->retain_max_bytes > 0) {
+        H5VL__stream_warn_once(fs, &fs->warned_overlay_retention, H5VL_stream_err_step_g,
+                               "the /stream overlay is off while a retention policy is set: its links "
+                               "would keep pruned steps alive");
+        return;
+    }
+
+    /* Datasets this step wrote that the overlay has not seen yet. */
+    for (i = 0; i < fs->n_path_index; i++) {
+        H5VL_stream_path_steps_t *pe = &fs->path_index[i];
+
+        if (strchr(pe->path, '@') || pe->n_steps == 0 || pe->steps[pe->n_steps - 1] != n)
+            continue;
+        for (k = 0; k < fs->n_overlay; k++)
+            if (!strcmp(fs->overlay[k].path, pe->path))
+                break;
+        if (k == fs->n_overlay && !H5VL__stream_overlay_start(fs, pe->path, n))
+            return; /* out of memory: try again next step */
+    }
+
+    /* One row per covered dataset: a hard link to its state as of step n. */
+    for (k = 0; k < fs->n_overlay; k++) {
+        H5VL_stream_overlay_t  *e = &fs->overlay[k];
+        H5VL_link_create_args_t args;
+        H5VL_loc_params_t       loc;
+        char                    target[1100], link[1200];
+        uint64_t                r;
+
+        if (e->dead || n < e->first_step || H5VL__stream_path_index_resolve(fs, e->path, n, &r) < 0)
+            continue;
+        snprintf(target, sizeof(target), "/step/%llu%s", (unsigned long long)r, e->path);
+        snprintf(link, sizeof(link), "/stream/.steps%s/%llu", e->path,
+                 (unsigned long long)(n - e->first_step));
+
+        memset(&args, 0, sizeof(args));
+        args.op_type                                            = H5VL_LINK_CREATE_HARD;
+        args.args.hard.curr_obj                                 = H5VL__stream_file_under(fs);
+        args.args.hard.curr_loc_params.obj_type                 = H5I_FILE;
+        args.args.hard.curr_loc_params.type                     = H5VL_OBJECT_BY_NAME;
+        args.args.hard.curr_loc_params.loc_data.loc_by_name.name    = target;
+        args.args.hard.curr_loc_params.loc_data.loc_by_name.lapl_id = H5P_LINK_ACCESS_DEFAULT;
+        memset(&loc, 0, sizeof(loc));
+        loc.obj_type                         = H5I_FILE;
+        loc.type                             = H5VL_OBJECT_BY_NAME;
+        loc.loc_data.loc_by_name.name        = link;
+        loc.loc_data.loc_by_name.lapl_id     = H5P_LINK_ACCESS_DEFAULT;
+        if (H5VLlink_create(&args, H5VL__stream_file_under(fs), &loc, fs->file_under_vol_id,
+                            H5P_LINK_CREATE_DEFAULT, H5P_LINK_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL) < 0)
+            e->dead = 1; /* a missing row would end the view; stop here instead */
+    }
+} /* end H5VL__stream_overlay_step() */
+
+/*-------------------------------------------------------------------------
  * Function:    H5VL__stream_step_flush_refresh
  *
  * Purpose:     Flush or refresh on an object that belongs to the writer's
@@ -11949,6 +12235,9 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
          * pruning failure can never make a just-written step unreachable.
          * Best-effort by construction: it returns void. */
         H5VL__stream_apply_retention(o, committed_bytes);
+
+        /* The /stream timeline view, if asked for. */
+        H5VL__stream_overlay_step(o->file_state, committed_step);
 
 #ifdef VOL_STREAM_HAVE_MERCURY
         /* Best-effort: a stalled or absent reader must not fail (or stall)
@@ -13942,6 +14231,7 @@ H5VL_stream_config_init(H5VL_stream_config_t *config)
     config->version        = H5VL_STREAM_CONFIG_VERSION;
     config->stage_payload  = -1;
     config->bulk_threshold = -1;
+    config->overlay        = -1;
 } /* end H5VL_stream_config_init() */
 
 herr_t

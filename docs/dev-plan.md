@@ -1232,6 +1232,15 @@ matches the code. Each item is documented for users in
   first, and end_step collects its notes and pushes them as its last action.
   A `Discard` drop is reported that way (`t_queue_policy`), and so is the
   parallel Spill-as-Block warning, which had never been visible.
+- **The `/stream` overlay: a timeline for native tools (and H5Web).** Opt-in
+  (`overlay` / `VOL_STREAM_OVERLAY`). `/stream/<path>` is a "printf" virtual
+  dataset, `[rows, dims...]` with an unlimited first dimension, whose row j is
+  `/stream/.steps/<path>/j` -- a hard link to the copy that is current as of
+  step `first_step + j`. So a step that did not write the dataset repeats the
+  last value, there are no gaps, no data is copied, and the view grows by one
+  link per covered dataset per step. Fixed-shape, non-VL datasets only; off
+  under a retention policy and for parallel writers. `t_overlay` checks it
+  natively; h5dump and h5py (and so H5Web through h5grove) read it.
 - **Phase 1 follow-ups: shared registrations, overlapped transfers.** A
   borrowed bulk push now pulls from a region registered once -- the step's
   whole staging buffer, or one write's data -- at an offset carried in the

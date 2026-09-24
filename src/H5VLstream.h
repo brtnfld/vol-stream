@@ -224,6 +224,8 @@ typedef struct H5VL_stream_config_t {
     const char *spill_dir;         /* VOL_STREAM_SPILL_DIR: NULL = /tmp */
     unsigned    concentration;     /* VOL_STREAM_CONCENTRATION: ranks per I/O concentrator, 0 or 1 = off */
     int64_t     bulk_threshold;    /* VOL_STREAM_BULK_THRESHOLD: bytes, -1 = default (64 KiB) */
+    int         overlay;           /* VOL_STREAM_OVERLAY: 1 builds the /stream timeline view, 0 or -1
+                                    * (default) does not -- see "The /stream overlay" in the user guide */
 } H5VL_stream_config_t;
 
 /* vol-stream connector info. Built by H5Pset_fapl_stream(); an application

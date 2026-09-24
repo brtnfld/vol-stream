@@ -236,6 +236,35 @@ script, or a colleague. See the [tool-compatibility matrix](#81-faq) for all
 four states a stream can be in, including the one where no file-reading tool
 works at all.
 
+#### The `/stream` overlay: a timeline for native tools
+
+Turn on the overlay (`overlay = 1` in `H5Pset_fapl_stream()`'s config, or
+`VOL_STREAM_OVERLAY=1`) and the writer also builds `/stream/<path>`, a virtual
+dataset shaped `[rows, dims...]`, one row per step. Row *j* is the dataset's
+state as of step `first_step + j` (an attribute on it). A step that did not
+write the dataset repeats the last value that was written. Any tool that reads
+HDF5 natively then sees the time series in place, with no export step:
+
+```
+$ h5dump -d /stream/T stream.h5
+   DATASPACE  SIMPLE { ( 4, 3 ) / ( H5S_UNLIMITED, 3 ) }
+   (0,0): 0, 1, 2,
+   (1,0): 10, 11, 12,
+   (2,0): 10, 11, 12,      <- step 2 did not write /T
+   (3,0): 30, 31, 32
+```
+
+h5py reads it the same way, so H5Web does too when served through h5grove,
+and its N-D slicing gives a time slider. Each row is a hard link to that
+step's own copy, under `/stream/.steps/`, so nothing is copied; the view grows
+as steps commit. The limits:
+
+- only datasets whose shape cannot change (current dims equal max dims) and
+  whose type is not variable-length;
+- not with a retention policy, whose pruned steps the links would keep alive;
+- not for a parallel writer yet;
+- a stream only ever read through the connector does not need it.
+
 ### 1.6 What you get for the overhead
 
 vol-stream is slower per step than a dedicated streaming library (quantified
@@ -764,7 +793,7 @@ H5Pset_fapl_stream(fapl, &cfg);    /* connector over native, with these settings
 ```
 
 The fields are `na`, `stage_payload`, `max_pending_bytes`, `spill_dir`,
-`concentration` and `bulk_threshold`, each the counterpart of the variable of
+`concentration`, `bulk_threshold` and `overlay`, each the counterpart of the variable of
 the same name below. **A variable that is set overrides the FAPL value**, so a
 job can be retuned without rebuilding. The same settings work in an
 `HDF5_VOL_CONNECTOR` string, after the under-connector part:
@@ -780,6 +809,7 @@ are environment only.
 | `VOL_STREAM_MAX_PENDING_BYTES` | byte count | unlimited | Caps the connector's in-step staging buffer |
 | `VOL_STREAM_SPILL_DIR` | directory path | `/tmp` | Where `H5VL_STREAM_QUEUE_SPILL` writes node-local bytes |
 | `VOL_STREAM_CONCENTRATION` | integer > 1 | `1` (off) | Subfiling-style I/O-concentrator topology for parallel writers: N ranks funnel their writes through one |
+| `VOL_STREAM_OVERLAY` | `1` to enable | off | Build the `/stream` timeline view for native tools ([§1.5](#15-what-the-file-on-disk-actually-looks-like)) |
 | `VOL_STREAM_BULK_THRESHOLD` | byte count | `65536` | A push payload at least this large is registered and pulled by the subscriber (Mercury bulk) rather than copied inline into the RPC. `0` sends every non-empty payload by bulk. The default is provisional until measured on an RDMA fabric |
 | `VOL_STREAM_PUSH_STATS` | any non-`0` value | off | Report per-push timing from the transport, including how many pushes went by bulk |
 | `VOL_STREAM_DEBUG_REFILTER` | any value | off | Trace per-subscriber re-filtering |
