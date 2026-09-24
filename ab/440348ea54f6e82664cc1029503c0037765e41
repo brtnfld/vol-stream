@@ -1,0 +1,35 @@
+test/t_bulk_push.c
+  s_3816fb7b7c4a27::t_ff5b80017a5ac8 1-351
+test/CMakeLists.txt
+  s_3816fb7b7c4a27::t_165ee36b2cae87 104-128
+python/CMakeLists.txt
+  s_3816fb7b7c4a27::t_0b542ac129c059 98-109
+docs/dev-plan.md
+  s_3816fb7b7c4a27::t_9041bcd6bad425 1244-1250
+docs/user-guide.md
+  s_3816fb7b7c4a27::t_5723d83624040d 755-756,2156
+src/tr_mercury.c
+  s_3816fb7b7c4a27::t_b649c74b1ce428 27,108-138,240-243,247,292-301,307-308,1749,1753,2753,2769-2772,2832-2835,2852-2859
+  s_3816fb7b7c4a27::t_88b95d400c30ee 2897-2898,2932-2953,2979-2983,2985,2988,3007-3010
+  s_3816fb7b7c4a27::t_0dcc9c9c8e7693 2874-2879
+  s_3816fb7b7c4a27::t_d3272092fcd0d6 3485-3488,3505-3509
+  s_3816fb7b7c4a27::t_299cde7f51a7f9 1558-1586
+  s_3816fb7b7c4a27::t_d121e19c5b1e96 549
+  s_3816fb7b7c4a27::t_01f44441899832 2860,3011
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ab440348ea54f6e82664cc1029503c0037765e41",
+  "prompts": {},
+  "sessions": {
+    "s_3816fb7b7c4a27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b5b5c72-aca3-496b-8412-0fb9ae85948c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
