@@ -1,0 +1,21 @@
+src/H5VLstream.c
+  s_3816fb7b7c4a27::t_e4154f18a4dc63 329-334,8153-8177,8182,8552,8582,11223,11336
+docs/dev-plan.md
+  s_3816fb7b7c4a27::t_c5089d38e9b89e 1227-1234,1288-1292
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8ed024c661dc451cf67f8ee51dcf7fc4633b77cb",
+  "prompts": {},
+  "sessions": {
+    "s_3816fb7b7c4a27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b5b5c72-aca3-496b-8412-0fb9ae85948c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
