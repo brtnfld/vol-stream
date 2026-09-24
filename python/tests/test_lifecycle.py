@@ -61,13 +61,12 @@ def consumer_break(path, sync):
     f.subscribe("/grid")
     touch(sync, "ready")
     n = 0
-    while True:
-        step = f.next_step(10000)
-        if step is None:
-            sys.exit("consumer: a step never arrived")
+    for _ in f.steps(timeout=30):
         n += 1
         if n == 3:
             break
+    if n != 3:
+        sys.exit("consumer: a step never arrived")
     # Deliberately no close(): the atexit backstop must leave the group.
     globals()["kept_open"] = f
     sys.exit(0)

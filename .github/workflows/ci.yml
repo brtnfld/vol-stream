@@ -355,6 +355,15 @@ jobs:
             ./configure --prefix=$HOME/mochi-install
           make -j"$(nproc)" && make install
 
+      # CPU-only torch, for the volstream.torch.StreamDataset test. The
+      # runner's system Python is externally managed, and this is an
+      # ephemeral VM, so install into it directly.
+      - name: Install torch (CPU)
+        run: |
+          python3 -m pip install --break-system-packages --quiet torch \
+            --index-url https://download.pytorch.org/whl/cpu
+          python3 -c "import torch; print('torch', torch.__version__)"
+
       - name: Build vol-stream with the transport
         run: |
           export PKG_CONFIG_PATH=$HOME/mochi-install/lib/pkgconfig:$HOME/mochi-install/lib64/pkgconfig:$PKG_CONFIG_PATH

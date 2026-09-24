@@ -2,6 +2,7 @@
 
 import atexit
 import math
+import time
 import weakref
 from typing import NamedTuple, Optional
 
@@ -276,15 +277,16 @@ class File:
         """Return the next raw Push, or None if none arrives within timeout_ms.
 
         This is one payload, not one step: a step can arrive as several
-        pushes. Use next_step() for whole steps.
+        pushes. Use next_step() or iterate the File for whole steps.
 
-        get() never consumes step notifications. A consumer that calls only
-        get() leaves them to accumulate for as long as it runs, and the
-        connector drops notifications once that queue can no longer grow.
-        Mixing get() with next_step() on one file breaks next_step()'s
-        grouping.
+        get() also discards any step notifications already queued, which a
+        get()-only consumer has no use for; left alone they would accumulate
+        for as long as it runs. That is also why get() and next_step() must
+        not be mixed on one file: next_step() needs those notifications.
         """
         item = self._raw.get(timeout_ms)
+        while self._raw.wait_step_ready(0) is not None:
+            pass
         if item is None:
             return None
         return self._push(item)
@@ -330,6 +332,38 @@ class File:
         arrays = {path: self._subs[path].assemble(plist) for path, plist in by_path.items()}
         return Step(phys, wall_ns, arrays)
 
+    def steps(self, max_steps=None, timeout=None, idle_timeout=None, poll_ms=1000):
+        """Yield Steps as the writer commits them.
+
+        A quiet stream does not end iteration on its own: the connector has
+        no end-of-stream signal, so a pause and a finished writer look the
+        same. Iteration ends only on a bound you give it: max_steps steps,
+        timeout seconds in total, or idle_timeout seconds without a step.
+        With none of them it runs until you break out or interrupt it.
+
+        The generator holds nothing that needs cleaning up; the File does.
+        Close the File, or use it as a context manager, when you are done.
+        """
+        start = last = time.monotonic()
+        count = 0
+        while max_steps is None or count < max_steps:
+            now = time.monotonic()
+            wait_s = poll_ms / 1000
+            if timeout is not None:
+                wait_s = min(wait_s, start + timeout - now)
+            if idle_timeout is not None:
+                wait_s = min(wait_s, last + idle_timeout - now)
+            if wait_s <= 0:
+                return
+            step = self.next_step(int(wait_s * 1000))
+            if step is not None:
+                count += 1
+                last = time.monotonic()
+                yield step
+
+    def __iter__(self):
+        return self.steps()
+
     def _sub(self, path):
         sub = self._subs.get(path)
         if sub is None:
@@ -357,3 +391,31 @@ class File:
 def open(path):
     """Open a vol-stream file for reading."""
     return File(_volstream.open(path))
+
+
+def follow(path, selections=None, timeout_ms=10000):
+    """Open a live stream and subscribe to it in one call.
+
+    selections is anything File.subscribe() takes. By default every dataset
+    in the writer's schema with an integer or float type is subscribed.
+    Waits up to timeout_ms for the writer's first committed step.
+
+        with volstream.follow("run.h5") as stream:
+            for step in stream.steps(max_steps=100):
+                ...
+    """
+    f = open(path)
+    try:
+        if selections is None:
+            selections = [
+                v.path
+                for v in f.schema(timeout_ms).values()
+                if not v.is_attr and v.dtype is not None and v.shape is not None
+            ]
+            if not selections:
+                raise Error(f"{path!r}: the stream has no integer or float datasets to follow")
+        f.subscribe(selections, timeout_ms)
+    except BaseException:
+        f.close()
+        raise
+    return f

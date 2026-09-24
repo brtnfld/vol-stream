@@ -12,7 +12,7 @@ target_link_libraries(_volstream PRIVATE vol_stream)
 set_target_properties(_volstream PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/volstream
 )
-foreach(py __init__.py _file.py)
+foreach(py __init__.py _file.py torch.py)
   configure_file(volstream/${py} ${CMAKE_CURRENT_BINARY_DIR}/volstream/${py} COPYONLY)
 endforeach()
 
@@ -32,13 +32,16 @@ if(VOL_STREAM_BUILD_TESTS)
   if(VOL_STREAM_HAVE_MERCURY)
     add_executable(py_stream_writer tests/stream_writer.c)
     target_link_libraries(py_stream_writer PRIVATE vol_stream)
-    foreach(mode column narrowing)
+    # P2 and P4: whole steps, iteration, get()-only, and the torch dataset
+    # (skipped when torch is not installed).
+    foreach(mode column narrowing iterate getonly torch)
       add_test(NAME python_stream_${mode}
         COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_stream.py
                 $<TARGET_FILE:py_stream_writer> ${mode})
       set_tests_properties(python_stream_${mode} PROPERTIES
         ENVIRONMENT "${_py_env};VOL_STREAM_NA=na+sm"
         TIMEOUT 120
+        SKIP_RETURN_CODE 77
       )
     endforeach()
 

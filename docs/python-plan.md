@@ -329,6 +329,28 @@ test showing the step-ready queue stays bounded (or, if the hazard is only
 documented, showing that it does grow, so the docstring is a claim with a
 test behind it rather than a warning nobody checked).
 
+As built:
+
+- `File.steps(max_steps=, timeout=, idle_timeout=)` and `for step in f:`.
+  `idle_timeout` is a bound the caller chooses, so it is consistent with
+  "a bare timeout does not end iteration."
+- `get()` drains queued step notifications on every call, which removes the
+  hazard rather than documenting it. The test checks that none are left
+  after a `get()`-only run.
+- `volstream.follow(path, selections=None)` opens and subscribes, to every
+  integer or float dataset by default.
+- `volstream.torch.StreamDataset` refuses to run in a DataLoader worker or
+  to be pickled into one, so it is `num_workers=0` only. A stream is one
+  ordered source, and each worker would be a separate subscriber receiving
+  every step. Its docstring says it applies no backpressure (see P3's open
+  item).
+
+Open: the connector declares `H5F_STEP_EOS` but never sets it, so a
+subscriber cannot tell a finished writer from a paused one. Iteration can
+end only on a bound the caller supplies. Ending `for step in f:` when the
+writer closes needs the reader side to turn the writer's departure from
+the group into an end-of-stream signal.
+
 ### P5 — CI and packaging · M
 
 Add the Python build to the existing na+sm CI job, which already builds

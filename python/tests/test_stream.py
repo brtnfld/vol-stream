@@ -11,8 +11,14 @@ ctest entry per mode) so every scenario gets a fresh transport.
   narrowing  The whole grid, delivered as int16 and filtered by a predicate:
              one step where everything matches, one where some rows do, and
              one where nothing does.
+  iterate    follow() and `for step in f.steps(max_steps=3)`: the
+             schema-driven path, run to completion.
+  getonly    Only get(), for every push of every step. Afterwards no step
+             notification may be left queued: get() drains them.
+  torch      StreamDataset through a DataLoader. Skipped (exit 77) if torch
+             is not installed.
 
-usage: test_stream.py <stream_writer executable> <column|narrowing>
+usage: test_stream.py <stream_writer executable> <column|narrowing|iterate|getonly|torch>
 """
 
 import os
@@ -164,14 +170,94 @@ class NarrowingTest(StreamTest):
         self.assert_writer_ok()
 
 
+def whole_grid(s):
+    return np.array([[value(s, r, c) for c in range(COLS)] for r in range(ROWS)], dtype=np.int32)
+
+
+class IterateTest(StreamTest):
+    mode = "narrowing"  # the writer commits steps 1..3 back to back
+
+    def test_follow_and_iterate(self):
+        self.wait_for("committed")
+        with volstream.follow(self.path) as f:
+            self.touch("ready")
+            seen = []
+            for step in f.steps(max_steps=3, timeout=30):
+                seen.append(step)
+            self.assertEqual(len(seen), 3, "iteration ended before max_steps")
+            for s, step in enumerate(seen, start=1):
+                np.testing.assert_array_equal(step["/grid"], whole_grid(s), err_msg=f"step {s}")
+            # A quiet stream ends iteration only on a bound the caller gave.
+            t0 = time.monotonic()
+            self.assertEqual(list(f.steps(idle_timeout=0.5)), [])
+            self.assertLess(time.monotonic() - t0, 3)
+        self.assertTrue(f.closed, "leaving the with block closed the file")
+        self.touch("done")
+        self.assertEqual(self.writer.wait(timeout=60), 0)
+
+
+class GetOnlyTest(StreamTest):
+    mode = "narrowing"
+
+    def test_get_only_leaves_no_notifications(self):
+        self.attach()
+        self.file.subscribe("/grid")
+        self.touch("ready")
+        self.wait_for("writes_done")
+        pushes = []
+        deadline = time.monotonic() + 30
+        while len(pushes) < 3 and time.monotonic() < deadline:
+            p = self.file.get(1000)
+            if p is not None:
+                pushes.append(p)
+        self.assertEqual([p.phys for p in pushes], sorted(p.phys for p in pushes))
+        self.assertEqual(len(pushes), 3, "a whole-grid subscription is one push per step")
+        for s, p in enumerate(pushes, start=1):
+            np.testing.assert_array_equal(p.data.reshape(ROWS, COLS), whole_grid(s))
+        self.assertIsNone(self.file.get(200))
+        self.assertIsNone(self.file._raw.wait_step_ready(0), "step notifications were left to accumulate")
+        self.assert_writer_ok()
+
+
+class TorchTest(StreamTest):
+    mode = "narrowing"
+
+    def test_dataloader(self):
+        import torch
+        from volstream.torch import StreamDataset
+
+        self.wait_for("committed")
+        ds = StreamDataset(self.path, "/grid", max_steps=3, timeout=30)
+        self.touch("ready")
+        batches = list(torch.utils.data.DataLoader(ds, batch_size=3, num_workers=0))
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(tuple(batches[0].shape), (3, ROWS, COLS))
+        expected = np.stack([whole_grid(s) for s in (1, 2, 3)])
+        np.testing.assert_array_equal(batches[0].numpy(), expected)
+        with self.assertRaises(TypeError):
+            import pickle
+
+            pickle.dumps(ds)
+        ds.close()
+        self.touch("done")
+        self.assertEqual(self.writer.wait(timeout=60), 0)
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     WRITER = sys.argv.pop(1)
     mode = sys.argv.pop(1)
-    cases = {"column": ColumnTest, "narrowing": NarrowingTest}
+    cases = {"column": ColumnTest, "narrowing": NarrowingTest, "iterate": IterateTest,
+             "getonly": GetOnlyTest, "torch": TorchTest}
     if mode not in cases:
         sys.exit(__doc__)
+    if mode == "torch":
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            print("torch is not installed; skipping")
+            sys.exit(77)
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(cases[mode])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)
