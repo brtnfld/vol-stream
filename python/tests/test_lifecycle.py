@@ -75,6 +75,13 @@ def consumer_break(path, sync):
 def consumer_interrupt(path, sync):
     import volstream
 
+    # CPython installs its KeyboardInterrupt handler only if SIGINT was not
+    # already ignored when it started, and a process launched from a
+    # non-interactive CI shell can inherit it ignored. This test is about
+    # the binding, not that environment, so install the handler explicitly.
+    print(f"  info  inherited SIGINT handler: {signal.getsignal(signal.SIGINT)}", flush=True)
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+
     f = volstream.open(path)
     f.subscribe("/grid")
     touch(sync, "ready")
@@ -183,6 +190,7 @@ def run(writer_exe, mode):
             rc = consumer.wait(timeout=30)
             check(rc == 0, f"consumer broke out early and exited without close() in {time.monotonic() - t0:.1f} s")
             touch(sync, "gone")
+            touch(sync, "done")  # the writer waits for it after its last step
             out, _ = writer.communicate(timeout=60)
             check(writer.returncode == 0, "writer finished every step after the consumer left")
             worst = float(out.split("max_commit_ms")[1].split()[0])
