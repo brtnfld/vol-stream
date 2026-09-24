@@ -27,6 +27,11 @@
  *              GCOLS ints per row, one row in step 0, then steps 1..3 each
  *              extend it by a row and write only that row (value r*100+c),
  *              the tail-only pattern of test/b_push_fanout.c.
+ *   types      writes "/rec" instead of "/grid": NREC records of
+ *              {int a; double b; char c[4]}, and a scalar double attribute
+ *              "/rec@scale", both rewritten every step through handles kept
+ *              open across steps. In step s, record i is {s*10+i, s+i*0.5,
+ *              "<s><i>"} and scale is s*0.25. Steps 1..2 follow step 0.
  *   block      then sets the Block queue policy with one slot of slack and
  *              commits steps 1..6 back to back, printing how long that took
  *              as "writer_ms <ms>". A reader that acks makes it wait.
@@ -35,7 +40,7 @@
  * "committed" after step 0 and "writes_done" after its last step, and waits
  * for "ready" (the reader has subscribed) and "done" (the reader has closed).
  *
- * usage: stream_writer <column|narrowing|lifecycle|idle|eos|block|grow> <file> <syncdir>
+ * usage: stream_writer <column|narrowing|lifecycle|idle|eos|block|grow|types> <file> <syncdir>
  */
 
 #include <stdio.h>
@@ -52,8 +57,16 @@
 #define LOCKSTEP 3
 #define LAST     7
 #define GCOLS    4
+#define NREC     3
 
-static char g_syncdir[512];
+typedef struct {
+    int    a;
+    double b;
+    char   c[4];
+} rec_t;
+
+static char  g_syncdir[512];
+static hid_t g_rec_type = H5I_INVALID_HID;
 
 static void
 sync_path(char *out, size_t len, const char *name)
@@ -168,10 +181,51 @@ done:
     return rc;
 }
 
+/* "/rec" and "/rec@scale", rewritten every step through open handles. */
+static int
+write_types_step(hid_t fid, hid_t *ds, hid_t *attr, int s)
+{
+    rec_t   recs[NREC];
+    double  scale = s * 0.25;
+    hsize_t n     = NREC;
+    int     i;
+
+    for (i = 0; i < NREC; i++) {
+        recs[i].a = s * 10 + i;
+        recs[i].b = s + i * 0.5;
+        snprintf(recs[i].c, sizeof(recs[i].c), "%d%d", s, i);
+    }
+    if (H5Fbegin_step(fid, 0, NULL, 0) < 0)
+        goto fail;
+    if (s == 0) {
+        hid_t str = H5Tcopy(H5T_C_S1), rt = H5Tcreate(H5T_COMPOUND, sizeof(rec_t));
+        hid_t space = H5Screate_simple(1, &n, NULL), scalar = H5Screate(H5S_SCALAR);
+
+        if (str < 0 || rt < 0 || space < 0 || scalar < 0 || H5Tset_size(str, 4) < 0 ||
+            H5Tinsert(rt, "a", HOFFSET(rec_t, a), H5T_NATIVE_INT) < 0 ||
+            H5Tinsert(rt, "b", HOFFSET(rec_t, b), H5T_NATIVE_DOUBLE) < 0 ||
+            H5Tinsert(rt, "c", HOFFSET(rec_t, c), str) < 0 ||
+            (*ds = H5Dcreate2(fid, "/rec", rt, space, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT)) < 0 ||
+            (*attr = H5Acreate2(*ds, "scale", H5T_NATIVE_DOUBLE, scalar, H5P_DEFAULT, H5P_DEFAULT)) < 0)
+            goto fail;
+        H5Tclose(str);
+        H5Sclose(space);
+        H5Sclose(scalar);
+        g_rec_type = rt;
+    }
+    if (H5Dwrite(*ds, g_rec_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, recs) < 0 ||
+        H5Awrite(*attr, H5T_NATIVE_DOUBLE, &scale) < 0 || H5Fend_step(fid) < 0)
+        goto fail;
+    return 0;
+fail:
+    fprintf(stderr, "stream_writer: FAIL types step %d\n", s);
+    return -1;
+}
+
 int
 main(int argc, char **argv)
 {
-    hid_t   vol_id, fapl, fid, space, ds = H5I_INVALID_HID;
+    hid_t   vol_id, fapl, fid, space, ds = H5I_INVALID_HID, attr = H5I_INVALID_HID;
     hsize_t dims[2] = {ROWS, COLS};
     const char *mode;
     int         s;
@@ -179,8 +233,8 @@ main(int argc, char **argv)
     if (argc != 4 || (strcmp(argv[1], "column") != 0 && strcmp(argv[1], "narrowing") != 0 &&
                       strcmp(argv[1], "lifecycle") != 0 && strcmp(argv[1], "idle") != 0 &&
                       strcmp(argv[1], "eos") != 0 && strcmp(argv[1], "block") != 0 &&
-                      strcmp(argv[1], "grow") != 0)) {
-        fprintf(stderr, "usage: %s <column|narrowing|lifecycle|idle|eos|block|grow> <file> <syncdir>\n",
+                      strcmp(argv[1], "grow") != 0 && strcmp(argv[1], "types") != 0)) {
+        fprintf(stderr, "usage: %s <column|narrowing|lifecycle|idle|eos|block|grow|types> <file> <syncdir>\n",
                 argv[0]);
         return 2;
     }
@@ -196,7 +250,9 @@ main(int argc, char **argv)
         return 1;
     }
 
-    if ((!strcmp(mode, "grow") ? write_grow_step(fid, &ds, 0) : write_step(fid, space, &ds, 0)) < 0)
+    if ((!strcmp(mode, "grow")    ? write_grow_step(fid, &ds, 0)
+         : !strcmp(mode, "types") ? write_types_step(fid, &ds, &attr, 0)
+                                  : write_step(fid, space, &ds, 0)) < 0)
         return 1;
     touch("committed");
     if (wait_for("ready", 60) < 0)
@@ -242,6 +298,11 @@ main(int argc, char **argv)
         printf("max_commit_ms %.1f\n", worst);
         fflush(stdout);
     }
+    else if (!strcmp(mode, "types")) {
+        for (s = 1; s <= 2; s++)
+            if (write_types_step(fid, &ds, &attr, s) < 0)
+                return 1;
+    }
     else if (!strcmp(mode, "grow")) {
         for (s = 1; s <= 3; s++)
             if (write_grow_step(fid, &ds, s) < 0)
@@ -274,6 +335,10 @@ main(int argc, char **argv)
     if (strcmp(mode, "eos") != 0)
         wait_for("done", 60);
 
+    if (attr >= 0)
+        H5Aclose(attr);
+    if (g_rec_type >= 0)
+        H5Tclose(g_rec_type);
     H5Dclose(ds);
     H5Sclose(space);
     H5Fclose(fid);

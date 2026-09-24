@@ -39,6 +39,7 @@
 #include <Python.h>
 #include <pythread.h>
 
+#include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -256,34 +257,189 @@ RawFile_close(RawFileObject *self, PyObject *Py_UNUSED(ignored))
 /* ---- schema ---- */
 
 typedef struct {
-    char       *path;
-    int         is_attr;
-    int         rank; /* -1 if not a simple dataspace */
-    hsize_t     dims[H5S_MAX_RANK];
-    const char *kind; /* "i", "u", "f", or NULL */
-    size_t      size;
-    const char *order;
+    char   *path;
+    int     is_attr;
+    int     rank; /* -1 if not a simple dataspace */
+    hsize_t dims[H5S_MAX_RANK];
+    char   *type_json; /* see describe_type() */
 } var_desc_t;
+
+/* A growable string, built under HDF5_BEGIN/END without touching Python. */
+typedef struct {
+    char  *buf;
+    size_t len, cap;
+    int    oom;
+} sbuf_t;
+
+static void
+sb_put(sbuf_t *b, const char *str, size_t n)
+{
+    if (b->oom)
+        return;
+    if (b->len + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap : 128;
+        char  *grown;
+
+        while (b->len + n + 1 > cap)
+            cap *= 2;
+        if (NULL == (grown = realloc(b->buf, cap))) {
+            b->oom = 1;
+            return;
+        }
+        b->buf = grown;
+        b->cap = cap;
+    }
+    memcpy(b->buf + b->len, str, n);
+    b->len += n;
+    b->buf[b->len] = '\0';
+}
+
+/* Append a string literal; its length is taken at compile time. */
+#define SB_LIT(b, lit) sb_put((b), (lit), sizeof(lit) - 1)
+
+static void
+sb_printf(sbuf_t *b, const char *fmt, ...)
+{
+    char    tmp[128];
+    va_list ap;
+    int     n;
+
+    va_start(ap, fmt);
+    n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    va_end(ap);
+    if (n > 0)
+        sb_put(b, tmp, (size_t)n < sizeof(tmp) ? (size_t)n : sizeof(tmp) - 1);
+}
+
+static void
+sb_json_string(sbuf_t *b, const char *str)
+{
+    const unsigned char *p;
+
+    SB_LIT(b, "\"");
+    for (p = (const unsigned char *)str; *p; p++) {
+        if (*p == '"' || *p == '\\') {
+            char esc[2] = {'\\', (char)*p};
+
+            sb_put(b, esc, 2);
+        }
+        else if (*p < 0x20)
+            sb_printf(b, "\\u%04x", *p);
+        else
+            sb_put(b, (const char *)p, 1);
+    }
+    SB_LIT(b, "\"");
+}
+
+/* Under HDF5_BEGIN/END. Describes type_id as JSON the Python layer turns
+ * into a NumPy dtype:
+ *   {"k":"i"|"u"|"f", "s":size, "o":"<"|">"}   integer or float
+ *   {"k":"S", "s":size}                        fixed-length string
+ *   {"k":"V", "s":size}                        opaque
+ *   {"k":"array", "dims":[...], "base":T}      array
+ *   {"k":"compound", "s":size, "members":[{"name":..., "offset":..., "type":T}, ...]}
+ *   {"k":null, "s":size}                       anything else (variable
+ *                                              length, reference, bitfield)
+ * An enum is described as its base integer type. */
+static void
+describe_type(hid_t t, sbuf_t *b, int depth)
+{
+    H5T_class_t cls  = H5Tget_class(t);
+    size_t      size = H5Tget_size(t);
+    const char *ord  = H5Tget_order(t) == H5T_ORDER_BE ? ">" : "<";
+
+    if (depth > 16) {
+        sb_printf(b, "{\"k\":null,\"s\":%zu}", size);
+        return;
+    }
+    switch (cls) {
+        case H5T_INTEGER:
+            sb_printf(b, "{\"k\":\"%s\",\"s\":%zu,\"o\":\"%s\"}",
+                      H5Tget_sign(t) == H5T_SGN_NONE ? "u" : "i", size, ord);
+            return;
+        case H5T_FLOAT:
+            sb_printf(b, "{\"k\":\"f\",\"s\":%zu,\"o\":\"%s\"}", size, ord);
+            return;
+        case H5T_STRING:
+            if (H5Tis_variable_str(t) > 0)
+                break;
+            sb_printf(b, "{\"k\":\"S\",\"s\":%zu}", size);
+            return;
+        case H5T_OPAQUE:
+            sb_printf(b, "{\"k\":\"V\",\"s\":%zu}", size);
+            return;
+        case H5T_ENUM: {
+            hid_t base = H5Tget_super(t);
+
+            if (base < 0)
+                break;
+            describe_type(base, b, depth + 1);
+            H5Tclose(base);
+            return;
+        }
+        case H5T_ARRAY: {
+            hsize_t adims[H5S_MAX_RANK];
+            int     r = H5Tget_array_ndims(t), i;
+            hid_t   base;
+
+            if (r < 0 || r > H5S_MAX_RANK || H5Tget_array_dims2(t, adims) < 0 || (base = H5Tget_super(t)) < 0)
+                break;
+            SB_LIT(b, "{\"k\":\"array\",\"dims\":[");
+            for (i = 0; i < r; i++)
+                sb_printf(b, "%s%llu", i ? "," : "", (unsigned long long)adims[i]);
+            SB_LIT(b, "],\"base\":");
+            describe_type(base, b, depth + 1);
+            SB_LIT(b, "}");
+            H5Tclose(base);
+            return;
+        }
+        case H5T_COMPOUND: {
+            int nm = H5Tget_nmembers(t), i;
+
+            if (nm < 0)
+                break;
+            sb_printf(b, "{\"k\":\"compound\",\"s\":%zu,\"members\":[", size);
+            for (i = 0; i < nm; i++) {
+                char  *name = H5Tget_member_name(t, (unsigned)i);
+                hid_t  mt   = H5Tget_member_type(t, (unsigned)i);
+                size_t off  = H5Tget_member_offset(t, (unsigned)i);
+
+                if (i)
+                    SB_LIT(b, ",");
+                SB_LIT(b, "{\"name\":");
+                sb_json_string(b, name ? name : "");
+                sb_printf(b, ",\"offset\":%zu,\"type\":", off);
+                if (mt >= 0) {
+                    describe_type(mt, b, depth + 1);
+                    H5Tclose(mt);
+                }
+                else
+                    sb_printf(b, "{\"k\":null,\"s\":0}");
+                SB_LIT(b, "}");
+                H5free_memory(name);
+            }
+            SB_LIT(b, "]}");
+            return;
+        }
+        default:
+            break;
+    }
+    sb_printf(b, "{\"k\":null,\"s\":%zu}", size);
+}
 
 /* Under HDF5_BEGIN/END. */
 static void
 describe_var(const H5F_stream_var_t *v, var_desc_t *d)
 {
-    H5T_class_t cls = H5Tget_class(v->type_id);
+    sbuf_t b = {NULL, 0, 0, 0};
 
     d->path    = strdup(v->path);
     d->is_attr = v->is_attr ? 1 : 0;
     d->rank    = H5Sget_simple_extent_ndims(v->space_id);
     if (d->rank > 0)
         H5Sget_simple_extent_dims(v->space_id, d->dims, NULL);
-    d->size  = H5Tget_size(v->type_id);
-    d->order = H5Tget_order(v->type_id) == H5T_ORDER_BE ? ">" : "<";
-    if (cls == H5T_INTEGER)
-        d->kind = H5Tget_sign(v->type_id) == H5T_SGN_NONE ? "u" : "i";
-    else if (cls == H5T_FLOAT)
-        d->kind = "f";
-    else
-        d->kind = NULL;
+    describe_type(v->type_id, &b, 0);
+    d->type_json = b.oom ? (free(b.buf), NULL) : b.buf;
 }
 
 static PyObject *
@@ -306,8 +462,11 @@ var_to_python(const var_desc_t *d)
         }
     if (!dims)
         return NULL;
-    type = d->kind ? Py_BuildValue("(sns)", d->kind, (Py_ssize_t)d->size, d->order)
-                   : Py_BuildValue("(OnO)", Py_None, (Py_ssize_t)d->size, Py_None);
+    if (!d->type_json) {
+        Py_DECREF(dims);
+        return PyErr_NoMemory();
+    }
+    type = PyUnicode_FromString(d->type_json);
     if (!type) {
         Py_DECREF(dims);
         return NULL;
@@ -379,8 +538,10 @@ RawFile_schema(RawFileObject *self, PyObject *args)
 
 done:
     Py_XDECREF(list);
-    for (i = 0; i < n; i++)
+    for (i = 0; i < n; i++) {
         free(descs[i].path);
+        free(descs[i].type_json);
+    }
     free(descs);
     return result;
 }
@@ -802,7 +963,7 @@ RawFile_get_path(RawFileObject *self, void *Py_UNUSED(closure))
 static PyMethodDef RawFile_methods[] = {
     {"close", (PyCFunction)RawFile_close, METH_NOARGS, "Close the file. Safe to call more than once."},
     {"schema", (PyCFunction)RawFile_schema, METH_VARARGS,
-     "schema(timeout_ms) -> (step, [(path, is_attr, dims, (kind, size, order))])"},
+     "schema(timeout_ms) -> (step, [(path, is_attr, dims, type_json)])"},
     {"subscribe", (PyCFunction)RawFile_subscribe, METH_VARARGS,
      "subscribe([(path, dims, start, count[, deflate]), ...]); start/count None for the whole extent"},
     {"subscribe_type", (PyCFunction)RawFile_subscribe_type, METH_VARARGS,

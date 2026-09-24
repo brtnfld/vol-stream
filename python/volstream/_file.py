@@ -1,6 +1,7 @@
 """The File API over the raw extension, and per-step reassembly."""
 
 import atexit
+import json
 import math
 import time
 import weakref
@@ -25,7 +26,7 @@ class Var(NamedTuple):
     """One object the stream carries, as the writer describes it."""
 
     path: str
-    dtype: Optional[np.dtype]  # None for types other than atomic int/float
+    dtype: Optional[np.dtype]  # None for variable-length, reference and similar types
     shape: tuple
     is_attr: bool
 
@@ -67,10 +68,29 @@ class Step:
         return f"<volstream.Step phys={self.phys} paths={sorted(self.arrays)}>"
 
 
-def _dtype(kind, size, order):
-    if kind is None:
-        return None
-    return np.dtype(f"{order}{kind}{size}")
+def _dtype(desc):
+    """A NumPy dtype for the extension's JSON type description, or None."""
+    k = desc.get("k")
+    if k in ("i", "u", "f"):
+        return np.dtype(f"{desc['o']}{k}{desc['s']}")
+    if k == "S":
+        return np.dtype(f"S{desc['s']}")
+    if k == "V":
+        return np.dtype(f"V{desc['s']}")
+    if k == "array":
+        base = _dtype(desc["base"])
+        return None if base is None else np.dtype((base, tuple(desc["dims"])))
+    if k == "compound":
+        names, formats, offsets = [], [], []
+        for m in desc["members"]:
+            t = _dtype(m["type"])
+            if t is None:
+                return None
+            names.append(m["name"])
+            formats.append(t)
+            offsets.append(m["offset"])
+        return np.dtype({"names": names, "formats": formats, "offsets": offsets, "itemsize": desc["s"]})
+    return None
 
 
 class _Subscription:
@@ -209,8 +229,8 @@ class File:
         """
         _, entries = self._raw.schema(timeout_ms)
         return {
-            path: Var(path, _dtype(*type_desc), tuple(dims) if dims is not None else None, is_attr)
-            for path, is_attr, dims, type_desc in entries
+            path: Var(path, _dtype(json.loads(type_json)), tuple(dims) if dims is not None else None, is_attr)
+            for path, is_attr, dims, type_json in entries
         }
 
     def subscribe(self, selections, timeout_ms=10000, deflate=None):
@@ -242,10 +262,12 @@ class File:
             var = schema.get(path)
             if var is None:
                 raise KeyError(f"{path!r} is not in the stream's schema")
-            if var.is_attr:
-                raise NotImplementedError(f"{path!r} is an attribute; only datasets can be subscribed")
             if var.dtype is None:
-                raise NotImplementedError(f"{path!r} is not an atomic integer or float type")
+                raise NotImplementedError(
+                    f"{path!r} has a type this binding cannot deliver (variable-length, reference, "
+                    "or bitfield)")
+            if var.is_attr and deflate is not None:
+                raise ValueError(f"{path!r} is an attribute; attributes cannot be delivered deflated")
             if var.shape is None:
                 raise NotImplementedError(f"{path!r} does not have a simple dataspace")
             if sel is None:

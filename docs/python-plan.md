@@ -403,8 +403,12 @@ supported, or depends on something outside this binding.
 
 ### Not supported
 
-- **Attributes, and types other than atomic integer or float** (compound,
-  string, enum, array). `subscribe()` raises `NotImplementedError`.
+- **Variable-length types, references and bitfields.** `subscribe()`
+  raises `NotImplementedError` for them: their pushed bytes are not plain
+  values a dtype can describe. Attributes, compound types (as structured
+  arrays, with HDF5's member offsets), fixed-length strings, enums (as their
+  base integer), array types and opaque types are supported. An attribute
+  cannot be delivered deflated.
 - **Per-subscriber precision beyond deflate.** `subscribe(deflate=level)`
   exposes the C API's `plists` argument for deflate, the one filter every
   HDF5 build has, with one chunk spanning the selection. Other filters
