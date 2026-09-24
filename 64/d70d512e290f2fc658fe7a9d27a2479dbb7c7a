@@ -1,0 +1,30 @@
+docs/user-guide.md
+  s_3816fb7b7c4a27::t_150279eb6a3da2 735
+python/tests/test_stream.py
+  s_3816fb7b7c4a27::t_5172672fcb798c 22-24,26,51,59,180-210,310
+src/tr_mercury.c
+  s_3816fb7b7c4a27::t_78bd1956ae27a0 488,1509-1517
+  s_3816fb7b7c4a27::t_6247f3207e69b9 486-487,489-491,2774-2785
+  s_3816fb7b7c4a27::t_57cb01c0719675 1518,2786
+docs/python-plan.md
+  s_3816fb7b7c4a27::t_150279eb6a3da2 218-222,265-266,429-435
+  s_3816fb7b7c4a27::t_efb2c78adc2a4b 436
+python/CMakeLists.txt
+  s_3816fb7b7c4a27::t_5172672fcb798c 85
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "64d70d512e290f2fc658fe7a9d27a2479dbb7c7a",
+  "prompts": {},
+  "sessions": {
+    "s_3816fb7b7c4a27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b5b5c72-aca3-496b-8412-0fb9ae85948c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
