@@ -1,0 +1,123 @@
+examples/narrowing_demo/narrow_subscriber.c
+  s_3816fb7b7c4a27::t_c0bb6b413fcdd1 183
+docs/user-guide.md
+  s_3816fb7b7c4a27::t_854fda0619bf74 323-330,898-906,1416,2112
+test/t_subvolume_strided.c
+  s_3816fb7b7c4a27::t_0df11dacf13f90 37-41,58-60,107-111,145-149,151-152,154,160,177,180-181,184-207,239-243,285-287,312-313,319-322,328-329
+test/t_schema.c
+  s_3816fb7b7c4a27::t_c0bb6b413fcdd1 238
+test/t_step_grouping.c
+  s_3816fb7b7c4a27::t_c0bb6b413fcdd1 273,377,410
+test/b_stream_grow.c
+  s_3816fb7b7c4a27::t_c0bb6b413fcdd1 250
+test/t_rendezvous_barrier.c
+  s_3816fb7b7c4a27::t_c0bb6b413fcdd1 126
+python/_volstream.c
+  s_3816fb7b7c4a27::t_5b4a77dbe6a12f 996-997
+  s_3816fb7b7c4a27::t_ca55a73c3bfc74 901-902,917-918,933-934,1124-1129
+test/b_detector_narrowing.c
+  s_3816fb7b7c4a27::t_c0bb6b413fcdd1 715
+python/tests/test_stream.py
+  s_3816fb7b7c4a27::t_d552ff8118f1cc 235,246
+src/H5VLstream.h
+  s_3816fb7b7c4a27::t_eb48781f58fabf 157-163,459-464
+  s_3816fb7b7c4a27::t_725a7a184d688d 540-547
+  s_3816fb7b7c4a27::t_78d7dcb33e12b8 571-573,576-593,597
+test/t_chunk_zerocopy.c
+  s_3816fb7b7c4a27::t_c0bb6b413fcdd1 152
+test/t_diaspora.c
+  s_3816fb7b7c4a27::t_cc98e7837a7a95 132,201,228,240
+src/tr_mercury.h
+  s_3816fb7b7c4a27::t_9bdc808f18d9b6 515-517
+  s_3816fb7b7c4a27::t_3e43ef97bf0fa5 239-247
+  s_3816fb7b7c4a27::t_a88e0735115f7a 523-524
+  s_3816fb7b7c4a27::t_128d6d404b4f99 266-270,274
+examples/heat_diffusion/heat_monitor.c
+  s_3816fb7b7c4a27::t_c0bb6b413fcdd1 173
+test/t_eos.c
+  s_3816fb7b7c4a27::t_c0bb6b413fcdd1 179,191
+test/t_subscribe.c
+  s_3816fb7b7c4a27::t_c0bb6b413fcdd1 176,229,266
+src/tr_diaspora.cpp
+  s_3816fb7b7c4a27::t_eed9451e2f9972 204,356-357,372-380,386-387,396-397,856-857,860-868,899,1184-1185,1221-1222
+test/t_precision_dual.c
+  s_3816fb7b7c4a27::t_c0bb6b413fcdd1 209
+test/t_subvolume_grow.c
+  s_3816fb7b7c4a27::t_c0bb6b413fcdd1 284
+test/b_stream_grow_tail.c
+  s_3816fb7b7c4a27::t_c0bb6b413fcdd1 250
+examples/reaction_diffusion/rd_monitor.c
+  s_3816fb7b7c4a27::t_c0bb6b413fcdd1 174
+test/b_push_fanout.c
+  s_3816fb7b7c4a27::t_c0bb6b413fcdd1 316
+test/t_precision.c
+  s_3816fb7b7c4a27::t_c0bb6b413fcdd1 149
+test/t_subvolume_nd.c
+  s_3816fb7b7c4a27::t_c0bb6b413fcdd1 128
+src/H5VLstream.c
+  s_3816fb7b7c4a27::t_732a3407ada8f0 655,3309,3321-3322,3430-3431
+  s_3816fb7b7c4a27::t_0a3c499cbb5691 3110,3120-3138
+  s_3816fb7b7c4a27::t_7a1f4e4d9db163 13389
+  s_3816fb7b7c4a27::t_ffb95dab82225a 13405
+  s_3816fb7b7c4a27::t_339b2455ebdf3e 11616-11617
+  s_3816fb7b7c4a27::t_26caefab244907 1056
+  s_3816fb7b7c4a27::t_fb08c8e84d0e7c 13376-13386,13393-13394
+  s_3816fb7b7c4a27::t_eb48781f58fabf 2940-2942,3079-3082
+test/t_chunk_shape_split.c
+  s_3816fb7b7c4a27::t_766338ace6ca3b 28-32,47-51,88,90-93,96,124-128,130-132,134,141-142,151-152,165-186,251-265,280-282,310-311,327-334
+  s_3816fb7b7c4a27::t_c0bb6b413fcdd1 159
+python/volstream/__init__.py
+  s_3816fb7b7c4a27::t_fa136448716214 6-17,20-32
+src/tr_mercury.c
+  s_3816fb7b7c4a27::t_fc146dfc87e07a 212
+  s_3816fb7b7c4a27::t_9f89a4cf8970b3 3342
+  s_3816fb7b7c4a27::t_d6cf8a18e942ff 3192,3194,3197,3199,3201-3203,3207,3210-3211
+  s_3816fb7b7c4a27::t_98ef390be35c70 3178-3179
+  s_3816fb7b7c4a27::t_98275fcb1e8d26 3295-3296
+  s_3816fb7b7c4a27::t_f31285de0c41a7 329
+  s_3816fb7b7c4a27::t_8b10e49e57b852 3126,3129-3130
+  s_3816fb7b7c4a27::t_46721ba58775cf 3337
+  s_3816fb7b7c4a27::t_c26812570d29a2 882
+  s_3816fb7b7c4a27::t_72166cf5e46b2e 907
+  s_3816fb7b7c4a27::t_dba063b0e2a209 3287
+  s_3816fb7b7c4a27::t_a832e92c599149 3428-3429
+  s_3816fb7b7c4a27::t_a6e150e69f137d 206-208
+  s_3816fb7b7c4a27::t_0db42138216685 3380-3381
+  s_3816fb7b7c4a27::t_bef7f3e049b68a 2819
+  s_3816fb7b7c4a27::t_4ed6bae373e964 3055-3057
+  s_3816fb7b7c4a27::t_89ced220bc3551 1514
+  s_3816fb7b7c4a27::t_5e8ee2acc90839 2794
+docs/python-plan.md
+  s_3816fb7b7c4a27::t_854fda0619bf74 454-455
+  s_3816fb7b7c4a27::t_2adf39b269f93c 385-392
+docs/dev-plan.md
+  s_3816fb7b7c4a27::t_2adf39b269f93c 1214-1222
+python/volstream/_file.py
+  s_3816fb7b7c4a27::t_d068448ab9c970 15-24,51-53,65-70,73,75,79,125,149-163,170,196,218-224,417,423,484,487,535,538
+examples/detector_pipeline/pipeline_consumer.c
+  s_3816fb7b7c4a27::t_c0bb6b413fcdd1 447,516
+test/t_strided_write.c
+  s_3816fb7b7c4a27::t_c0bb6b413fcdd1 130
+README.md
+  s_3816fb7b7c4a27::t_854fda0619bf74 120
+test/t_predicate.c
+  s_3816fb7b7c4a27::t_ac579d15608dc1 108,256,258,266,348-355
+  s_3816fb7b7c4a27::t_8df3f7dcac286c 356,432-438
+  s_3816fb7b7c4a27::t_a01168e0e4fe78 357
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "bd26a189b9e155a9ff995709feafb789e8a0b8f1",
+  "prompts": {},
+  "sessions": {
+    "s_3816fb7b7c4a27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b5b5c72-aca3-496b-8412-0fb9ae85948c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
