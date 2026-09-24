@@ -60,6 +60,7 @@ option(VOL_STREAM_BUILD_TESTS "Build the test programs" ON)
 set(VOL_STREAM_EXTRA_PLUGIN_PATH "" CACHE STRING
   "Colon-separated HDF5 filter plugin directories appended to HDF5_PLUGIN_PATH for tests")
 option(VOL_STREAM_BUILD_EXAMPLES "Build the example programs" ON)
+option(VOL_STREAM_BUILD_PYTHON "Build the volstream Python package (needs Python >= 3.10 headers)" OFF)
 
 # ---------------------------------------------------------------------------
 # flatcc -- manifest framing (M2)
@@ -628,6 +629,10 @@ if(VOL_STREAM_BUILD_EXAMPLES)
   add_subdirectory(examples)
 endif()
 
+if(VOL_STREAM_BUILD_PYTHON)
+  add_subdirectory(python)
+endif()
+
 install(TARGETS vol_stream LIBRARY DESTINATION lib)
 install(FILES src/H5VLstream.h DESTINATION include)
 
@@ -642,5 +647,6 @@ message(STATUS "  vfd swmr:        ${VOL_STREAM_HAVE_VFD_SWMR} (examples/vfd_swm
 message(STATUS "  logging:         ${VOL_STREAM_ENABLE_LOGGING}")
 message(STATUS "  tests:           ${VOL_STREAM_BUILD_TESTS}")
 message(STATUS "  examples:        ${VOL_STREAM_BUILD_EXAMPLES}")
+message(STATUS "  python:          ${VOL_STREAM_BUILD_PYTHON}")
 message(STATUS "  h5sign:          ${H5SIGN_EXECUTABLE}")
 message(STATUS "")

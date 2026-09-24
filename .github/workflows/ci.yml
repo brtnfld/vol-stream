@@ -219,7 +219,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build zlib1g-dev \
             libfabric-dev libjson-c-dev libboost-dev libcereal-dev pkg-config autoconf automake libtool \
-            uuid-dev pandoc
+            uuid-dev pandoc python3-dev
 
       # HDF5_ENABLE_ZLIB_SUPPORT=ON is required, not cosmetic: HDF5 defaults
       # it OFF, and t_precision/t_precision_dual (M8.5 per-subscriber
@@ -363,6 +363,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DVOL_STREAM_ENABLE_MERCURY=ON \
             -DVOL_STREAM_ENABLE_BAKE=ON \
+            -DVOL_STREAM_BUILD_PYTHON=ON \
             -DVOL_STREAM_H5DIFF=$PWD/hdf5-install/bin/h5diff
           cmake --build build --parallel
 
