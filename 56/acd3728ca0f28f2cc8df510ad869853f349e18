@@ -1,0 +1,45 @@
+docs/user-guide.md
+  s_3816fb7b7c4a27::t_9ca5d27e1cdb83 752-774
+test/CMakeLists.txt
+  s_3816fb7b7c4a27::t_efc70ab82517e8 3,14-16
+  s_3816fb7b7c4a27::t_10c61ab25c9c9b 126-135
+src/tr_diaspora.cpp
+  s_3816fb7b7c4a27::t_4f9619c36acbab 1338-1343
+test/t_config.c
+  s_3816fb7b7c4a27::t_6ae61f1ab2f319 1-186
+docs/dev-plan.md
+  s_3816fb7b7c4a27::t_9ca5d27e1cdb83 1235-1243,1296-1301
+test/t_config_na.c
+  s_3816fb7b7c4a27::t_c08f50620e3f22 1-69
+src/H5VLstream.c
+  s_3816fb7b7c4a27::t_52bd21e5f26b60 605,636
+  s_3816fb7b7c4a27::t_6cd78886bf89f3 1779
+  s_3816fb7b7c4a27::t_36d363734c40b7 348-356,1552-1553,1699,1701-1703,1719,1723-1724,1772,1824,2051,2053,2063-2066,2071,2094,4364,4373-4375,6734,6838,7349,7355-7357,7944,8054
+  s_3816fb7b7c4a27::t_9d673e6b0914db 13392,13406-13414
+  s_3816fb7b7c4a27::t_ba43b3d496e9bf 1339-1341,1346-1390,8920,8963-8982,9018-9019,9056-9085,9123-9125,9129,9141-9181,11014,11090,13376-13391,13393-13405,13415
+  s_3816fb7b7c4a27::t_fb877fdb9c70aa 13416
+src/H5VLstream.h
+  s_3816fb7b7c4a27::t_50e0e7c40a0af1 208-230,232-234
+  s_3816fb7b7c4a27::t_1e066c3b0aadb7 947-977
+src/tr_mercury.c
+  s_3816fb7b7c4a27::t_6cd78886bf89f3 119,134-137,556
+  s_3816fb7b7c4a27::t_4f9619c36acbab 122-123,125,141-142,1632,1713-1719,2955
+src/tr_mercury.h
+  s_3816fb7b7c4a27::t_6cd78886bf89f3 239-243
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "56acd3728ca0f28f2cc8df510ad869853f349e18",
+  "prompts": {},
+  "sessions": {
+    "s_3816fb7b7c4a27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b5b5c72-aca3-496b-8412-0fb9ae85948c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
