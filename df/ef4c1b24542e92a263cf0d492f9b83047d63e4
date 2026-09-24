@@ -1,0 +1,23 @@
+.github/workflows/ci.yml
+  s_3816fb7b7c4a27::t_56a7adcfff4912 310-316,320
+.github/patches/flock-provider-group-before-init.patch
+  s_3816fb7b7c4a27::t_234550cec9a4c0 32,48,66
+  s_3816fb7b7c4a27::t_d163138c9c6427 1-3,18-31,33-47,49-65,67-70
+  s_3816fb7b7c4a27::t_a35a7ed4d12c25 4-17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "dfef4c1b24542e92a263cf0d492f9b83047d63e4",
+  "prompts": {},
+  "sessions": {
+    "s_3816fb7b7c4a27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b5b5c72-aca3-496b-8412-0fb9ae85948c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
