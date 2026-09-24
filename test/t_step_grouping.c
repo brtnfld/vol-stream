@@ -270,7 +270,7 @@ run_reader(void)
             void    *buf  = NULL;
             size_t   size = 0;
 
-            if (H5Fget_subscribed_data(fid, 0, &data_phys, &path, &buf, &size, &elem_start, &elem_count) < 0)
+            if (H5Fget_subscribed_data(fid, 0, &data_phys, &path, &buf, &size, &elem_start, &elem_count, NULL) < 0)
                 break;
             free(path);
 
@@ -374,7 +374,7 @@ run_late_reader(void)
             void    *buf  = NULL;
             size_t   size = 0;
 
-            if (H5Fget_subscribed_data(fid, 0, &data_phys, &path, &buf, &size, &elem_start, &elem_count) < 0)
+            if (H5Fget_subscribed_data(fid, 0, &data_phys, &path, &buf, &size, &elem_start, &elem_count, NULL) < 0)
                 break;
             free(path);
             free(buf);
@@ -407,7 +407,7 @@ run_late_reader(void)
             void    *buf  = NULL;
             size_t   size = 0;
 
-            if (H5Fget_subscribed_data(fid, 0, &data_phys, &path, &buf, &size, &elem_start, &elem_count) < 0)
+            if (H5Fget_subscribed_data(fid, 0, &data_phys, &path, &buf, &size, &elem_start, &elem_count, NULL) < 0)
                 break;
             free(path);
             if (data_phys != phys) {

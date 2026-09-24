@@ -1211,6 +1211,15 @@ matches the code. Each item is documented for users in
 - **A test-only fault hook.** `VOL_STREAM_TEST_DROP_PUSH=<k>` makes a writer
   skip its k-th push while still announcing the step, the only way to reach a
   subscriber's lost-push handling in a healthy run.
+- **A subscriber is told when a narrowing fell back.** Every push carries
+  `H5VL_STREAM_DELIVERY_*` bits (a wire change), returned through a new last
+  argument of `H5Fget_subscribed_data()` (an API change; NULL ignores it): the
+  selection sent as its bounding span, a predicate not evaluated, matches
+  coalesced to their span, or a type conversion declined. `t_predicate` and
+  `t_subvolume_strided` pin exact pushes at 0 and each fallback's bit.
+- **A chunk shape of any rank is honored** as its element count per push,
+  where rank 2 or more used to be ignored. `t_chunk_shape_split` covers a
+  (2, 8) chunk on an 8x8 dataset.
 
 ## Stretch goals
 

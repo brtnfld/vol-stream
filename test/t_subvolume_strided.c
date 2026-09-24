@@ -34,6 +34,11 @@
  *   2. nothing else arrives -- which is the actual improvement, and is
  *      measured in bytes rather than asserted.
  *
+ * And when the selection cannot be described -- /tall's column is TALL runs,
+ * more than the writer's run budget -- the fallback is the bounding span, and
+ * the push must say so: H5VL_STREAM_DELIVERY_SELECTION_SPAN, while /grid's
+ * exact column carries no flag at all.
+ *
  * Two processes, na+sm, same shape as test/t_subvolume_nd.c.
  */
 
@@ -49,6 +54,9 @@
 #define ROWS 6
 #define COLS 8
 #define COL  3 /* the subscribed column -- not 0, so a wrong stride shows up */
+
+/* /tall: TALL x 2, column 1 subscribed -- TALL runs, past the run budget. */
+#define TALL 100
 
 #define FNAME "t_subvolume_strided.h5"
 
@@ -96,7 +104,11 @@ run_reader(void)
     hsize_t dims[2]   = {ROWS, COLS};
     hsize_t start[2]  = {0, COL};
     hsize_t count[2]  = {ROWS, 1}; /* one column: ROWS separate flat runs */
-    int     seen[ROWS];
+    hsize_t tdims[2]  = {TALL, 2};
+    hsize_t tstart[2] = {0, 1};
+    hsize_t tcount[2] = {TALL, 1};
+    hid_t   tspace;
+    int     seen[ROWS], tall_pushes = 0;
     size_t  total_elems = 0, total_bytes = 0;
     int     i, rc = 0;
 
@@ -130,16 +142,22 @@ run_reader(void)
         printf("reader: FAIL build column selection\n");
         return 1;
     }
+    if ((tspace = H5Screate_simple(2, tdims, NULL)) < 0 ||
+        H5Sselect_hyperslab(tspace, H5S_SELECT_SET, tstart, NULL, tcount, NULL) < 0) {
+        printf("reader: FAIL build /tall selection\n");
+        return 1;
+    }
     {
-        const char *paths[1]  = {"/grid"};
-        const hid_t spaces[1] = {space};
+        const char *paths[2]  = {"/grid", "/tall"};
+        const hid_t spaces[2] = {space, tspace};
 
-        if (H5Fsubscribe(fid, 1, paths, spaces, NULL) < 0) {
+        if (H5Fsubscribe(fid, 2, paths, spaces, NULL) < 0) {
             printf("reader: FAIL subscribe\n");
             return 1;
         }
     }
     H5Sclose(space);
+    H5Sclose(tspace);
 
     touch_sentinel(READY_SENTINEL);
 
@@ -156,10 +174,36 @@ run_reader(void)
         char    *path = NULL;
         void    *buf  = NULL;
         size_t   size = 0;
+        uint32_t delivery = 0;
         uint64_t k;
 
-        if (H5Fget_subscribed_data(fid, 500, &phys, &path, &buf, &size, &elem_start, &elem_count) < 0)
+        if (H5Fget_subscribed_data(fid, 500, &phys, &path, &buf, &size, &elem_start, &elem_count, &delivery) <
+            0)
             break;
+
+        if (path && strcmp(path, "/tall") == 0) {
+            /* Too fragmented to describe: the writer declines the selection
+             * and sends the bounding span, and must say it did. */
+            tall_pushes++;
+            if (delivery != H5VL_STREAM_DELIVERY_SELECTION_SPAN) {
+                printf("  FAIL  /tall push [%llu, +%llu) has delivery flags 0x%x, expected SELECTION_SPAN "
+                       "(0x%x)\n",
+                       (unsigned long long)elem_start, (unsigned long long)elem_count, delivery,
+                       H5VL_STREAM_DELIVERY_SELECTION_SPAN);
+                rc = 1;
+            }
+            else
+                printf("  ok    a %d-run selection falls back to its bounding span (%llu elements), and the "
+                       "push says SELECTION_SPAN\n",
+                       TALL, (unsigned long long)elem_count);
+            free(path);
+            free(buf);
+            continue;
+        }
+        if (delivery != 0) {
+            printf("  FAIL  /grid column push has delivery flags 0x%x, expected 0 (exact)\n", delivery);
+            rc = 1;
+        }
 
         total_elems += (size_t)elem_count;
         total_bytes += size;
@@ -190,6 +234,11 @@ run_reader(void)
 
         free(path);
         free(buf);
+    }
+
+    if (tall_pushes != 1) {
+        printf("  FAIL  got %d /tall pushes, expected 1 (the bounding span)\n", tall_pushes);
+        rc = 1;
     }
 
     /* 1. Nothing the subscriber asked for may be missing. */
@@ -233,9 +282,9 @@ run_reader(void)
 static int
 run_writer(void)
 {
-    hid_t   vol_id, fapl, fid, space, ds;
-    hsize_t dims[2] = {ROWS, COLS};
-    int     vals[ROWS * COLS];
+    hid_t   vol_id, fapl, fid, space, ds, tspace, tds;
+    hsize_t dims[2] = {ROWS, COLS}, tdims[2] = {TALL, 2};
+    int     vals[ROWS * COLS], tvals[TALL * 2];
     int     r, c;
 
     if ((vol_id = H5VL_stream_register()) < 0) {
@@ -260,17 +309,24 @@ run_writer(void)
     for (r = 0; r < ROWS; r++)
         for (c = 0; c < COLS; c++)
             vals[r * COLS + c] = val_at(r, c);
+    for (r = 0; r < TALL * 2; r++)
+        tvals[r] = r;
 
     /* One whole-dataset write: the narrowing has to come from the
      * subscription, not from how the writer decomposed its own I/O. */
     if (H5Fbegin_step(fid, 0, NULL, 0) < 0 || (space = H5Screate_simple(2, dims, NULL)) < 0 ||
         (ds = H5Dcreate2(fid, "/grid", H5T_NATIVE_INT, space, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT)) < 0 ||
-        H5Dwrite(ds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, vals) < 0 || H5Fend_step(fid) < 0) {
+        H5Dwrite(ds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, vals) < 0 ||
+        (tspace = H5Screate_simple(2, tdims, NULL)) < 0 ||
+        (tds = H5Dcreate2(fid, "/tall", H5T_NATIVE_INT, tspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT)) < 0 ||
+        H5Dwrite(tds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, tvals) < 0 || H5Fend_step(fid) < 0) {
         printf("writer: FAIL write step\n");
         return 1;
     }
     H5Dclose(ds);
     H5Sclose(space);
+    H5Dclose(tds);
+    H5Sclose(tspace);
 
     touch_sentinel(WRITES_DONE_SENTINEL);
 

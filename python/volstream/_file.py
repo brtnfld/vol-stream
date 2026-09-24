@@ -12,6 +12,16 @@ import numpy as np
 from . import _volstream
 from ._volstream import Error
 
+# What each narrowing fallback means; see Push.delivery.
+DELIVERY_SELECTION_SPAN = _volstream.DELIVERY_SELECTION_SPAN
+DELIVERY_PREDICATE_UNEVALUATED = _volstream.DELIVERY_PREDICATE_UNEVALUATED
+DELIVERY_PREDICATE_SPAN = _volstream.DELIVERY_PREDICATE_SPAN
+DELIVERY_TYPE_NATIVE = _volstream.DELIVERY_TYPE_NATIVE
+_DELIVERY_PREDICATE = DELIVERY_PREDICATE_UNEVALUATED | DELIVERY_PREDICATE_SPAN
+
+_TESTS = {"<": np.less, "<=": np.less_equal, ">": np.greater, ">=": np.greater_equal, "==": np.equal,
+          "!=": np.not_equal}
+
 _OPS = {
     "<": _volstream.PRED_LT,
     "<=": _volstream.PRED_LE,
@@ -38,6 +48,9 @@ class Push(NamedTuple):
     path: str
     start: int  # flat element index of data[0] in the whole object
     data: np.ndarray  # 1-D
+    # DELIVERY_* bits: which narrowing the writer could not apply exactly to
+    # this push, so it may hold more than was asked for. 0 means exact.
+    delivery: int = 0
 
 
 class Step:
@@ -49,14 +62,21 @@ class Step:
     mask marks the elements that did not arrive. That happens with a predicate
     subscription, with a writer that wrote only part of the object this step,
     and if a push was lost.
+
+    delivery maps each path to the DELIVERY_* bits of its pushes, OR'd: 0
+    when the writer applied every narrowing exactly. The arrays are the same
+    either way -- elements outside the selection are dropped, and a predicate
+    the writer could not apply exactly is applied here -- so this says only
+    how much more than necessary crossed the wire.
     """
 
-    __slots__ = ("phys", "wall_time_ns", "arrays")
+    __slots__ = ("phys", "wall_time_ns", "arrays", "delivery")
 
-    def __init__(self, phys, wall_time_ns, arrays):
+    def __init__(self, phys, wall_time_ns, arrays, delivery=None):
         self.phys = phys
         self.wall_time_ns = wall_time_ns
         self.arrays = arrays
+        self.delivery = delivery if delivery is not None else {}
 
     def __getitem__(self, path):
         return self.arrays[path]
@@ -102,6 +122,7 @@ class _Subscription:
         self.dims = var.shape
         self.dtype = var.dtype
         self.native_dtype = var.dtype  # what the writer sends without narrowing
+        self.pred = None  # (op, value) from subscribe_predicate()
         self.start = tuple(start)
         self.count = tuple(count)
         self.strides = tuple(math.prod(self.dims[k + 1 :]) for k in range(len(self.dims)))
@@ -125,12 +146,28 @@ class _Subscription:
             f"neither {self.dtype} nor {self.native_dtype}"
         )
 
+    def _matches(self, push):
+        """Which of a push's elements satisfy the predicate, for a push the
+        writer could not filter exactly. Same rules as the writer: compared
+        in the data's own class, a float constant truncated toward zero
+        against integer data."""
+        if self.pred is None:
+            return np.ones(len(push.data), dtype=bool)
+        op, value = self.pred
+        if push.data.dtype.kind in "iu" and isinstance(value, float):
+            value = math.trunc(value)
+        try:
+            return np.asarray(_TESTS[op](push.data, value), dtype=bool)
+        except TypeError:  # not a type a value test applies to: keep it all, as the writer did
+            return np.ones(len(push.data), dtype=bool)
+
     def assemble(self, pushes):
         if not self.dims:  # scalar
             return pushes[-1].data.reshape(())
 
         if (
             len(pushes) == 1
+            and not pushes[0].delivery & _DELIVERY_PREDICATE
             and self.contiguous
             and pushes[0].start == self.flat_first
             and len(pushes[0].data) == self.nelem
@@ -156,7 +193,7 @@ class _Subscription:
                 local.append(coord)
             index = tuple(c[keep] for c in local)
             out[index] = p.data[keep]
-            got[index] = True
+            got[index] = self._matches(p)[keep] if p.delivery & _DELIVERY_PREDICATE else True
         if got.all():
             return out
         return np.ma.MaskedArray(out, mask=~got)
@@ -176,6 +213,13 @@ def _close_all():
             f.close()
         except Exception:
             pass
+
+
+def _or_all(bits):
+    out = 0
+    for b in bits:
+        out |= b
+    return out
 
 
 def _check_expected(expected, actual):
@@ -370,12 +414,13 @@ class File:
         matches sends nothing for path; one where some elements match arrives
         as a masked array.
         """
-        self._sub(path)
+        sub = self._sub(path)
         if op not in _OPS:
             raise ValueError(f"op must be one of {sorted(_OPS)}, not {op!r}")
         if isinstance(value, np.generic):
             value = value.item()
         self._raw.subscribe_predicate(path, _OPS[op], value)
+        sub.pred = (op, value)
 
     def get(self, timeout_ms=0):
         """Return the next raw Push, or None if none arrives within timeout_ms.
@@ -436,9 +481,10 @@ class File:
             if p.path in self._subs:
                 by_path.setdefault(p.path, []).append(p)
         arrays = {path: self._subs[path].assemble(plist) for path, plist in by_path.items()}
+        delivery = {path: _or_all(p.delivery for p in plist) for path, plist in by_path.items()}
         if self.backpressure:
             self._raw.ack(phys)
-        return Step(phys, wall_ns, arrays)
+        return Step(phys, wall_ns, arrays, delivery)
 
     @property
     def end_of_stream(self):
@@ -486,10 +532,10 @@ class File:
         return sub
 
     def _push(self, item):
-        phys, path, start, count, buf = item
+        phys, path, start, count, buf, delivery = item
         sub = self._subs.get(path)
         data = sub.values(buf, count) if sub else np.frombuffer(buf, dtype=np.uint8)
-        return Push(phys, path, start, data)
+        return Push(phys, path, start, data, delivery)
 
     def _verify_expected(self):
         # A step has committed, so the schema exists. If the writer cannot be

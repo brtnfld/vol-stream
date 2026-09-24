@@ -313,7 +313,7 @@ run_reader(int idx)
         size_t   size = 0;
 
         if (H5Fget_subscribed_data(fid, 20000 /* 20s */, &phys, &path, &buf, &size, &elem_start,
-                                    &elem_count) < 0) {
+                                    &elem_count, NULL) < 0) {
             printf("reader %d: FAIL subscribed data at step %d (timed out)\n", idx, s);
             rc = 1;
             break;

@@ -712,7 +712,7 @@ run_subscriber(int idx, int scene)
         void    *buf   = NULL;
         size_t   size  = 0;
 
-        if (H5Fget_subscribed_data(fid, 1500, &phys, &rpath, &buf, &size, &elem_start, &elem_count) < 0) {
+        if (H5Fget_subscribed_data(fid, 1500, &phys, &rpath, &buf, &size, &elem_start, &elem_count, NULL) < 0) {
             if (exists(g_writer_done_sentinel)) {
                 if (drained)
                     break;

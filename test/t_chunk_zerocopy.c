@@ -149,7 +149,7 @@ run_reader(void)
 
     touch_sentinel(READY_SENTINEL);
 
-    if (H5Fget_subscribed_data(fid, 10000, &phys, &path, &buf, &size, &elem_start, &elem_count) < 0) {
+    if (H5Fget_subscribed_data(fid, 10000, &phys, &path, &buf, &size, &elem_start, &elem_count, NULL) < 0) {
         printf("  FAIL  never received pushed data for /chunked\n");
         rc = 1;
     }

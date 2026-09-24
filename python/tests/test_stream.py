@@ -232,6 +232,7 @@ class NarrowingTest(StreamTest):
         self.assertNotIsInstance(a, np.ma.MaskedArray)
         self.assertEqual(a.dtype, np.dtype("int16"))
         np.testing.assert_array_equal(a, full)
+        self.assertEqual(step.delivery["/grid"], 0, "an exact narrowing was reported as a fallback")
 
         # Step 2: rows 0-2 (20000..20207) match, rows 3-5 do not.
         step = self.file.next_step(5000)
@@ -242,6 +243,7 @@ class NarrowingTest(StreamTest):
         self.assertFalse(a.mask[:3].any(), "matching rows were masked")
         self.assertTrue(a.mask[3:].all(), "non-matching rows were not masked")
         np.testing.assert_array_equal(a.data[:3], full[:3] + 10000)
+        self.assertEqual(step.delivery["/grid"], 0, "an exact predicate was reported as a fallback")
 
         # Step 3: 30000..30507, nothing matches, so nothing is sent.
         step = self.file.next_step(5000)

@@ -898,7 +898,8 @@ RawFile_get(RawFileObject *self, PyObject *args)
     uint64_t           deadline, t0, phys = 0, elem_start = 0, elem_count = 0;
     char              *path = NULL;
     void              *buf  = NULL;
-    size_t             size = 0;
+    size_t             size     = 0;
+    uint32_t           delivery = 0;
     herr_t             status;
     PyObject          *pybuf, *result;
 
@@ -913,7 +914,8 @@ RawFile_get(RawFileObject *self, PyObject *args)
             slice = POLL_MS;
         t0 = now_ms();
         HDF5_BEGIN
-        status = H5Fget_subscribed_data(self->fid, slice, &phys, &path, &buf, &size, &elem_start, &elem_count);
+        status = H5Fget_subscribed_data(self->fid, slice, &phys, &path, &buf, &size, &elem_start, &elem_count,
+                                        &delivery);
         H5Eclear2(H5E_DEFAULT);
         HDF5_END
         if (status >= 0)
@@ -928,8 +930,8 @@ RawFile_get(RawFileObject *self, PyObject *args)
         free(path);
         return NULL;
     }
-    result = Py_BuildValue("(KsKKN)", (unsigned long long)phys, path, (unsigned long long)elem_start,
-                           (unsigned long long)elem_count, pybuf);
+    result = Py_BuildValue("(KsKKNI)", (unsigned long long)phys, path, (unsigned long long)elem_start,
+                           (unsigned long long)elem_count, pybuf, (unsigned int)delivery);
     free(path);
     return result;
 }
@@ -991,7 +993,8 @@ static PyMethodDef RawFile_methods[] = {
     {"wait_step_ready", (PyCFunction)RawFile_wait_step_ready, METH_VARARGS,
      "wait_step_ready(timeout_ms) -> (physical_step, wall_time_ns) or None on timeout"},
     {"get", (PyCFunction)RawFile_get, METH_VARARGS,
-     "get(timeout_ms) -> (physical_step, path, elem_start, elem_count, Buffer) or None on timeout"},
+     "get(timeout_ms) -> (physical_step, path, elem_start, elem_count, Buffer, delivery) or None on timeout; "
+     "delivery is the DELIVERY_* bits for that push"},
     {"ack", (PyCFunction)RawFile_ack, METH_VARARGS,
      "ack(physical_step) -> bool; tell the writer this step was consumed (best-effort)"},
     {"end_of_stream", (PyCFunction)RawFile_end_of_stream, METH_NOARGS,
@@ -1118,7 +1121,12 @@ PyInit__volstream(void)
         PyModule_AddIntConstant(m, "PRED_GT", H5VL_STREAM_PRED_GT) < 0 ||
         PyModule_AddIntConstant(m, "PRED_GE", H5VL_STREAM_PRED_GE) < 0 ||
         PyModule_AddIntConstant(m, "PRED_EQ", H5VL_STREAM_PRED_EQ) < 0 ||
-        PyModule_AddIntConstant(m, "PRED_NE", H5VL_STREAM_PRED_NE) < 0) {
+        PyModule_AddIntConstant(m, "PRED_NE", H5VL_STREAM_PRED_NE) < 0 ||
+        PyModule_AddIntConstant(m, "DELIVERY_SELECTION_SPAN", H5VL_STREAM_DELIVERY_SELECTION_SPAN) < 0 ||
+        PyModule_AddIntConstant(m, "DELIVERY_PREDICATE_UNEVALUATED",
+                                H5VL_STREAM_DELIVERY_PREDICATE_UNEVALUATED) < 0 ||
+        PyModule_AddIntConstant(m, "DELIVERY_PREDICATE_SPAN", H5VL_STREAM_DELIVERY_PREDICATE_SPAN) < 0 ||
+        PyModule_AddIntConstant(m, "DELIVERY_TYPE_NATIVE", H5VL_STREAM_DELIVERY_TYPE_NATIVE) < 0) {
         Py_DECREF(m);
         return NULL;
     }

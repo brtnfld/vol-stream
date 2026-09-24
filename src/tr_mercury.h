@@ -236,6 +236,15 @@ typedef struct vs_tr_run_t {
  * loss. */
 #define VS_TR_MAX_PRED_RUNS 64
 
+/* Carried on every push: which narrowing the writer could not apply exactly,
+ * so the push may hold a superset of what the subscriber asked for. The
+ * values are H5VL_STREAM_DELIVERY_* in H5VLstream.h, kept equal there by a
+ * static assertion. 0 means every requested narrowing was applied. */
+#define VS_TR_DELIVERY_SELECTION_SPAN        0x1u /* selection declined: bounding span sent */
+#define VS_TR_DELIVERY_PREDICATE_UNEVALUATED 0x2u /* predicate not evaluated: run sent whole */
+#define VS_TR_DELIVERY_PREDICATE_SPAN        0x4u /* matches too fragmented: their span sent */
+#define VS_TR_DELIVERY_TYPE_NATIVE           0x8u /* conversion declined: object's own type sent */
+
 /* M9: implemented by H5VLstream.c, registered via vs_tr_set_predicate_cb().
  * Same division of labour as vs_tr_refilter_fn -- this module carries
  * pred_enc and type_enc without ever decoding either.
@@ -254,11 +263,15 @@ typedef struct vs_tr_run_t {
  * this project's standing rule that over-sending is inefficiency while
  * under-sending is data loss. A subscriber consequently may receive
  * elements that do not match, and must not read delivery as proof of a
- * match. */
+ * match.
+ *
+ * *coalesced is set nonzero when the matches were too fragmented for
+ * max_runs and the callback returned the span containing them instead, so
+ * the caller can mark the push VS_TR_DELIVERY_PREDICATE_SPAN. */
 typedef int (*vs_tr_predicate_fn)(const void *raw_buf, uint64_t elem_size, uint64_t count,
                                     const uint8_t *pred_enc, uint64_t pred_enc_len,
                                     const uint8_t *type_enc, uint64_t type_enc_len, vs_tr_run_t *runs,
-                                    int max_runs);
+                                    int max_runs, int *coalesced);
 
 /* Registers the callback used to evaluate a subscriber's predicate (M9).
  * NULL (the default) means a predicate is carried but never acted on, so
@@ -499,13 +512,16 @@ uint64_t vs_tr_writer_bytes_pushed(vs_tr_t *tr);
  * caller frees, NULL/0 if this push was not re-filtered) and
  * *out_filter_mask are what a caller needs to reverse the filtering (see
  * vs_tr_refilter_fn's comment) -- *out_buf is the *filtered* bytes in that
- * case, not decoded values. timeout_ms == 0 polls without blocking. Returns
+ * case, not decoded values. *out_delivery gets the VS_TR_DELIVERY_* bits the
+ * writer set on this push (0: every narrowing was applied exactly). Any
+ * out-param may be NULL. timeout_ms == 0 polls without blocking. Returns
  * 0 on success, -1 on timeout or if vs_tr_stop() was called while waiting
  * and no item remains queued. */
 int vs_tr_reader_wait_data(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physical_step, char **out_path,
                             void **out_buf, uint64_t *out_size, uint64_t *out_elem_start,
                             uint64_t *out_elem_count, uint8_t **out_dcpl_enc, uint64_t *out_dcpl_enc_len,
-                            uint8_t **out_type_enc, uint64_t *out_type_enc_len, uint32_t *out_filter_mask);
+                            uint8_t **out_type_enc, uint64_t *out_type_enc_len, uint32_t *out_filter_mask,
+                            uint32_t *out_delivery);
 
 /* Writer side (M10): publish the schema bytes a later
  * vs_tr_reader_get_schema() query is answered with -- what this stream

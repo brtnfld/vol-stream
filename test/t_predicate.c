@@ -105,6 +105,7 @@ typedef struct got_t {
     uint64_t elem_count;
     size_t   size;
     void    *buf;
+    uint32_t delivery; /* H5VL_STREAM_DELIVERY_* */
 } got_t;
 
 #define MAX_GOT 16
@@ -252,8 +253,9 @@ run_reader(void)
         char    *path = NULL;
         void    *buf  = NULL;
         size_t   size = 0;
+        uint32_t delivery = 0;
 
-        if (H5Fget_subscribed_data(fid, 500, &phys, &path, &buf, &size, &es, &ec) < 0)
+        if (H5Fget_subscribed_data(fid, 500, &phys, &path, &buf, &size, &es, &ec, &delivery) < 0)
             break;
 
         got[n_got].path        = path;
@@ -261,6 +263,7 @@ run_reader(void)
         got[n_got].elem_count = ec;
         got[n_got].size        = size;
         got[n_got].buf         = buf;
+        got[n_got].delivery    = delivery;
         n_got++;
     }
 
@@ -342,6 +345,16 @@ run_reader(void)
                 continue;
             }
 
+            /* The subscriber is told which runs are exact and which are the
+             * coalesced superset, rather than having to know the run cap. */
+            if (got[i].delivery != (coalesced ? H5VL_STREAM_DELIVERY_PREDICATE_SPAN : 0u)) {
+                printf("  FAIL  /temp run [%llu, %llu) has delivery flags 0x%x, expected 0x%x\n",
+                       (unsigned long long)got[i].elem_start,
+                       (unsigned long long)(got[i].elem_start + got[i].elem_count), got[i].delivery,
+                       coalesced ? H5VL_STREAM_DELIVERY_PREDICATE_SPAN : 0u);
+                rc = 1;
+            }
+
             vals = (const int *)got[i].buf;
             for (k = 0; k < got[i].elem_count; k++) {
                 int idx      = (int)(got[i].elem_start + k);
@@ -416,6 +429,13 @@ run_reader(void)
                 printf("  ok    predicate on compound data declines to the whole object (%zu bytes), "
                        "over-sending rather than under-sending\n",
                        got[i].size);
+            if (got[i].delivery != H5VL_STREAM_DELIVERY_PREDICATE_UNEVALUATED) {
+                printf("  FAIL  /blob delivery flags 0x%x, expected PREDICATE_UNEVALUATED (0x%x)\n",
+                       got[i].delivery, H5VL_STREAM_DELIVERY_PREDICATE_UNEVALUATED);
+                rc = 1;
+            }
+            else
+                printf("  ok    and the push says so: H5VL_STREAM_DELIVERY_PREDICATE_UNEVALUATED\n");
         }
 
     for (i = 0; i < n_got; i++) {

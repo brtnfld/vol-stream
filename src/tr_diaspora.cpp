@@ -201,6 +201,7 @@ struct item_t {
     uint64_t             elem_start = 0;
     uint64_t             elem_count = 0;
     std::vector<uint8_t> type_enc;
+    uint32_t             delivery = 0; /* VS_TR_DELIVERY_* */
 };
 
 /* Overlap of a write's [w_start, w_start+w_count) with a subscription's
@@ -352,7 +353,8 @@ struct vs_tr_t {
  * delivery path (to split what arrived into per-run items). Deterministic and
  * shared precisely so those two cannot disagree about what was requested. */
 static std::vector<vs_tr_run_t>
-runs_for(vs_tr_t *tr, const sub_t &sub, const nlohmann::json &j, uint64_t *out_ws, uint64_t *out_es)
+runs_for(vs_tr_t *tr, const sub_t &sub, const nlohmann::json &j, uint64_t *out_ws, uint64_t *out_es,
+         bool *out_span = nullptr)
 {
     std::vector<vs_tr_run_t> out;
     uint64_t es = j.value("es", uint64_t{1});
@@ -367,12 +369,22 @@ runs_for(vs_tr_t *tr, const sub_t &sub, const nlohmann::json &j, uint64_t *out_w
 
     vs_tr_run_t bounding{os, oc};
 
-    if (!tr->selection_fn || sub.space_enc.empty() || !j.contains("sp")) {
+    if (out_span)
+        *out_span = false;
+    if (sub.space_enc.empty()) {
+        out.push_back(bounding); /* no selection asked for: the range is exact */
+        return out;
+    }
+    if (!tr->selection_fn || !j.contains("sp")) {
+        if (out_span)
+            *out_span = true;
         out.push_back(bounding);
         return out;
     }
     std::vector<uint8_t> wsp = b64_decode(j["sp"].get<std::string>());
     if (wsp.empty()) {
+        if (out_span)
+            *out_span = true;
         out.push_back(bounding);
         return out;
     }
@@ -381,6 +393,8 @@ runs_for(vs_tr_t *tr, const sub_t &sub, const nlohmann::json &j, uint64_t *out_w
     int n = tr->selection_fn(sub.space_enc.data(), sub.space_enc.size(), wsp.data(), wsp.size(), os,
                              oc, runs, DSA_MAX_RUNS);
     if (n < 0) {
+        if (out_span)
+            *out_span = true;
         out.push_back(bounding); /* declined -- send the whole range */
         return out;
     }
@@ -839,9 +853,19 @@ pump(vs_tr_t *tr, uint64_t timeout_ms, bool want_step)
             auto                        sit = tr->subs.find(it.path);
             if (sit == tr->subs.end())
                 continue;
-            auto runs = runs_for(tr, sit->second, j, &ws, &es);
+            bool span = false;
+            auto runs = runs_for(tr, sit->second, j, &ws, &es, &span);
             if (runs.empty())
                 continue;
+            /* This backend never evaluates a predicate or converts a type
+             * (see the file comment), so a subscription asking for either
+             * always gets the fallback, and says so. */
+            if (span)
+                it.delivery |= VS_TR_DELIVERY_SELECTION_SPAN;
+            if (!sit->second.pred_enc.empty())
+                it.delivery |= VS_TR_DELIVERY_PREDICATE_UNEVALUATED;
+            if (sit->second.has_type)
+                it.delivery |= VS_TR_DELIVERY_TYPE_NATIVE;
             if (j.contains("t"))
                 it.type_enc = b64_decode(j["t"].get<std::string>());
 
@@ -872,6 +896,7 @@ pump(vs_tr_t *tr, uint64_t timeout_ms, bool want_step)
                 ri.step       = it.step;
                 ri.path       = it.path;
                 ri.type_enc   = it.type_enc;
+                ri.delivery   = it.delivery;
                 ri.elem_start = r.start;
                 ri.elem_count = r.count;
                 uint64_t nb   = r.count * es;
@@ -1156,7 +1181,8 @@ int
 vs_tr_reader_wait_data(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physical_step, char **out_path,
                         void **out_buf, uint64_t *out_size, uint64_t *out_elem_start,
                         uint64_t *out_elem_count, uint8_t **out_dcpl_enc, uint64_t *out_dcpl_enc_len,
-                        uint8_t **out_type_enc, uint64_t *out_type_enc_len, uint32_t *out_filter_mask)
+                        uint8_t **out_type_enc, uint64_t *out_type_enc_len, uint32_t *out_filter_mask,
+                        uint32_t *out_delivery)
 {
     if (!tr)
         return -1;
@@ -1192,6 +1218,8 @@ vs_tr_reader_wait_data(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physical_step
         *out_dcpl_enc_len = 0;
     if (out_filter_mask)
         *out_filter_mask = 0;
+    if (out_delivery)
+        *out_delivery = it.delivery;
     return 0;
 }
 

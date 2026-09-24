@@ -176,7 +176,7 @@ run_reader(void)
         void    *buf  = NULL;
         size_t   size = 0;
 
-        if (H5Fget_subscribed_data(fid, 0, &p, &path, &buf, &size, &es, &ec) < 0)
+        if (H5Fget_subscribed_data(fid, 0, &p, &path, &buf, &size, &es, &ec, NULL) < 0)
             break;
         free(path);
         free(buf);
@@ -188,7 +188,7 @@ run_reader(void)
         void    *buf  = NULL;
         size_t   size = 0;
 
-        CHECK(H5Fget_subscribed_data(fid, 10000, &p, &path, &buf, &size, &es, &ec) < 0 &&
+        CHECK(H5Fget_subscribed_data(fid, 10000, &p, &path, &buf, &size, &es, &ec, NULL) < 0 &&
                   now_s() - t0 < 1.0,
               "H5Fget_subscribed_data() returns at once at EOS (%.3f s)", now_s() - t0);
     }

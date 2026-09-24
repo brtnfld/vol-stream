@@ -154,12 +154,13 @@
  *              non-contiguous subscription (a column of a 2-D dataset)
  *              receives exactly its own elements rather than a superset.
  *
- *              A requested chunk shape is honored only for a 1-D DCPL,
- *              read as elements per push: the writer splits each run
- *              into slices of that size, each filtered and pushed on its
- *              own (test/t_chunk_shape_split.c). A DCPL of rank 2 or more
- *              is not split, and its run is re-filtered as one chunk.
- *              That is about how a re-filtered push is stored in transit,
+ *              A requested chunk shape is honored as its element count
+ *              (the product of its dimensions) per push: the writer splits
+ *              each run into slices of that size, each filtered and pushed
+ *              on its own (test/t_chunk_shape_split.c). A push is a flat
+ *              run, so for rank 2 or more that is a real chunk only when
+ *              the chunk's trailing dimensions equal the dataset's (whole
+ *              rows). That is about how a re-filtered push is stored in transit,
  *              not about which elements are chosen.
  *
  *              M10 status: live schema discovery. H5Fget_stream_schema()
@@ -455,10 +456,12 @@ H5VL_STREAM_API herr_t H5Fget_logical_steps(hid_t file_id, size_t *n_logical, ui
  *       over-sends rather than under-sends. Call H5Fget_subscribed_data()
  *       after H5Fwait_step_ready() to retrieve what was pushed.
  *
- * \note A chunk shape in \p plists is honored only for a 1-D DCPL, read as
- *       elements per push: each run is split into slices of that size, each
- *       filtered and pushed separately. For a DCPL of rank 2 or more the
- *       whole run is re-filtered as one chunk.
+ * \note A chunk shape in \p plists is honored as its element count (the
+ *       product of its dimensions) per push: each run is split into slices
+ *       of that many elements, each filtered and pushed separately. A push
+ *       is a flat run, so at rank 2 or more a slice is a real chunk of the
+ *       dataset only when the chunk's trailing dimensions equal the
+ *       dataset's -- whole rows.
  */
 H5VL_STREAM_API herr_t H5Fsubscribe(hid_t file_id, size_t count, const char *const *paths, const hid_t *spaces,
                     const hid_t *plists);
@@ -534,6 +537,14 @@ typedef enum H5VL_stream_pred_op_t {
 H5VL_STREAM_API herr_t H5Fsubscribe_predicate(hid_t file_id, const char *path, H5VL_stream_pred_op_t op,
                     hid_t type_id, const void *value);
 
+/* Bits in H5Fget_subscribed_data()'s *delivery_flags: which narrowing the
+ * writer could not apply exactly to that push. Every fallback over-sends,
+ * never under-sends, so each bit means "may hold more than was asked for". */
+#define H5VL_STREAM_DELIVERY_SELECTION_SPAN        0x1u
+#define H5VL_STREAM_DELIVERY_PREDICATE_UNEVALUATED 0x2u
+#define H5VL_STREAM_DELIVERY_PREDICATE_SPAN        0x4u
+#define H5VL_STREAM_DELIVERY_TYPE_NATIVE           0x8u
+
 /**
  * \brief M8/M8.5: reader only. Block until the writer pushes data for a
  *        subscribed path, or \p timeout_ms elapses.
@@ -557,12 +568,33 @@ H5VL_STREAM_API herr_t H5Fsubscribe_predicate(hid_t file_id, const char *path, H
  * \param size          OUT: length of \p buf in bytes
  * \param elem_start    OUT: first (1-D) element index \p buf covers
  * \param elem_count    OUT: number of elements \p buf covers
+ * \param delivery_flags OUT: 0 if the writer applied every narrowing of this
+ *                      subscription exactly, otherwise H5VL_STREAM_DELIVERY_*
+ *                      bits (see below); NULL to ignore them
  * \return \herr_t, -1 on timeout or if the transport is unavailable for this
  *         file
+ *
+ * \note Every narrowing -- a selection, a predicate, a datatype -- falls back
+ *       to sending more rather than less when the writer cannot apply it.
+ *       \p delivery_flags says which fell back for this push:
+ *       - H5VL_STREAM_DELIVERY_SELECTION_SPAN: the selection could not be
+ *         described (too fragmented, or its trailing dimensions do not match
+ *         the write), so the push covers its bounding span and may hold
+ *         unselected elements. Discard those by the selection.
+ *       - H5VL_STREAM_DELIVERY_PREDICATE_UNEVALUATED: the writer could not
+ *         evaluate the predicate (a datatype it does not apply to, for
+ *         instance), so nothing was filtered by value.
+ *       - H5VL_STREAM_DELIVERY_PREDICATE_SPAN: the matches were too fragmented
+ *         to send run by run, so the push is the span containing them,
+ *         non-matching elements included.
+ *       - H5VL_STREAM_DELIVERY_TYPE_NATIVE: H5Fsubscribe_type()'s conversion
+ *         was not possible, so \p buf holds the dataset's own type.
+ *       With neither predicate bit set, every element delivered satisfies the
+ *       predicate.
  */
 H5VL_STREAM_API herr_t H5Fget_subscribed_data(hid_t file_id, uint64_t timeout_ms, uint64_t *physical_step,
                                                 char **path, void **buf, size_t *size, uint64_t *elem_start,
-                                                uint64_t *elem_count);
+                                                uint64_t *elem_count, uint32_t *delivery_flags);
 
 /**
  * \brief M10: one object a live stream is currently publishing, as

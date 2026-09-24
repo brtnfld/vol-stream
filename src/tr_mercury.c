@@ -203,11 +203,13 @@ MERCURY_GEN_PROC(vs_subscribe_out_t, ((int32_t)(status))((int32_t)(matched)))
  * type_enc/filter_mask (M8.5 precision) are set only when this push was
  * re-filtered through the subscriber's own requested pipeline (see
  * vs_tr_refilter_fn's comment) -- 0-length dcpl_enc means payload is raw,
- * unfiltered bytes, the original M8/M8.5 behavior. */
+ * unfiltered bytes, the original M8/M8.5 behavior. delivery is the
+ * VS_TR_DELIVERY_* bits: which narrowing the writer could not apply exactly
+ * to this push, so the subscriber knows it may hold a superset. */
 MERCURY_GEN_PROC(vs_data_push_in_t,
                   ((uint64_t)(physical_step))((hg_string_t)(path))((uint64_t)(elem_start))((uint64_t)(
                       elem_count))((vs_blob_t)(payload))((vs_blob_t)(dcpl_enc))((vs_blob_t)(type_enc))(
-                      (uint32_t)(filter_mask)))
+                      (uint32_t)(filter_mask))((uint32_t)(delivery)))
 MERCURY_GEN_PROC(vs_data_push_out_t, ((int32_t)(status)))
 
 /* M10: reader -> writer, "what is in this stream?". The reply's is_writer is
@@ -324,6 +326,7 @@ typedef struct vs_tr_data_item_t {
     uint8_t *type_enc;
     uint64_t type_enc_len;
     uint32_t filter_mask;
+    uint32_t delivery;
 } vs_tr_data_item_t;
 
 struct vs_tr_t {
@@ -876,7 +879,7 @@ vs_push_pending(vs_tr_t *tr, uint64_t physical_step, uint64_t wall_time_ns)
 static void
 vs_push_data_item(vs_tr_t *tr, uint64_t physical_step, char *path, void *buf, uint64_t size,
                     uint64_t elem_start, uint64_t elem_count, uint8_t *dcpl_enc, uint64_t dcpl_enc_len,
-                    uint8_t *type_enc, uint64_t type_enc_len, uint32_t filter_mask)
+                    uint8_t *type_enc, uint64_t type_enc_len, uint32_t filter_mask, uint32_t delivery)
 {
     pthread_mutex_lock(&tr->data_lock);
 
@@ -901,6 +904,7 @@ vs_push_data_item(vs_tr_t *tr, uint64_t physical_step, char *path, void *buf, ui
         tr->data_queue[tr->n_data].type_enc      = type_enc;
         tr->data_queue[tr->n_data].type_enc_len  = type_enc_len;
         tr->data_queue[tr->n_data].filter_mask   = filter_mask;
+        tr->data_queue[tr->n_data].delivery      = delivery;
         tr->n_data++;
     }
     else {
@@ -1507,7 +1511,7 @@ vs_data_push_ult(hg_handle_t handle)
         if (path_copy) {
             vs_push_data_item(tr, in.physical_step, path_copy, in.payload.buf, in.payload.size, in.elem_start,
                                 in.elem_count, (uint8_t *)in.dcpl_enc.buf, in.dcpl_enc.size,
-                                (uint8_t *)in.type_enc.buf, in.type_enc.size, in.filter_mask);
+                                (uint8_t *)in.type_enc.buf, in.type_enc.size, in.filter_mask, in.delivery);
             /* ownership moved -- do not let margo_free_input() free these too */
             in.payload.buf  = NULL;
             in.dcpl_enc.buf = NULL;
@@ -2787,7 +2791,7 @@ vs_tr_push_one_item(vs_tr_t *tr, hg_addr_t addr, vs_member_id_t member_id, uint6
                      const char *path, uint64_t elem_start, uint64_t elem_count, const void *payload_buf,
                      uint64_t payload_len, const uint8_t *dcpl_enc, uint64_t dcpl_enc_len,
                      const uint8_t *type_enc, uint64_t type_enc_len, uint32_t filter_mask,
-                     void *payload_owned)
+                     uint32_t delivery, void *payload_owned)
 {
     vs_data_push_in_t in;
     hg_handle_t         handle;
@@ -2812,6 +2816,7 @@ vs_tr_push_one_item(vs_tr_t *tr, hg_addr_t addr, vs_member_id_t member_id, uint6
     in.elem_start      = elem_start;
     in.elem_count      = elem_count;
     in.filter_mask     = filter_mask;
+    in.delivery        = delivery;
     in.payload.buf     = (void *)(uintptr_t)payload_buf;
     in.payload.size    = payload_len;
 
@@ -3047,6 +3052,9 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
         vs_tr_run_t        runs[VS_TR_MAX_PRED_RUNS];
         int                n_sel = 1, n_runs = 1, sr, r;
         int                member_unreachable = 0;
+        /* VS_TR_DELIVERY_* for this subscriber's pushes of this write: every
+         * narrowing below that falls back to over-sending says so here. */
+        uint32_t           sub_delivery = 0, run_delivery = 0;
 
         member_id = snapshot[si].member_id;
 
@@ -3115,8 +3123,11 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
                  * into sel_runs before giving up. */
                 sel_runs[0].start = 0;
                 sel_runs[0].count = overlap_count;
+                sub_delivery |= VS_TR_DELIVERY_SELECTION_SPAN;
             }
         }
+        else if (sub_space_enc_len > 0)
+            sub_delivery |= VS_TR_DELIVERY_SELECTION_SPAN;
         free(sub_space_enc);
         sub_space_enc = NULL;
 
@@ -3164,6 +3175,8 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
                 s_type_enc_len = sub_want_type_enc_len;
             }
         }
+        if (sub_want_type_enc_len > 0 && !s_conv_buf)
+            sub_delivery |= VS_TR_DELIVERY_TYPE_NATIVE;
 
         for (sr = 0; sr < n_sel; sr++) {
             uint64_t sel_start_abs = overlap_start + sel_runs[sr].start;
@@ -3176,18 +3189,26 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
         runs[0].start = 0;
         runs[0].count = sel_count_abs;
         n_runs        = 1;
+        run_delivery  = sub_delivery;
         if (sub_pred_enc_len > 0 && tr->predicate_fn) {
+            int coalesced = 0;
             int n = tr->predicate_fn((const uint8_t *)s_buf + (sel_start_abs - s_base) * s_elem_size,
                                        s_elem_size, sel_count_abs, sub_pred_enc, sub_pred_enc_len,
-                                       s_type_enc, s_type_enc_len, runs, VS_TR_MAX_PRED_RUNS);
+                                       s_type_enc, s_type_enc_len, runs, VS_TR_MAX_PRED_RUNS, &coalesced);
 
-            if (n >= 0)
+            if (n >= 0) {
                 n_runs = n;
+                if (coalesced)
+                    run_delivery |= VS_TR_DELIVERY_PREDICATE_SPAN;
+            }
             else {
                 runs[0].start = 0;
                 runs[0].count = sel_count_abs;
+                run_delivery |= VS_TR_DELIVERY_PREDICATE_UNEVALUATED;
             }
         }
+        else if (sub_pred_enc_len > 0)
+            run_delivery |= VS_TR_DELIVERY_PREDICATE_UNEVALUATED;
 
         /* Nothing matched: this subscriber gets no RPC at all for this run.
          * The whole point of the predicate -- every other reduction in this
@@ -3263,7 +3284,7 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
                         member_unreachable = vs_tr_push_one_item(
                             tr, addr, member_id, physical_step, path, run_start + off, this_count, cb_buf,
                             cb_len, sub_dcpl_enc, sub_dcpl_enc_len, s_type_enc, s_type_enc_len, cb_mask,
-                            cb_buf);
+                            run_delivery, cb_buf);
                     else
                         /* Refilter declined/failed for this slice: fall back
                          * to raw bytes for just this slice, the same
@@ -3271,7 +3292,8 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
                          * already follows. */
                         member_unreachable = vs_tr_push_one_item(
                             tr, addr, member_id, physical_step, path, run_start + off, this_count, sub_ptr,
-                            this_count * s_elem_size, NULL, 0, s_type_enc, s_type_enc_len, 0, NULL);
+                            this_count * s_elem_size, NULL, 0, s_type_enc, s_type_enc_len, 0, run_delivery,
+                            NULL);
 
                     if (member_unreachable)
                         break;
@@ -3312,12 +3334,12 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
                     member_unreachable = vs_tr_push_one_item(
                         tr, addr, member_id, physical_step, path, run_start, run_count, filtered_buf,
                         filtered_len, sub_dcpl_enc, sub_dcpl_enc_len, s_type_enc, s_type_enc_len,
-                        filter_mask, filtered_buf);
+                        filter_mask, run_delivery, filtered_buf);
                 else
                     member_unreachable =
                         vs_tr_push_one_item(tr, addr, member_id, physical_step, path, run_start, run_count,
                                              run_ptr, run_count * s_elem_size, NULL, 0, s_type_enc,
-                                             s_type_enc_len, 0, NULL);
+                                             s_type_enc_len, 0, run_delivery, NULL);
             }
 
             if (member_unreachable)
@@ -3355,7 +3377,8 @@ int
 vs_tr_reader_wait_data(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physical_step, char **out_path,
                          void **out_buf, uint64_t *out_size, uint64_t *out_elem_start,
                          uint64_t *out_elem_count, uint8_t **out_dcpl_enc, uint64_t *out_dcpl_enc_len,
-                         uint8_t **out_type_enc, uint64_t *out_type_enc_len, uint32_t *out_filter_mask)
+                         uint8_t **out_type_enc, uint64_t *out_type_enc_len, uint32_t *out_filter_mask,
+                         uint32_t *out_delivery)
 {
     struct timespec deadline;
     int             ret = -1;
@@ -3402,6 +3425,8 @@ vs_tr_reader_wait_data(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physical_step
             *out_type_enc_len = tr->data_queue[0].type_enc_len;
         if (out_filter_mask)
             *out_filter_mask = tr->data_queue[0].filter_mask;
+        if (out_delivery)
+            *out_delivery = tr->data_queue[0].delivery;
         memmove(&tr->data_queue[0], &tr->data_queue[1], (tr->n_data - 1) * sizeof(*tr->data_queue));
         tr->n_data--;
         ret = 0;

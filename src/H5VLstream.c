@@ -652,7 +652,7 @@ static uint64_t H5VL__stream_refilter_shape_for_subscriber(const uint8_t *dcpl_e
  * H5VL__stream_eval_predicate()'s comment. */
 static int H5VL__stream_eval_predicate(const void *raw_buf, uint64_t elem_size, uint64_t count,
                              const uint8_t *pred_enc, uint64_t pred_enc_len, const uint8_t *type_enc,
-                             uint64_t type_enc_len, vs_tr_run_t *runs, int max_runs);
+                             uint64_t type_enc_len, vs_tr_run_t *runs, int max_runs, int *coalesced);
 static herr_t H5VL__stream_encode_predicate(H5VL_stream_pred_op_t op, hid_t type_id, const void *value,
                              uint8_t **buf, size_t *len);
 /* M8.5 follow-up: vs_tr_selection_fn's implementation -- see
@@ -1053,6 +1053,7 @@ typedef struct H5VL_stream_args_get_subscribed_data_t {
     size_t   *size;          /* OUT */
     uint64_t *elem_start;    /* OUT */
     uint64_t *elem_count;    /* OUT */
+    uint32_t *delivery;      /* OUT, H5VL_STREAM_DELIVERY_* -- may be NULL */
 } H5VL_stream_args_get_subscribed_data_t;
 
 /* M10 */
@@ -2936,9 +2937,9 @@ done:
  *              Always forces a single chunk spanning the whole extent it is
  *              handed, so exactly one H5Dget_chunk_info_by_coord()/
  *              H5Dread_chunk2() pair always suffices. A subscriber's
- *              chunk-size preference is honored one level up, and only for
- *              a 1-D DCPL: the caller first splits the run into slices of
- *              that size (H5VL__stream_refilter_shape_for_subscriber()) and
+ *              chunk-size preference is honored one level up, as the
+ *              chunk's element count: the caller first splits the run into
+ *              slices of that size (H5VL__stream_refilter_shape_for_subscriber()) and
  *              calls this once per slice.
  *              H5VL__stream_unfilter_pushed_data() undoes this on the
  *              receiving end.
@@ -3075,10 +3076,10 @@ done:
  *              see that typedef's comment in tr_mercury.h for the full
  *              design. Decodes the subscriber's own dcpl_enc just far
  *              enough to answer one question: did they ask for real
- *              chunking (H5D_CHUNKED layout, H5Pget_chunk() dims[0] > 0),
- *              and is that shape smaller than the run tr_mercury.c is
- *              about to push? If so, the caller splits the run into that
- *              many elements per RPC instead of pushing it as one chunk
+ *              chunking (H5D_CHUNKED layout), and is that chunk's element
+ *              count -- the product of its dimensions, at any rank --
+ *              smaller than the run tr_mercury.c is about to push? If so,
+ *              the caller splits the run into that many elements per RPC instead of pushing it as one chunk
  *              spanning the whole run; H5VL__stream_refilter_for_
  *              subscriber() itself needs no change at all, since a smaller
  *              count handed to it already produces a correctly-sized
@@ -3106,7 +3107,7 @@ H5VL__stream_refilter_shape_for_subscriber(const uint8_t *dcpl_enc, uint64_t dcp
                                             uint64_t elem_size)
 {
     hid_t    dcpl = H5I_INVALID_HID;
-    hsize_t  chunk_dims[1];
+    hsize_t  chunk_dims[H5S_MAX_RANK];
     uint64_t result = 0;
 
     (void)elem_size;
@@ -3116,9 +3117,25 @@ H5VL__stream_refilter_shape_for_subscriber(const uint8_t *dcpl_enc, uint64_t dcp
     if ((dcpl = H5Pdecode(dcpl_enc)) < 0)
         return 0;
 
-    if (H5Pget_layout(dcpl) == H5D_CHUNKED && H5Pget_chunk(dcpl, 1, chunk_dims) == 1 && chunk_dims[0] > 0 &&
-        (uint64_t)chunk_dims[0] < count)
-        result = (uint64_t)chunk_dims[0];
+    if (H5Pget_layout(dcpl) == H5D_CHUNKED) {
+        /* A chunk of any rank is honored as its element count per push. A
+         * push is a flat run, so that count is a real chunk of the dataset
+         * when the chunk's trailing dimensions equal the dataset's (whole
+         * rows), and otherwise a flat slice of the same size -- the size the
+         * subscriber asked for, rather than silently the whole run. */
+        int      rank  = H5Pget_chunk(dcpl, H5S_MAX_RANK, chunk_dims);
+        uint64_t elems = rank > 0 ? 1 : 0;
+        int      d;
+
+        for (d = 0; d < rank && elems > 0; d++) {
+            if (chunk_dims[d] == 0 || elems > UINT64_MAX / (uint64_t)chunk_dims[d])
+                elems = 0; /* degenerate or overflowing: decline */
+            else
+                elems *= (uint64_t)chunk_dims[d];
+        }
+        if (elems > 0 && elems < count)
+            result = elems;
+    }
 
     H5Pclose(dcpl);
     return result;
@@ -3289,7 +3306,7 @@ H5VL__stream_pred_match_d(double v, double c, unsigned op)
 static int
 H5VL__stream_eval_predicate(const void *raw_buf, uint64_t elem_size, uint64_t count,
                             const uint8_t *pred_enc, uint64_t pred_enc_len, const uint8_t *type_enc,
-                            uint64_t type_enc_len, vs_tr_run_t *runs, int max_runs)
+                            uint64_t type_enc_len, vs_tr_run_t *runs, int max_runs, int *coalesced)
 {
     hid_t       dtype = H5I_INVALID_HID, ptype = H5I_INVALID_HID, canon = H5I_INVALID_HID;
     H5T_class_t cls;
@@ -3301,6 +3318,8 @@ H5VL__stream_eval_predicate(const void *raw_buf, uint64_t elem_size, uint64_t co
     int         n_runs = 0, any = 0, overflow = 0;
     int         ret_value = -1;
 
+    if (coalesced)
+        *coalesced = 0;
     if (!raw_buf || !runs || max_runs <= 0 || count == 0 || elem_size == 0)
         return -1;
     if (!pred_enc || pred_enc_len < H5VL_STREAM_PRED_HDR || !type_enc || type_enc_len == 0)
@@ -3408,6 +3427,8 @@ H5VL__stream_eval_predicate(const void *raw_buf, uint64_t elem_size, uint64_t co
         runs[0].start = first_match;
         runs[0].count = last_match - first_match + 1;
         n_runs        = 1;
+        if (coalesced)
+            *coalesced = 1;
     }
 
     /* Nothing else can observe that the writer did this work -- a subscriber
@@ -11592,7 +11613,8 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
             int      r = vs_tr_reader_wait_data(o->file_state->transport, sargs->timeout_ms,
                                                   sargs->physical_step, sargs->path, sargs->buf, &size64,
                                                   sargs->elem_start, sargs->elem_count, &dcpl_enc,
-                                                  &dcpl_enc_len, &type_enc, &type_enc_len, &filter_mask);
+                                                  &dcpl_enc_len, &type_enc, &type_enc_len, &filter_mask,
+                                                  sargs->delivery);
 
             *sargs->size = (size_t)size64;
 
@@ -13351,12 +13373,25 @@ H5Fset_stream_retention_policy(hid_t file_id, size_t max_steps, uint64_t max_byt
     return H5VL__stream_file_op(file_id, H5VL_stream_op_set_retention, &op_args);
 } /* end H5Fset_stream_retention_policy() */
 
+/* The transport's wire bits are the public ones; keep them from drifting. */
+#ifdef VOL_STREAM_HAVE_MERCURY
+typedef char H5VL__stream_delivery_bits_match
+    [(VS_TR_DELIVERY_SELECTION_SPAN == H5VL_STREAM_DELIVERY_SELECTION_SPAN &&
+      VS_TR_DELIVERY_PREDICATE_UNEVALUATED == H5VL_STREAM_DELIVERY_PREDICATE_UNEVALUATED &&
+      VS_TR_DELIVERY_PREDICATE_SPAN == H5VL_STREAM_DELIVERY_PREDICATE_SPAN &&
+      VS_TR_DELIVERY_TYPE_NATIVE == H5VL_STREAM_DELIVERY_TYPE_NATIVE)
+         ? 1
+         : -1];
+#endif
+
 herr_t
 H5Fget_subscribed_data(hid_t file_id, uint64_t timeout_ms, uint64_t *physical_step, char **path, void **buf,
-                         size_t *size, uint64_t *elem_start, uint64_t *elem_count)
+                         size_t *size, uint64_t *elem_start, uint64_t *elem_count, uint32_t *delivery_flags)
 {
     H5VL_stream_args_get_subscribed_data_t op_args;
 
+    if (delivery_flags)
+        *delivery_flags = 0;
     if (!physical_step || !path || !buf || !size || !elem_start || !elem_count)
         return -1;
 
@@ -13367,6 +13402,7 @@ H5Fget_subscribed_data(hid_t file_id, uint64_t timeout_ms, uint64_t *physical_st
     op_args.size            = size;
     op_args.elem_start     = elem_start;
     op_args.elem_count     = elem_count;
+    op_args.delivery       = delivery_flags;
 
     return H5VL__stream_file_op(file_id, H5VL_stream_op_get_subscribed_data, &op_args);
 } /* end H5Fget_subscribed_data() */

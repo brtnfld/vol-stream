@@ -173,7 +173,7 @@ run_reader(void)
 
     touch_sentinel(READY_SENTINEL);
 
-    if (H5Fget_subscribed_data(fid, 10000, &phys, &path, &buf, &size, &elem_start, &elem_count) < 0) {
+    if (H5Fget_subscribed_data(fid, 10000, &phys, &path, &buf, &size, &elem_start, &elem_count, NULL) < 0) {
         printf("  FAIL  never received pushed data for /sub\n");
         rc = 1;
     }
@@ -226,7 +226,7 @@ run_reader(void)
         void    *buf3   = NULL;
         size_t   size3  = 0;
 
-        if (H5Fget_subscribed_data(fid, 10000, &phys3, &path3, &buf3, &size3, &es3, &ec3) < 0) {
+        if (H5Fget_subscribed_data(fid, 10000, &phys3, &path3, &buf3, &size3, &es3, &ec3, NULL) < 0) {
             printf("  FAIL  never received pushed data for /sub@meta\n");
             rc = 1;
         }
@@ -263,7 +263,7 @@ run_reader(void)
         size_t   size2  = 0;
         uint64_t es2 = 0, ec2 = 0;
 
-        if (H5Fget_subscribed_data(fid, 500, &phys2, &path2, &buf2, &size2, &es2, &ec2) == 0) {
+        if (H5Fget_subscribed_data(fid, 500, &phys2, &path2, &buf2, &size2, &es2, &ec2, NULL) == 0) {
             printf("  FAIL  received unexpected extra data for '%s' (%zu bytes) -- /unsub leaked\n",
                    path2 ? path2 : "(null)", size2);
             free(path2);

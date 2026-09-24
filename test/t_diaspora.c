@@ -129,7 +129,7 @@ main(int argc, char **argv)
     uint8_t *tenc = NULL, *denc = NULL;
     uint32_t fmask = 0xFFFFFFFFu;
     rc = vs_tr_reader_wait_data(r, 5000, &step, &path, &out, &size, &elem_start, &elem_count, &denc,
-                                &dlen, &tenc, &tlen, &fmask);
+                                &dlen, &tenc, &tlen, &fmask, NULL);
     CHECK(rc == 0, "vs_tr_reader_wait_data() = %d", rc);
     if (rc == 0) {
         CHECK(step == 7, "step = %" PRIu64 " (want 7)", step);
@@ -198,7 +198,7 @@ main(int argc, char **argv)
     step = elem_start = elem_count = size = 0;
     path = NULL; out = NULL; tenc = NULL; denc = NULL;
     rc = vs_tr_reader_wait_data(r, 5000, &step, &path, &out, &size, &elem_start, &elem_count, &denc,
-                                &dlen, &tenc, &tlen, &fmask);
+                                &dlen, &tenc, &tlen, &fmask, NULL);
     CHECK(rc == 0, "vs_tr_reader_wait_data() = %d", rc);
     if (rc == 0) {
         CHECK(step == 8, "step = %" PRIu64 " (want 8)", step);
@@ -225,7 +225,7 @@ main(int argc, char **argv)
     CHECK(rc == 0, "vs_tr_writer_push_data(start=12, count=4) = %d", rc);
     path = NULL; out = NULL; tenc = NULL; denc = NULL;
     rc = vs_tr_reader_wait_data(r, 400, &step, &path, &out, &size, &elem_start, &elem_count, &denc,
-                                &dlen, &tenc, &tlen, &fmask);
+                                &dlen, &tenc, &tlen, &fmask, NULL);
     CHECK(rc == -1, "vs_tr_reader_wait_data() = %d (want -1: nothing delivered, not an empty push)",
           rc);
     free(path); free(out); free(tenc); free(denc);
@@ -237,7 +237,7 @@ main(int argc, char **argv)
     CHECK(rc == 0, "vs_tr_writer_push_data(\"/not-subscribed\") = %d", rc);
     path = NULL; out = NULL;
     rc = vs_tr_reader_wait_data(r, 400, &step, &path, &out, &size, &elem_start, &elem_count, &denc,
-                                &dlen, &tenc, &tlen, &fmask);
+                                &dlen, &tenc, &tlen, &fmask, NULL);
     CHECK(rc == -1, "vs_tr_reader_wait_data() = %d (want -1: path not subscribed)", rc);
     free(path); free(out);
 

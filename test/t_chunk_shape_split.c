@@ -25,6 +25,11 @@
  * positions, proving the split doesn't corrupt data at the chunk
  * boundaries.
  *
+ * /grid2d does the same at rank 2: an 8x8 dataset subscribed with a (2, 8)
+ * chunk, which is two whole rows -- 16 elements, the chunk's element count --
+ * so it must arrive as 4 pushes of 16. Rank 2 used to be ignored and pushed
+ * as one chunk.
+ *
  * Two OS processes, na+sm, same shape as test/t_precision.c.
  */
 
@@ -39,6 +44,11 @@
 
 #define NELEM 64
 #define REQ_CHUNK 16 /* NELEM must be an exact multiple, so every push is the same size */
+#define G_ROWS 8
+#define G_COLS 8
+#define G_CHUNK_ROWS 2 /* chunk (2, G_COLS): whole rows, G_CHUNK_ROWS * G_COLS elements */
+#define G_N (G_ROWS * G_COLS)
+#define G_PER_PUSH (G_CHUNK_ROWS * G_COLS)
 #define FNAME "t_chunk_shape_split.h5"
 
 #define READY_SENTINEL "t_chunk_shape_split.reader_ready"
@@ -75,13 +85,15 @@ run_reader(void)
 {
     hid_t    vol_id, fapl, fid;
     int      rc = 0;
-    hid_t    space, precise_dcpl;
+    hid_t    space, precise_dcpl, gspace, grid_dcpl;
     hsize_t  dims = NELEM, chunk_dims = REQ_CHUNK;
-    int      got[NELEM];
-    int      have[NELEM];
-    int      i, n_pushes = 0, total_elems = 0;
+    hsize_t  gdims[2] = {G_ROWS, G_COLS}, gchunk[2] = {G_CHUNK_ROWS, G_COLS};
+    int      got[NELEM], ggot[G_N];
+    int      have[NELEM], ghave[G_N];
+    int      i, n_pushes = 0, total_elems = 0, g_pushes = 0, g_elems = 0, g_bad_size = 0;
 
     memset(have, 0, sizeof(have));
+    memset(ghave, 0, sizeof(ghave));
 
     if ((vol_id = H5VL_stream_register()) < 0) {
         printf("reader: FAIL register\n");
@@ -109,18 +121,25 @@ run_reader(void)
         printf("reader: FAIL configure chunked/GZIP dcpl\n");
         return 1;
     }
+    if ((gspace = H5Screate_simple(2, gdims, NULL)) < 0 || (grid_dcpl = H5Pcreate(H5P_DATASET_CREATE)) < 0 ||
+        H5Pset_chunk(grid_dcpl, 2, gchunk) < 0 || H5Pset_deflate(grid_dcpl, 6) < 0) {
+        printf("reader: FAIL configure the 2-D chunked/GZIP dcpl\n");
+        return 1;
+    }
     {
-        const char *paths[1]  = {"/precise"};
-        const hid_t spaces[1] = {space};
-        const hid_t plists[1] = {precise_dcpl};
+        const char *paths[2]  = {"/precise", "/grid2d"};
+        const hid_t spaces[2] = {space, gspace};
+        const hid_t plists[2] = {precise_dcpl, grid_dcpl};
 
-        if (H5Fsubscribe(fid, 1, paths, spaces, plists) < 0) {
+        if (H5Fsubscribe(fid, 2, paths, spaces, plists) < 0) {
             printf("reader: FAIL subscribe with chunk-shape dcpl\n");
             return 1;
         }
     }
     H5Sclose(space);
     H5Pclose(precise_dcpl);
+    H5Sclose(gspace);
+    H5Pclose(grid_dcpl);
 
     touch_sentinel(READY_SENTINEL);
 
@@ -129,18 +148,41 @@ run_reader(void)
      * back into fewer, larger pushes, this loop still terminates instead of
      * spinning, and n_pushes/total_elems below report what actually
      * happened either way. */
-    while (total_elems < NELEM && n_pushes < 2 * (NELEM / REQ_CHUNK)) {
+    while ((total_elems < NELEM || g_elems < G_N) &&
+           n_pushes + g_pushes < 2 * (NELEM / REQ_CHUNK + G_N / G_PER_PUSH)) {
         uint64_t phys = (uint64_t)-1;
         char    *path = NULL;
         void    *buf  = NULL;
         size_t   size = 0;
         uint64_t elem_start = 0, elem_count = 0;
 
-        if (H5Fget_subscribed_data(fid, 10000, &phys, &path, &buf, &size, &elem_start, &elem_count) < 0) {
+        if (H5Fget_subscribed_data(fid, 10000, &phys, &path, &buf, &size, &elem_start, &elem_count, NULL) < 0) {
             printf("  FAIL  timed out after %d push(es), %d/%d element(s) received\n", n_pushes,
                    total_elems, NELEM);
             rc = 1;
             break;
+        }
+        if (path && strcmp(path, "/grid2d") == 0) {
+            g_pushes++;
+            if (elem_start + elem_count > G_N || size != elem_count * sizeof(int)) {
+                g_bad_size = 1;
+            }
+            else {
+                const int *vals = (const int *)buf;
+
+                for (i = 0; i < (int)elem_count; i++) {
+                    ggot[elem_start + (uint64_t)i]  = vals[i];
+                    ghave[elem_start + (uint64_t)i] = 1;
+                }
+                g_elems += (int)elem_count;
+                if (elem_count != G_PER_PUSH)
+                    g_bad_size = 1;
+            }
+            printf("  info  /grid2d push %d: [%llu, %llu)\n", g_pushes, (unsigned long long)elem_start,
+                   (unsigned long long)(elem_start + elem_count));
+            free(path);
+            free(buf);
+            continue;
         }
         n_pushes++;
 
@@ -206,6 +248,21 @@ run_reader(void)
         }
         if (!rc)
             printf("  ok    all %d values decode correctly across chunk boundaries\n", NELEM);
+
+        if (g_pushes != G_N / G_PER_PUSH || g_bad_size) {
+            printf("  FAIL  /grid2d: %d push(es), expected %d of %d elements each (a (%d, %d) chunk at rank 2 "
+                   "was not honored)\n",
+                   g_pushes, G_N / G_PER_PUSH, G_PER_PUSH, G_CHUNK_ROWS, G_COLS);
+            rc = 1;
+        }
+        else
+            printf("  ok    /grid2d: a (%d, %d) chunk arrives as %d pushes of %d elements -- two whole rows each\n",
+                   G_CHUNK_ROWS, G_COLS, g_pushes, G_PER_PUSH);
+        for (i = 0; i < G_N && !rc; i++)
+            if (!ghave[i] || ggot[i] != 1000 + i) {
+                printf("  FAIL  /grid2d element %d: %s\n", i, ghave[i] ? "wrong value" : "never received");
+                rc = 1;
+            }
     }
 
     H5Fclose(fid);
@@ -220,9 +277,9 @@ static int
 run_writer(void)
 {
     hid_t   vol_id, fapl, fid;
-    hid_t   space, ds;
-    hsize_t dims = NELEM;
-    int     vals[NELEM];
+    hid_t   space, ds, gspace, gds;
+    hsize_t dims = NELEM, gdims[2] = {G_ROWS, G_COLS};
+    int     vals[NELEM], gvals[G_N];
     int     i;
 
     if ((vol_id = H5VL_stream_register()) < 0) {
@@ -250,6 +307,8 @@ run_writer(void)
     }
     for (i = 0; i < NELEM; i++)
         vals[i] = i;
+    for (i = 0; i < G_N; i++)
+        gvals[i] = 1000 + i;
 
     if (H5Fbegin_step(fid, 0, NULL, 0) < 0) {
         printf("writer: FAIL begin_step\n");
@@ -265,6 +324,14 @@ run_writer(void)
         return 1;
     }
     H5Dclose(ds);
+    if ((gspace = H5Screate_simple(2, gdims, NULL)) < 0 ||
+        (gds = H5Dcreate2(fid, "/grid2d", H5T_NATIVE_INT, gspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT)) < 0 ||
+        H5Dwrite(gds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, gvals) < 0) {
+        printf("writer: FAIL write /grid2d\n");
+        return 1;
+    }
+    H5Dclose(gds);
+    H5Sclose(gspace);
     if (H5Fend_step(fid) < 0) {
         printf("writer: FAIL end_step\n");
         return 1;

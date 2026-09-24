@@ -281,7 +281,7 @@ run_reader(void)
         size_t   size = 0;
         size_t   i, n;
 
-        if (H5Fget_subscribed_data(fid, 2000, &phys, &path, &buf, &size, &elem_start, &elem_count) < 0) {
+        if (H5Fget_subscribed_data(fid, 2000, &phys, &path, &buf, &size, &elem_start, &elem_count, NULL) < 0) {
             if (++drained >= 2)
                 break;
             continue;

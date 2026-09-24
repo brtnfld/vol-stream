@@ -117,7 +117,7 @@ VOL, which also ships `H5F*` calls from an out-of-tree connector.
 | `H5Fsubscribe(fid, n, paths, spaces, plists)` | Reader declares interest, optionally with a per-subscriber filter pipeline |
 | `H5Fsubscribe_type(fid, path, type)` | Have the writer convert a subscription's data before sending it |
 | `H5Fsubscribe_predicate(fid, path, op, type, value)` | Narrow a subscription to elements passing a value test, evaluated writer-side |
-| `H5Fget_subscribed_data(fid, timeout, ...)` | Take the next pushed payload |
+| `H5Fget_subscribed_data(fid, timeout, ..., &flags)` | Take the next pushed payload, and whether any narrowing fell back to over-sending |
 | `H5Fget_stream_schema(fid, timeout, &step, &n, &vars)` | Ask a live writer what the stream carries — every path, its datatype and extent |
 | `H5Fack_stream_step(fid, phys)` | Subscriber: report a consumed step, so the writer's queue policy counts it |
 | `H5Fset_stream_queue_policy(fid, policy, slots)` | Writer: Block, Discard or Spill when a tracked reader falls behind |

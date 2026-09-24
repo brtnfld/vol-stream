@@ -206,7 +206,7 @@ run_reader(const char *label, int want_gzip, int leaves_first, const char *ready
 
     touch_sentinel(ready_sentinel);
 
-    if (H5Fget_subscribed_data(fid, 10000, &phys, &path, &buf, &size, &elem_start, &elem_count) < 0) {
+    if (H5Fget_subscribed_data(fid, 10000, &phys, &path, &buf, &size, &elem_start, &elem_count, NULL) < 0) {
         printf("  FAIL  reader %s never received pushed data for /precise\n", label);
         rc = 1;
     }

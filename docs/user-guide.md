@@ -320,11 +320,14 @@ Stated plainly so you can plan around them:
   reopening the file. The subscription path
   (`H5Fsubscribe`/`H5Fget_subscribed_data`) is the live data channel; the
   reader-cursor path is for finished or reopened streams.
-- **Per-subscriber re-filtering honors a requested chunk shape only in 1-D.**
-  A 1-D DCPL's chunk is read as elements per push: each run is split into
-  slices of that size, each filtered and pushed separately. A DCPL of rank 2 or
-  more is not split; its run is re-filtered as one chunk. This affects how a
-  re-filtered push is stored in transit, not which elements are chosen.
+- **Per-subscriber re-filtering honors a chunk shape as its element count.**
+  A requested chunk's element count (the product of its dimensions) is the
+  size of each push: each run is split into slices of that many elements, each
+  filtered and pushed separately. A push is a flat run, so at rank 2 or more a
+  slice is a real chunk of the dataset only when the chunk's trailing
+  dimensions equal the dataset's (whole rows); otherwise it is a flat slice of
+  the same size. This affects how a re-filtered push is stored in transit, not
+  which elements are chosen.
 - **`h5py` cannot open a step.** The step API is optional operations; `h5py` has
   no binding for `H5VLfile_optional_op()`. Python reaches the stream through
   the separate `volstream` package instead, as a subscriber only; see
@@ -892,11 +895,15 @@ conversion, so prefer a constant of the same class as the data.
 > **Over-sending is inefficiency; under-sending is data loss — the connector
 > always chooses the former.** A predicate against data it cannot evaluate (a
 > compound, a string, a `uint64` whose values exceed `LLONG_MAX`, a float wider
-> than `double`) is silently ignored and the whole overlap is sent. A selection
-> or match set too fragmented to describe in a bounded number of runs is
-> coalesced to its bounding span. **A consumer that must see only matching
-> elements should re-test what arrives** rather than treat delivery as proof of
-> a match.
+> than `double`) is ignored and the whole overlap is sent. A selection or match
+> set too fragmented to describe in a bounded number of runs is coalesced to its
+> bounding span. Each push says whether this happened: the last argument of
+> `H5Fget_subscribed_data()` returns `H5VL_STREAM_DELIVERY_*` bits
+> (`SELECTION_SPAN`, `PREDICATE_UNEVALUATED`, `PREDICATE_SPAN`, `TYPE_NATIVE`),
+> 0 when every narrowing was applied exactly. **Re-test the values of a push
+> with a predicate bit set**; one with neither bit set holds only matches. The
+> Python binding does this for you: its arrays mask non-matching elements
+> either way, and `Step.delivery` reports the bits.
 
 > [!CAUTION]
 > A later `H5Fsubscribe()` naming the same path **clears** that path's
@@ -1406,7 +1413,7 @@ main(int argc, char **argv)
         size_t   size = 0;
 
         if (H5Fget_subscribed_data(fid, 5000, &phys, &path, &buf, &size,
-                                   &elem_start, &elem_count) < 0) {
+                                   &elem_start, &elem_count, NULL) < 0) {
             printf("consumer: no further data after %d push(es)\n", seen);
             break;
         }
@@ -2102,7 +2109,7 @@ connector, because a step is a file-scoped transaction.
 | `H5Fget_logical_steps(fid, &n, ids)` | Reader: list logical ids | Two-call size-then-fill idiom; deduped, ascending, authoritative only |
 | `H5Fsubscribe(fid, n, paths, spaces, plists)` | Reader: declare interest | Needs the transport. `plists` entries must be real DCPLs; `H5P_DEFAULT` means no re-filtering |
 | `H5Fsubscribe_predicate(fid, path, op, type, val)` | Reader: narrow by value | Requires a prior `H5Fsubscribe()` on that path. `type_id` travels as `H5Tencode()` bytes, so a writer of different endianness converts correctly |
-| `H5Fget_subscribed_data(fid, ms, &step, &path, &buf, &sz, &start, &cnt)` | Reader: drain one push, oldest first | Caller frees `path` and `buf`. `ms = 0` polls without blocking |
+| `H5Fget_subscribed_data(fid, ms, &step, &path, &buf, &sz, &start, &cnt, &flags)` | Reader: drain one push, oldest first | Caller frees `path` and `buf`. `ms = 0` polls without blocking. `flags` (may be NULL) gets `H5VL_STREAM_DELIVERY_*` bits: which narrowing fell back to over-sending, 0 if none |
 | `H5Fwait_step_ready(fid, ms, &step, &wall_ns)` | Reader: block for a commit notification | Does not move the cursor or grow the index |
 | `H5Fset_stream_queue_policy(fid, policy, slots)` | Writer: backpressure | Needs the transport. Takes effect from the next `H5Fend_step()` |
 | `H5VL_stream_register()` | Register the connector | Not needed under `HDF5_VOL_CONNECTOR` |

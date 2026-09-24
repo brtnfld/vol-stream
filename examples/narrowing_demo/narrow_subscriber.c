@@ -180,7 +180,7 @@ main(int argc, char **argv)
             size_t   size = 0;
 
             if (H5Fget_subscribed_data(fid, (uint64_t)step_timeout, &phys, &path, &buf, &size, &elem_start,
-                                        &elem_count) < 0) {
+                                        &elem_count, NULL) < 0) {
                 if (++misses < max_misses)
                     continue;
                 printf("%s: no further data (writer finished or idle) after %d push(es)\n", argv[1],

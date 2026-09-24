@@ -123,7 +123,7 @@ run_reader(void)
 
     /* No sentinel touch here. The writer is not watching the filesystem. */
 
-    if (H5Fget_subscribed_data(fid, 20000, &phys, &path, &buf, &size, &elem_start, &elem_count) < 0) {
+    if (H5Fget_subscribed_data(fid, 20000, &phys, &path, &buf, &size, &elem_start, &elem_count, NULL) < 0) {
         printf("reader: FAIL no data pushed -- step 0 was lost\n");
         rc = 1;
         goto done;

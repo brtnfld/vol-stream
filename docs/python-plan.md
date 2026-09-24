@@ -382,6 +382,14 @@ released before `subscribe()` returns, the notifications queued before the
 subscription are drained before subscribing, not after. Otherwise the
 writer's first step could be announced in time to be thrown away with them.
 
+Narrowing fallbacks: each `Push` carries the writer's delivery bits
+(`volstream.DELIVERY_*`), and `Step.delivery` maps each path to them, 0 when
+every narrowing was applied exactly. The arrays do not depend on them.
+Elements outside a selection are dropped either way, and when the writer
+could not apply a predicate exactly (unevaluated, or matches coalesced to
+their span) the binding applies it and masks what does not match, so a step
+looks the same as when the writer filtered it.
+
 End of stream: a subscriber treats the writer leaving the group (closing
 the file, or its process dying) as the end of the stream. Steps the writer
 announced before leaving are still delivered. After the last one,
@@ -443,9 +451,8 @@ supported, or depends on something outside this binding.
 - **Per-subscriber precision beyond deflate.** `subscribe(deflate=level)`
   exposes the C API's `plists` argument for deflate, the one filter every
   HDF5 build has, with one chunk spanning the selection. Other filters
-  (bslz4, zstd, zfp) are not exposed. Neither is a chunk shape: the writer
-  honors one only for a 1-D DCPL (as elements per push), which would make it
-  a 1-D-only option here.
+  (bslz4, zstd, zfp) are not exposed, and neither is a chunk shape (the
+  writer honors one as its element count per push).
 - **A dataset resized in any dimension but the first.** A whole-dataset
   subscription follows growth along the first dimension: it is made against
   an unbounded first dimension so the writer sends new rows, and the returned

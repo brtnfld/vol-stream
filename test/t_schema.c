@@ -235,7 +235,7 @@ run_reader(void)
         void    *buf  = NULL;
         size_t   size = 0;
 
-        if (H5Fget_subscribed_data(fid, 20000, &phys, &path, &buf, &size, &elem_start, &elem_count) < 0) {
+        if (H5Fget_subscribed_data(fid, 20000, &phys, &path, &buf, &size, &elem_start, &elem_count, NULL) < 0) {
             printf("reader: FAIL no data pushed for the discovered subscription\n");
             return 1;
         }
