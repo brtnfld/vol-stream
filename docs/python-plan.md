@@ -1,0 +1,276 @@
+# vol-stream: Python subscriber plan
+
+The design reasoning is in RFC-VOLSTREAM-2026-001 `sec:pysub` ("A Python
+Subscriber"). This is the build plan for it: what to write, in what order,
+and what each stage has to prove before the next one starts.
+
+Same two rules as [`dev-plan.md`](dev-plan.md). No changes to HDF5, and
+borrow by default — which here means the extension wraps the connector's
+existing C API and adds no protocol.
+
+## Both premises re-verified, 2026-09-23
+
+`sec:pysub-not-h5py` rejects an h5py binding for two reasons. Neither was
+taken on trust; both were checked against the current h5py before planning
+any work.
+
+| Premise | Check | Result |
+|---|---|---|
+| h5py has no `H5VLfile_optional_op()` binding | `dir(h5py.h5f)`, `import h5py.h5vl` | No optional-op names; **no `h5py.h5vl` module at all**. Still true at h5py 3.16.0 |
+| An h5py wheel vendors its own libhdf5 | `otool -L` on h5py's `h5f*.so` | `@loader_path/.dylibs/libhdf5.320.0.0.dylib` — **vendored, not shared** |
+
+The second matters more than the version number suggests. This h5py reports
+HDF5 2.0.0, which is the version the connector requires — and it is still
+unusable, because it is a *separate loaded copy* of libhdf5 with its own
+identifier table. An `hid_t` from it means nothing to the connector's
+library. Matching versions do not make two libhdf5 instances one.
+
+`sec:pysub-gate` left open "whether an HDF5 2.x-based Python environment
+exists at the target site at all, which determines whether the standalone
+design is a convenience or a necessity." On this machine the answer is
+both: a 2.x Python environment exists, *and* the standalone design is a
+**necessity** rather than a convenience, because the 2.x it has is
+vendored inside a wheel.
+
+## Scope
+
+**Subscriber only.** A Python consumer does not produce steps, so the
+writer side stays out — that halves the surface, and `sec:pysub-not-h5py`
+already argues it.
+
+Out of scope, explicitly: the writer API, h5py interop (addable later,
+nothing depends on it), device-direct buffers (that is bulk-transfer
+Phase 3 — but see "The Phase 3 seam" below, which must not be foreclosed),
+and Windows.
+
+## The call surface
+
+`sec:pysub`'s table, with one addition:
+
+| Python | Wraps |
+|---|---|
+| `open()` / `close()` | `H5Fopen()` with the connector on the FAPL, `H5Fclose()` |
+| `schema()` | `H5Fget_stream_schema()` / `H5Ffree_stream_schema()` |
+| `subscribe(paths, sel=, dcpl=)` | `H5Fsubscribe()` |
+| `subscribe_type(path, dtype)` | `H5Fsubscribe_type()` |
+| `subscribe_predicate(...)` | `H5Fsubscribe_predicate()` |
+| `get(timeout_ms)` | `H5Fget_subscribed_data()` |
+| `wait_step_ready()`, `logical_steps()`, `step_status()` | read-only status calls |
+
+**`schema()` is the addition, and it should arguably lead.** The RFC's
+table predates M10. `H5Fget_stream_schema()` is what makes a *generic*
+consumer possible — it returns real decoded type and space ids, so a
+consumer that has never opened the file can size a buffer and build a
+selection from nothing but a filename. That matters more in Python than in
+C: the idiomatic Python consumer is `for arr in stream:`, and asking a
+user to declare shapes that the stream already knows is exactly the
+friction the C examples had to live with before M10.
+`examples/detector_pipeline`'s `discover` mode is the C precedent.
+
+No `hid_t` crosses into Python, per `sec:pysub-not-h5py`. Selections
+arrive as shapes and start/count tuples and become `H5Screate_simple()` +
+`H5Sselect_hyperslab()` inside the extension; `schema()` returns NumPy
+dtypes and shape tuples, not ids.
+
+## Binding technology: the CPython C API
+
+| Option | Verdict |
+|---|---|
+| **Raw CPython C API** | **Chosen.** Matches `sec:pysub-gate`'s "one C extension whose only dependencies are NumPy and this connector." Full control of the three things that actually matter here: GIL release, signal checking, and buffer ownership |
+| Cython | Less boilerplate, but adds a build-time dependency and a second language to a C codebase, for ~8 functions |
+| pybind11 | C++ in a C codebase. Overkill |
+| ctypes / cffi | No build step at all, but the struct layout of `H5F_stream_var_t` would have to be mirrored by hand and would rot against the header, and it gives no natural home for the Phase 3 seam |
+
+## The three risks
+
+`sec:pysub-gate` ranks them. Their status has changed since it was written.
+
+### 1. Deterministic teardown — cannot be deferred
+
+`sec:pysub-ordering` is blunt about this: the standard Python idiom is
+actively wrong. A generator `__iter__` with cleanup in `finally` does not
+run that cleanup when the training loop `break`s, and the writer hangs.
+
+This is *in the exit gate*, not after it — the gate requires clean exit on
+"**both** the run-to-completion path and the early-`break` path." So it
+cannot be a later phase. Teardown lands in P3, before the Pythonic layer
+that would make it easy to get wrong.
+
+### 2. Multi-run reassembly — answered by the transport, not yet pinned
+
+No test asks "is this step's set of pushes complete."
+`test/t_subvolume_strided.c` is the fragmented-selection test ("one
+column: ROWS separate flat runs"), and it validates **in aggregate across
+the whole run**.
+
+Predicting the push count from the selection is unsound: RFC appendix A's
+findings F4 and F5 show the writer *coalesces* past a run cap. Waiting for
+a push of step *N+1* to arrive, to show that step *N* is complete, works
+but has a gap: with a bounded timeout, "step *N* has no more pushes" and
+"step *N+1* has not started" look the same.
+
+That gap does not need closing, because the transport already makes a
+stronger guarantee (`src/tr_mercury.c`, `vs_tr_writer_broadcast_step_ready()`):
+
+- The writer finishes delivering step *N*'s pushes (`vs_tr_drain_pushes()`)
+  before it sends step *N*'s step-ready notification. The reader's push
+  handler queues each item before it responds, so "delivered" means
+  "queued on the reader."
+- So when `H5Fwait_step_ready()` returns *N*, every delivered push for *N*
+  is already in the data queue. Draining it with a zero timeout gets the
+  complete step. There is no need to wait for a push of *N+1*.
+- Pushes never interleave across a step boundary: step *N*'s pushes all
+  finish before step *N+1*'s are issued.
+
+What this does **not** give, and the reassembly layer must handle:
+
+- **A lagging reader already has later steps queued.** If the consumer
+  falls behind, step *N+1*'s pushes sit in the data queue right behind
+  step *N*'s. The drain for step *N* will pop the first *N+1* push, and
+  there is no peek, so the layer has to hold that one item for the next
+  step rather than discard it. One item of carry-over, and only when
+  lagging.
+- **Completeness means "everything delivered," not "everything sent."**
+  A push that fails or times out on the writer does not stop the step
+  from being announced. The step arrives with runs missing. The layer
+  should compare the elements received against the selection and flag a
+  short step rather than hand back a partly filled array as if it were
+  whole.
+- **The late-joiner seed.** A reader that joins mid-stream gets a step-ready
+  notification for the writer's latest step. That step was never pushed to
+  it, so it drains to nothing. The layer must treat the first step after
+  joining as possibly empty, not as a step with no matching data.
+- **The two queues must be drained in pairs.** The step-ready queue is
+  FIFO and unbounded (`vs_push_pending()` doubles it). A consumer that only
+  calls `get()` never empties it. The iterator must always pair
+  `wait_step_ready()` with the drain, and the raw `get()` path should say
+  so in its docstring.
+
+`examples/detector_pipeline`'s `monitor` mode is the C precedent for the
+pairing. Until commit `3fae80d` (2026-09-24) it read only one push per step
+and got the wrong answer for multi-run steps. It still discards a lookahead
+item rather than carrying it. That is fixed alongside this plan, and the
+Python layer should copy the fixed loop, not the original.
+
+A per-subscriber end-of-step marker on the wire is still the cleaner
+long-term design (it would also make short steps detectable without
+knowing the selection). It is a protocol change, so it stays out of scope.
+
+### 3. Environment — resolved
+
+See above. Necessity, not convenience.
+
+## The Phase 3 seam
+
+`sec:pysub-buffer` argues this and it constrains P2's API, so it is
+settled now rather than later: the extension owns *allocate a destination,
+describe it to the framework, free it when the framework is done*.
+
+`H5Fget_subscribed_data()` hands back a `malloc()`ed buffer the caller
+frees. Wrapping it in a NumPy array whose base object frees on dealloc
+avoids a copy; `torch.from_numpy()` is then zero-copy too. If the
+extension instead returns `bytes` and lets the caller build the array,
+there is no seam, and bulk-transfer Phase 3 — which swaps the allocator
+and exposes `__cuda_array_interface__` in place of the buffer protocol —
+becomes a breaking API change instead of an internal one.
+
+## Milestones
+
+Sizes follow [`dev-plan.md`](dev-plan.md)'s convention.
+
+### P0 — Pin per-step push grouping in C · S
+
+A test, `test/t_step_grouping.c`, that locks in the transport guarantee
+from risk 2, for a fragmented (one push per row) selection:
+
+- **In lockstep:** once `H5Fwait_step_ready()` returns *N*, a zero-timeout
+  drain returns all of step *N*'s pushes, and nothing else.
+- **While lagging:** with several steps already queued, pushes come out
+  grouped by step in ascending order and never interleave, and the drain
+  for step *N* does run into step *N+1*'s first push. That confirms the
+  one-item carry-over P2 needs.
+- **Every step is complete:** each step's pushes cover exactly the
+  selection, with that step's values.
+
+In C, not a Python spike, deliberately. It settles the P2 design before
+P2 starts, it runs in the existing CI, and it stays as a regression test.
+A throwaway ctypes probe would answer the question once and then rot.
+
+**Exit gate:** `t_step_grouping` passes in the na+sm CI job, and fails if
+step-ready is ever sent before that step's pushes are queued.
+
+### P1 — Extension skeleton and build · S
+
+`VOL_STREAM_BUILD_PYTHON` (matching the existing
+`VOL_STREAM_BUILD_TESTS`/`_EXAMPLES` options), the module skeleton,
+`open()`/`close()` registering the connector and setting it on the FAPL.
+
+Note this stage needs **no transport**: the connector still captures and
+replays without Mercury, so import, open, close and error paths are
+testable anywhere — including on a machine with no Mochi stack.
+
+**Exit gate:** `import volstream; volstream.open(path)` works and closes
+cleanly, tested without the transport.
+
+### P2 — Subscribe, get, NumPy, reassembly · L
+
+The core, and where the real work is. `subscribe()`, `subscribe_type()`,
+`subscribe_predicate()`, `schema()`, `get()`. The NumPy wrapper with
+base-object ownership per the Phase 3 seam. Reassembly of several pushes
+into one array per step, using P0's pinned semantics: `wait_step_ready()`,
+then a zero-timeout drain, with one item of carry-over and a short-step
+check (risk 2).
+
+**Exit gate:** a Python consumer receives *N* steps of a fragmented
+(multi-run) subscription as correctly-shaped NumPy arrays whose values
+match what the writer sent, both in lockstep and after deliberately
+falling several steps behind.
+
+### P3 — Lifecycle correctness · M
+
+The three things `sec:pysub` identifies as where this breaks in ways that
+surface as someone else's bug:
+
+- **fork:** record the PID at subscribe time, raise on any call from a
+  different one. Converts PyTorch's default `DataLoader` fork from a
+  silent inert transport into a named exception.
+- **GIL and Ctrl-C:** release the GIL around blocking calls, and loop on a
+  short (~100 ms) internal timeout calling `PyErr_CheckSignals()` rather
+  than passing the caller's full timeout to C — otherwise a consumer
+  waiting on a stalled writer ignores SIGINT for the whole interval.
+- **Teardown:** explicit `close()`, a context manager, and an `atexit`
+  backstop. Never cleanup in a generator's `finally`.
+
+**Exit gate:** the early-`break` case, tested rather than assumed — the
+writer proceeds to completion after the consumer breaks out mid-stream.
+
+### P4 — The Pythonic layer · M
+
+Iteration with a defined termination policy (a bare timeout does *not*
+raise `StopIteration`; a caller-supplied step count or deadline does —
+`sec:pysub-gil` notes this is a choice the C API does not make for us), a
+schema-driven convenience path, and a PyTorch `IterableDataset` that
+subscribes in `__init__` and only drains in `__iter__`.
+
+**Exit gate:** RFC `sec:pysub-gate`'s gate, in full — a consumer written
+entirely in Python, no user-written C glue, following a live C writer,
+exiting cleanly on both paths.
+
+### P5 — CI and packaging · M
+
+Add the Python build to the existing na+sm CI job, which already builds
+the whole Mochi stack. Package with scikit-build-core so the extension
+builds against the same libhdf5 the connector links — the constraint that
+made the standalone design necessary in the first place.
+
+**Exit gate:** CI runs the P4 gate on every push.
+
+## What this does not fix
+
+It does not make vol-stream reachable from an existing h5py-based
+application — that would still need the upstream binding
+`sec:pysub-not-h5py` rules out depending on. It does not provide a Python
+*writer*. And it does not by itself enable an H5Web-style live viewer:
+that additionally needs a provider speaking this API and re-serving it,
+which is separate work this plan is a prerequisite for rather than a
+delivery of.
