@@ -43,8 +43,9 @@ done
 [[ -n "$PLUGIN_DIR" ]] || { echo "error: --plugin-dir is required" >&2; exit 2; }
 [[ -d "$API_BIN" ]]    || { echo "error: --api-bin '$API_BIN' is not a directory" >&2; exit 2; }
 
-if [[ ! -f "$PLUGIN_DIR/libvol_stream.so" ]]; then
-    echo "error: no libvol_stream.so in '$PLUGIN_DIR'" >&2
+# .so on Linux, .dylib on macOS.
+if [[ ! -f "$PLUGIN_DIR/libvol_stream.so" && ! -f "$PLUGIN_DIR/libvol_stream.dylib" ]]; then
+    echo "error: no libvol_stream.so or libvol_stream.dylib in '$PLUGIN_DIR'" >&2
     exit 2
 fi
 

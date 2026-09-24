@@ -27,7 +27,36 @@ if(SKBUILD)
   else()
     set(_origin "$ORIGIN")
   endif()
-  set_target_properties(_volstream PROPERTIES INSTALL_RPATH "${_origin}" INSTALL_RPATH_USE_LINK_PATH TRUE)
+  # The extension resolves exactly two libraries through its RPATH:
+  # libvol_stream beside it, and libhdf5. List them explicitly rather than
+  # using INSTALL_RPATH_USE_LINK_PATH, which also records the build directory
+  # it linked libvol_stream from -- a temporary directory under pip, and not
+  # recognised as the build tree on macOS, where /var is a symlink.
+  set(_hdf5_rpath "")
+  foreach(lib ${HDF5_C_LIBRARIES})
+    set(_loc "")
+    if(TARGET ${lib})
+      get_target_property(_loc ${lib} IMPORTED_LOCATION)
+      if(NOT _loc)
+        get_target_property(_cfgs ${lib} IMPORTED_CONFIGURATIONS)
+        foreach(c ${_cfgs})
+          get_target_property(_loc ${lib} IMPORTED_LOCATION_${c})
+          if(_loc)
+            break()
+          endif()
+        endforeach()
+      endif()
+    elseif(IS_ABSOLUTE "${lib}")
+      set(_loc "${lib}")
+    endif()
+    if(_loc)
+      get_filename_component(_dir "${_loc}" DIRECTORY)
+      list(APPEND _hdf5_rpath "${_dir}")
+    endif()
+  endforeach()
+  list(REMOVE_DUPLICATES _hdf5_rpath)
+  set_target_properties(_volstream PROPERTIES INSTALL_RPATH "${_origin};${_hdf5_rpath}"
+                                              INSTALL_RPATH_USE_LINK_PATH FALSE)
   set_target_properties(vol_stream PROPERTIES INSTALL_RPATH "${VOL_STREAM_DEP_LIBDIRS}"
                                               INSTALL_RPATH_USE_LINK_PATH TRUE)
   install(TARGETS _volstream vol_stream LIBRARY DESTINATION volstream COMPONENT python)

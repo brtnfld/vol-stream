@@ -65,8 +65,9 @@ done
 if [[ -z "$PLUGIN_DIR" ]]; then
     PLUGIN_DIR="$(cd "$(dirname "$BIN")" && pwd)"
 fi
-[[ -f "$PLUGIN_DIR/libvol_stream.so" ]] || {
-    echo "error: no libvol_stream.so in '$PLUGIN_DIR'" >&2
+# .so on Linux, .dylib on macOS.
+[[ -f "$PLUGIN_DIR/libvol_stream.so" || -f "$PLUGIN_DIR/libvol_stream.dylib" ]] || {
+    echo "error: no libvol_stream.so or libvol_stream.dylib in '$PLUGIN_DIR'" >&2
     exit 2
 }
 

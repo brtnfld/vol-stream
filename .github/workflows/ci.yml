@@ -388,7 +388,9 @@ jobs:
       - name: pip install the Python package and test the installed copy
         run: |
           export PKG_CONFIG_PATH=$HOME/mochi-install/lib/pkgconfig:$HOME/mochi-install/lib64/pkgconfig:$PKG_CONFIG_PATH
-          CMAKE_PREFIX_PATH="$PWD/hdf5-install;$HOME/mochi-install" \
+          # As an environment variable CMAKE_PREFIX_PATH is ':'-separated,
+          # unlike the ';'-separated -D form the build step above uses.
+          CMAKE_PREFIX_PATH="$PWD/hdf5-install:$HOME/mochi-install" \
             python3 -m pip install --break-system-packages --quiet . \
               -Ccmake.define.VOL_STREAM_ENABLE_MERCURY=ON
           ROOT=$PWD
