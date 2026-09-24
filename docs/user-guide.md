@@ -336,6 +336,24 @@ Stated plainly so you can plan around them:
   `connect()` in libfabric's TCP provider while reaching for an already-departed
   peer during teardown. It never produces a wrong answer and never crashes — it
   occasionally stalls process teardown past a normal test timeout.
+- **The mochi-flock 0.8.0 release crashes when several subscribers join at
+  once.** A joining reader can segfault in `libflock-server`: its provider
+  dereferences its group before `init_group()` has set it, when another
+  joiner's gossip arrives mid-join (mochi-hpc/mochi-flock#8, fix proposed in
+  #9). 0.8.0 also writes the group file through one shared temp name, so
+  concurrent joins can leave it half-written; that is fixed on Flock's `main`
+  but not released. CI builds Flock `main` with the patch in
+  `.github/patches/`. Building against the 0.8.0 release, expect occasional
+  crashes whenever several readers attach within the same moment.
+- **End of stream is not detected for a writer that leaves before announcing
+  any step to a reader.** A subscriber recognises the writer from its step
+  announcements or from the join seed; with neither, it cannot tell the writer's
+  departure from anyone else's.
+- **Subscribers are invisible to the queue policy unless they call
+  `H5Fbegin_step()`.** The Block policy waits on acks, and acks come only from a
+  reader's sequential `H5Fbegin_step()`. A subscriber that reads only through
+  `H5Fwait_step_ready()`/`H5Fget_subscribed_data()` -- which includes the Python
+  binding -- never acks, so the writer never waits for it.
 
 ### 2.4 Wire-format compatibility
 
@@ -354,6 +372,12 @@ One field is not HDF5's own encoding: the VL wire form's per-element length tag,
 (the +1 bias keeps NULL distinguishable from a legitimately empty sequence or
 `""`, which HDF5 round-trips differently). It is written and read as explicit
 little-endian, matching FlatBuffers' own specification.
+
+The transport's RPC messages are not versioned at all, so every process in a
+group -- writer and every reader -- must come from the same vol-stream build.
+They have already changed: the step-ready notification gained the writer's
+member id (for end-of-stream detection), so a writer and a reader built on
+either side of that change cannot interoperate.
 
 ### 2.5 How the behavior in this guide is verified
 
@@ -388,10 +412,10 @@ CI covers these axes:
 |---|---|
 | HDF5 version | `develop` only (see the compile-error warning at the top) |
 | MPI | MPICH · OpenMPI |
-| Mercury NA plugin | `na+sm` · `ofi+tcp` · `ofi+verbs` |
+| Mercury NA plugin | `na+sm` (gating) · `ofi+tcp` (a subset, non-gating) |
 | Rank shapes | 3→2 · 7→3 (coprime, where M×N projection bugs surface) |
 | Sanitizers | ASan · UBSan · TSan |
-| Spack environment | pinned lockfile · floating latest |
+| Python binding | CPython 3.12 with NumPy and CPU-only torch, `na+sm` only |
 
 ---
 
@@ -404,16 +428,20 @@ CI covers these axes:
 | **HDF5** | **2.x (`develop`)** — not 1.14, which does not compile | Everything |
 | CMake | 3.18+ | Build |
 | MPI | Any implementation | Parallel writers only |
-| Mercury, Argobots, mochi-margo, mochi-ssg | found via `pkg-config` | The transport: subscriptions, `H5Fwait_step_ready()`, `h5stream tail`, queue policy |
+| Mercury, Argobots, mochi-margo, mochi-flock | found via `pkg-config` (flock also needs mochi-thallium to build) | The transport: subscriptions, `H5Fwait_step_ready()`, `h5stream tail`, queue policy |
 | bake-client, bake-server, abt-io, PMDK | found via `pkg-config` | `H5VL_STREAM_QUEUE_SPILL` only |
+| Python 3.10+ headers; NumPy at run time | `-DVOL_STREAM_BUILD_PYTHON=ON` | The `volstream` Python subscriber (see `docs/python-plan.md`); torch only for `volstream.torch` |
 
 Without the Mochi stack the connector still builds and works — you get step
 capture, replay, the reader cursor, and the tools' offline subcommands. You do
 not get any live channel.
 
 Versions the CI builds against, if you are assembling the stack by hand:
-argobots 1.2, mercury 2.3.1, mochi-margo 0.17.0, mochi-ssg 0.5.4, PMDK 2.1.1,
-mochi-abt-io 0.9.0, mochi-bake 0.6.4. `mochi-margo` is a builtin Spack package.
+argobots 1.2, mercury 2.4.1, mochi-margo 0.24.2, mochi-thallium 0.17.1,
+mochi-flock `main` plus `.github/patches/flock-provider-group-before-init.patch`
+(see §2.3 for why not the 0.8.0 release), PMDK 2.1.1, mochi-abt-io 0.9.0,
+mochi-bake 0.6.4. vol-stream's own CMake requires margo >= 0.24.2 and
+flock >= 0.8.0.
 
 ### 3.2 Build
 

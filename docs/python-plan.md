@@ -364,6 +364,57 @@ made the standalone design necessary in the first place.
 
 **Exit gate:** CI runs the P4 gate on every push.
 
+## Known gaps
+
+What P0–P4 do not cover, in one place. Each item is either untested, not
+supported, or depends on something outside this binding.
+
+### Untested
+
+- **A dropped push.** P2 masks the missing elements, but nothing makes the
+  writer drop a push, so that path has never run. Needs the fault-injection
+  hook described under P0.
+- **`ofi+tcp`.** Every Python test runs over `na+sm`. The C suite's `ofi+tcp`
+  pass is a subset and non-gating.
+- **Two Files open at once in one process**, including two on the same file.
+  Nothing tests it. The connector starts a transport per file, and whether
+  two transports coexist in one process has not been checked.
+- **`volstream.torch` outside CI.** It is tested only where torch is
+  installed (the CI job installs the CPU wheel). Elsewhere the test is skipped.
+
+### Not supported
+
+- **Attributes, and types other than atomic integer or float** (compound,
+  string, enum, array). `subscribe()` raises `NotImplementedError`.
+- **Per-subscriber precision** (the C API's `plists` argument to
+  `H5Fsubscribe()`, a DCPL with a filter pipeline). Not exposed.
+- **A dataset whose extent changes after `subscribe()`.** Shapes and the
+  flat-index-to-coordinate mapping come from the schema at subscribe time.
+  Growth along the first dimension still maps correctly, but the returned
+  array keeps the subscribed shape. A change to any other dimension would
+  place elements wrongly. Re-subscribe after a resize.
+- **`num_workers > 0` in a DataLoader.** Refused, by design (see P4).
+
+### Depends on the connector or the Mochi stack
+
+- **Backpressure.** A Python subscriber never acks, so a writer's Block
+  queue policy cannot see it (see P3).
+- **End of stream for a writer that leaves before announcing any step** to
+  this reader is not detected (see P4). Neither is it for a parallel writer
+  with more than 1,024 ranks: the reader stops tracking beyond that, and
+  then never reports end of stream rather than reporting it early.
+- **mochi-flock 0.8.0** crashes when several readers join at once
+  (mochi-hpc/mochi-flock#8). A Python consumer is exposed like any other
+  reader. CI builds Flock `main` plus a local patch.
+
+### Performance
+
+- **One process-wide HDF5 lock.** All Files in a process share it, so a
+  blocking wait on one holds up calls on another for up to 100 ms at a time.
+- **Reassembly copies.** A step that arrives as one push covering the whole
+  selection is returned as a view with no copy. Anything else (several
+  pushes, or a strided selection) is copied into a new array.
+
 ## What this does not fix
 
 It does not make vol-stream reachable from an existing h5py-based

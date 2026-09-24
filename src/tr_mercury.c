@@ -406,6 +406,7 @@ struct vs_tr_t {
     vs_member_id_t eos_writers[VS_EOS_MAX_WRITERS];
     unsigned char  eos_writer_gone[VS_EOS_MAX_WRITERS];
     size_t         n_eos_writers;
+    int            eos_overflow; /* more writers than the table holds */
 
     /* M7, reader side: the group member that answered a get_current_step
      * query, cached the first time vs_tr_reader_get_current_step() finds it
@@ -791,15 +792,19 @@ vs_note_writer(vs_tr_t *tr, vs_member_id_t id)
         tr->eos_writer_gone[tr->n_eos_writers] = 0;
         tr->n_eos_writers++;
     }
+    else
+        tr->eos_overflow = 1;
 }
 
-/* Caller holds pending_lock. False until at least one writer is known. */
+/* Caller holds pending_lock. False until at least one writer is known, and
+ * always false once more writers were seen than the table holds: an untracked
+ * rank could still be writing, so ending the stream would be premature. */
 static int
 vs_all_writers_gone(vs_tr_t *tr)
 {
     size_t i;
 
-    if (tr->n_eos_writers == 0)
+    if (tr->n_eos_writers == 0 || tr->eos_overflow)
         return 0;
     for (i = 0; i < tr->n_eos_writers; i++)
         if (!tr->eos_writer_gone[i])
