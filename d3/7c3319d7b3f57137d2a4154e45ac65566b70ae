@@ -1,0 +1,59 @@
+python/tests/test_stream.py
+  s_3816fb7b7c4a27::t_79f98ff046dc81 231-232
+  s_3816fb7b7c4a27::t_9bbaea21f66cfa 16-17,217-230,233-236,569
+python/volstream/_file.py
+  s_3816fb7b7c4a27::t_9bbaea21f66cfa 315,331-336,390-393
+docs/dev-plan.md
+  s_3816fb7b7c4a27::t_1c8bbb0f7b33a5 1235-1245,1313-1315
+python/_volstream.c
+  s_3816fb7b7c4a27::t_eb4df4006097de 665-666,668,670-674,719-722,998-999
+docs/user-guide.md
+  s_3816fb7b7c4a27::t_1c8bbb0f7b33a5 2072-2083,2147
+src/tr_diaspora.cpp
+  s_3816fb7b7c4a27::t_dddbb941ecba16 1337-1339,1348-1370
+  s_3816fb7b7c4a27::t_b2a12a4a618856 1340-1347
+src/H5VLstream.c
+  s_3816fb7b7c4a27::t_cc76e9bca73495 11884,11888-11891
+  s_3816fb7b7c4a27::t_af7c8c7cb5622d 11448-11600
+  s_3816fb7b7c4a27::t_04180c4318938f 11676-11681,11710-11714
+  s_3816fb7b7c4a27::t_db02682a16ef83 345,1058,11876-11883,11885-11887,11892-11896,11918-11925,11929-11934,13240,13920-13924,13929-13945
+  s_3816fb7b7c4a27::t_e648ecc43072ea 11715
+  s_3816fb7b7c4a27::t_063e9f71c62444 13946
+  s_3816fb7b7c4a27::t_85be89937e2a80 14011
+src/tr_mercury.h
+  s_3816fb7b7c4a27::t_dddbb941ecba16 233-252
+  s_3816fb7b7c4a27::t_b2a12a4a618856 221-232
+test/CMakeLists.txt
+  s_3816fb7b7c4a27::t_a759ddc843471d 126-135
+python/CMakeLists.txt
+  s_3816fb7b7c4a27::t_9bbaea21f66cfa 87
+src/H5VLstream.h
+  s_3816fb7b7c4a27::t_ba9c596fff6350 849,853-854,876-879,882
+  s_3816fb7b7c4a27::t_db02682a16ef83 850-852,855-875,880-881,883-885
+  s_3816fb7b7c4a27::t_9cc5b3cca48bbe 886
+test/t_backfill.c
+  s_3816fb7b7c4a27::t_8cf02adf88b0bb 1-281
+src/tr_mercury.c
+  s_3816fb7b7c4a27::t_4af5f3c0a52206 240,244,375,1426,1510
+  s_3816fb7b7c4a27::t_f208663bd0af05 232-239,371-374,1430-1442
+  s_3816fb7b7c4a27::t_fbf0ff3938788b 1499-1502,1553-1556,2713-2716,2721-2740,2766,2841,2847,2853-2854,2856,2861,2879,2894,2896,3304-3305
+  s_3816fb7b7c4a27::t_b8e8d3dd911167 570-571,2792,2831,2840,2842-2846,2848-2852,2855,2857-2860,2862-2878,2880-2893,2895,2897-2957,3302
+  s_3816fb7b7c4a27::t_b2a12a4a618856 2334-2349,2405-2406
+  s_3816fb7b7c4a27::t_db904fef954cfb 3303
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d37c3319d7b3f57137d2a4154e45ac65566b70ae",
+  "prompts": {},
+  "sessions": {
+    "s_3816fb7b7c4a27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b5b5c72-aca3-496b-8412-0fb9ae85948c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
