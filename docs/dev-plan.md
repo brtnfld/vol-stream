@@ -1241,6 +1241,13 @@ the one list. ★ marks what is being worked on next.
 
 **Protocol and semantics**
 
+- **Bug, unverified by a test:** pushing a variable-length dataset to a
+  subscriber appears to read freed memory. In `H5VL__stream_replay_manifest()`
+  the push source `payload_ptr` is the rebuilt `vl_buf`, which is freed right
+  after the dataset write and before the push. Even unfreed it would carry
+  `hvl_t` pointers, which mean nothing in another process. Either push the
+  serialized form (and teach the reader to decode it) or refuse VL
+  subscriptions.
 - Subscriptions are not retroactive: a reader that joins at step 500 cannot
   get the steps it missed (subscribe-with-start-step).
 - A reader that vanishes costs the writer push timeouts until SWIM declares

@@ -101,6 +101,31 @@ if(VOL_STREAM_HAVE_MERCURY)
   # eos's killed-writer case waits for SWIM to declare the writer dead.
   set_tests_properties(eos PROPERTIES TIMEOUT 150)
 
+  # Phase 1: the same tests with every push payload sent by Mercury bulk
+  # (VOL_STREAM_BULK_THRESHOLD=0) instead of inline. Their payloads are all
+  # below the default threshold, so without these the bulk path -- borrowed
+  # source bytes, the refilter's owned output, chunk-split slices, predicate
+  # runs -- would only ever see bulk_push's one large payload.
+  foreach(t subscribe precision chunk_zerocopy chunk_shape_split subvolume_nd strided_write predicate
+            subvolume_strided subvolume_grow step_grouping)
+    add_test(NAME ${t}_bulk COMMAND t_${t})
+    set_tests_properties(${t}_bulk PROPERTIES
+      ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>;VOL_STREAM_BULK_THRESHOLD=0"
+      TIMEOUT 60
+    )
+  endforeach()
+
+  # Phase 1's gate: one large push (256 MiB by default; T_BULK_MIB overrides,
+  # e.g. 1024 for the RFC's 1 GiB) goes by bulk and arrives intact, while a
+  # small push in the same step stays inline.
+  add_executable(t_bulk_push t_bulk_push.c)
+  target_link_libraries(t_bulk_push PRIVATE vol_stream)
+  add_test(NAME bulk_push COMMAND t_bulk_push)
+  set_tests_properties(bulk_push PROPERTIES
+    ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>;VOL_STREAM_STAGE_PAYLOAD=0"
+    TIMEOUT 180
+  )
+
   # Benchmark, not a correctness gate in the usual sense: the growing
   # time-series array (t_dset_resize.c's supported re-create-each-step
   # pattern) streamed for real over na+sm, reporting commit latency,

@@ -95,6 +95,18 @@ if(VOL_STREAM_BUILD_TESTS)
       )
     endforeach()
 
+    # The same scenarios with every push sent by Mercury bulk (Phase 1): a
+    # split column, a type conversion plus predicate, and deflate.
+    foreach(mode column narrowing deflate)
+      add_test(NAME python_stream_${mode}_bulk
+        COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_stream.py
+                $<TARGET_FILE:py_stream_writer> ${mode})
+      set_tests_properties(python_stream_${mode}_bulk PROPERTIES
+        ENVIRONMENT "${_py_env};VOL_STREAM_BULK_THRESHOLD=0"
+        TIMEOUT 120
+      )
+    endforeach()
+
     # P3 exit gate: early exit without close(), Ctrl-C and other threads
     # during a wait, and fork().
     foreach(mode break interrupt fork)

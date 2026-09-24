@@ -24,6 +24,7 @@
 
 #include <margo.h>
 #include <mercury_macros.h>
+#include <mercury_proc_bulk.h>
 #include <mercury_proc_string.h>
 
 #include <flock/flock-bootstrap.h>
@@ -104,6 +105,37 @@ static uint64_t vs_push_stats_ns          = 0;
 static uint64_t vs_push_stats_bytes       = 0;
 static uint64_t vs_push_stats_last_end_ns = 0;
 static uint64_t vs_push_stats_tail_ns     = 0;
+static uint64_t vs_push_stats_bulk        = 0; /* pushes whose payload went by bulk */
+
+/* Phase 1 (RFC sec:bulk-phase1): a payload of at least this many bytes is
+ * registered with margo_bulk_create() and pulled by the subscriber instead
+ * of travelling inline in the RPC record. Small pushes -- the many runs that
+ * selection and predicate narrowing produce -- stay inline, where a
+ * registration and a second round trip would cost more than the copy.
+ * VOL_STREAM_BULK_THRESHOLD overrides it (0: every non-empty payload by
+ * bulk). The default is a placeholder until the RDMA payload-size sweep
+ * (Phase 0) measures the crossover. Read once. */
+#define VS_TR_BULK_THRESHOLD_DEFAULT (64u * 1024u)
+static int      vs_bulk_threshold_read = 0;
+static uint64_t vs_bulk_threshold      = VS_TR_BULK_THRESHOLD_DEFAULT;
+
+static uint64_t
+vs_tr_bulk_threshold(void)
+{
+    if (!vs_bulk_threshold_read) {
+        const char *e = getenv("VOL_STREAM_BULK_THRESHOLD");
+
+        if (e && *e) {
+            char              *end = NULL;
+            unsigned long long v   = strtoull(e, &end, 10);
+
+            if (end && *end == '\0')
+                vs_bulk_threshold = (uint64_t)v;
+        }
+        vs_bulk_threshold_read = 1;
+    }
+    return vs_bulk_threshold;
+}
 
 static uint64_t
 vs_now_ns(void)
@@ -205,11 +237,14 @@ MERCURY_GEN_PROC(vs_subscribe_out_t, ((int32_t)(status))((int32_t)(matched)))
  * vs_tr_refilter_fn's comment) -- 0-length dcpl_enc means payload is raw,
  * unfiltered bytes, the original M8/M8.5 behavior. delivery is the
  * VS_TR_DELIVERY_* bits: which narrowing the writer could not apply exactly
- * to this push, so the subscriber knows it may hold a superset. */
+ * to this push, so the subscriber knows it may hold a superset. bulk/
+ * bulk_size (Phase 1): when bulk is not HG_BULK_NULL the payload blob is
+ * empty and the bytes are pulled from the writer's registered memory
+ * instead -- see vs_tr_bulk_threshold(). */
 MERCURY_GEN_PROC(vs_data_push_in_t,
                   ((uint64_t)(physical_step))((hg_string_t)(path))((uint64_t)(elem_start))((uint64_t)(
                       elem_count))((vs_blob_t)(payload))((vs_blob_t)(dcpl_enc))((vs_blob_t)(type_enc))(
-                      (uint32_t)(filter_mask))((uint32_t)(delivery)))
+                      (uint32_t)(filter_mask))((uint32_t)(delivery))((hg_bulk_t)(bulk))((uint64_t)(bulk_size)))
 MERCURY_GEN_PROC(vs_data_push_out_t, ((int32_t)(status)))
 
 /* M10: reader -> writer, "what is in this stream?". The reply's is_writer is
@@ -254,12 +289,23 @@ typedef struct vs_tr_pending_t {
  * the bulk/extra-buffer route was exercised too), overwriting the source
  * the instant iforward() returned, and confirming the receiver still saw
  * every original byte. It has to hold, because H5Fend_step() frees the
- * replay payload buffers between issuing these pushes and draining them. */
+ * replay payload buffers between issuing these pushes and draining them.
+ *
+ * Phase 1 breaks that for a payload sent by bulk: there is no copy, and the
+ * subscriber pulls from the source while the request is outstanding. Such a
+ * push records its registration in bulk, freed on completion. When the
+ * source is the caller's own memory (borrowed), vs_tr_writer_push_data()
+ * completes the push before returning, so its contract -- buf need only
+ * outlive the call -- still holds for every caller. An owned source (the
+ * refilter's output) is freed on completion as before, so it needs no such
+ * wait. */
 typedef struct vs_tr_inflight_t {
     hg_handle_t     handle;
     margo_request   req;
     void           *owned;
     vs_member_id_t member_id;
+    hg_bulk_t       bulk;     /* Phase 1: the payload's registration, or HG_BULK_NULL */
+    int             borrowed; /* bulk over memory the caller still owns */
 } vs_tr_inflight_t;
 
 /* Cap on pushes in flight at once. Reaching it completes the oldest to free
@@ -500,6 +546,7 @@ struct vs_tr_t {
      * thread-safe against a concurrent push either, for the same reason. */
     vs_tr_inflight_t *inflight;
     size_t             n_inflight;
+    size_t             n_borrowed_bulk; /* in-flight pushes pulling from caller memory */
     size_t             cap_inflight;
 
     /* Members whose push failed during the current vs_tr_writer_push_data()
@@ -1508,6 +1555,35 @@ vs_data_push_ult(hg_handle_t handle)
     if (tr && HG_SUCCESS == margo_get_input(handle, &in)) {
         char *path_copy = in.path ? strdup(in.path) : NULL;
 
+        /* Phase 1: the payload was registered on the writer rather than sent
+         * inline -- pull it into a buffer of our own before queueing. The
+         * writer keeps it registered until this response, so responding
+         * only after the pull completes is what makes the transfer safe. A
+         * failed pull queues nothing: the step is still announced, and a
+         * subscriber sees exactly what a lost push looks like. */
+        if (path_copy && in.bulk != HG_BULK_NULL && in.bulk_size > 0) {
+            void     *dst     = malloc((size_t)in.bulk_size);
+            hg_size_t dst_len = (hg_size_t)in.bulk_size;
+            hg_bulk_t local   = HG_BULK_NULL;
+            int       ok      = 0;
+
+            if (dst && HG_SUCCESS == margo_bulk_create(mid, 1, &dst, &dst_len, HG_BULK_WRITE_ONLY, &local)) {
+                ok = HG_SUCCESS == margo_bulk_transfer(mid, HG_BULK_PULL, margo_get_info(handle)->addr,
+                                                       in.bulk, 0, local, 0, (size_t)in.bulk_size);
+                margo_bulk_free(local);
+            }
+            if (ok) {
+                free(in.payload.buf); /* empty for a bulk push, but ours to free */
+                in.payload.buf  = dst;
+                in.payload.size = in.bulk_size;
+            }
+            else {
+                free(dst);
+                free(path_copy);
+                path_copy = NULL;
+            }
+        }
+
         if (path_copy) {
             vs_push_data_item(tr, in.physical_step, path_copy, in.payload.buf, in.payload.size, in.elem_start,
                                 in.elem_count, (uint8_t *)in.dcpl_enc.buf, in.dcpl_enc.size,
@@ -1670,11 +1746,11 @@ vs_tr_stop(vs_tr_t *tr)
                 "[vol-stream push stats] %llu pushes, %.3f ms total in the forward "
                 "(%.1f us/push), %.2f MiB pushed; %.3f ms of writer work follows the last "
                 "push of a step before that step is announced (the window an async push "
-                "could overlap into)\n",
+                "could overlap into); %llu via bulk\n",
                 (unsigned long long)vs_push_stats_n, (double)vs_push_stats_ns / 1e6,
                 (double)vs_push_stats_ns / 1e3 / (double)vs_push_stats_n,
                 (double)vs_push_stats_bytes / (1024.0 * 1024.0),
-                (double)vs_push_stats_tail_ns / 1e6);
+                (double)vs_push_stats_tail_ns / 1e6, (unsigned long long)vs_push_stats_bulk);
 
     pthread_mutex_lock(&tr->pending_lock);
     tr->stopped = 1;
@@ -2674,7 +2750,7 @@ vs_tr_reader_subscribe_type(vs_tr_t *tr, const char *path, const uint8_t *type_e
  * it. */
 static int
 vs_tr_inflight_add(vs_tr_t *tr, hg_handle_t handle, margo_request req, void *owned,
-                    vs_member_id_t member_id)
+                    vs_member_id_t member_id, hg_bulk_t bulk, int borrowed)
 {
     if (tr->n_inflight == tr->cap_inflight) {
         size_t            new_cap = tr->cap_inflight ? tr->cap_inflight * 2 : 8;
@@ -2690,6 +2766,10 @@ vs_tr_inflight_add(vs_tr_t *tr, hg_handle_t handle, margo_request req, void *own
     tr->inflight[tr->n_inflight].req       = req;
     tr->inflight[tr->n_inflight].owned     = owned;
     tr->inflight[tr->n_inflight].member_id = member_id;
+    tr->inflight[tr->n_inflight].bulk      = bulk;
+    tr->inflight[tr->n_inflight].borrowed  = borrowed;
+    if (borrowed)
+        tr->n_borrowed_bulk++;
     tr->n_inflight++;
     return 0;
 } /* end vs_tr_inflight_add() */
@@ -2749,6 +2829,10 @@ vs_tr_drain_one(vs_tr_t *tr)
         vs_tr_member_failed_add(tr, e->member_id);
 
     margo_destroy(e->handle);
+    if (e->bulk != HG_BULK_NULL)
+        margo_bulk_free(e->bulk);
+    if (e->borrowed)
+        tr->n_borrowed_bulk--;
     free(e->owned);
 
     memmove(&tr->inflight[0], &tr->inflight[1], (tr->n_inflight - 1) * sizeof(*tr->inflight));
@@ -2765,6 +2849,15 @@ vs_tr_drain_pushes(vs_tr_t *tr)
         vs_tr_drain_one(tr);
 } /* end vs_tr_drain_pushes() */
 
+/* Complete every push still pulling from memory the caller owns, so the
+ * caller may free it. A no-op, and so free, unless a bulk push was issued. */
+static void
+vs_tr_drain_borrowed(vs_tr_t *tr)
+{
+    while (tr->n_borrowed_bulk > 0 && tr->n_inflight > 0)
+        vs_tr_drain_one(tr);
+} /* end vs_tr_drain_borrowed() */
+
 /* One vs_data_push_in_t RPC to one already-resolved member address.
  * Factored out of vs_tr_writer_push_data()'s per-run loop so that loop can
  * call this once per run (the original M8/M8.5 behavior) or, when a
@@ -2778,8 +2871,12 @@ vs_tr_drain_pushes(vs_tr_t *tr)
  * payload_owned, if non-NULL, is freed once the forward completes --
  * callers pass the refilter callback's malloc'd output there, or NULL when
  * payload_buf points into the caller's own live buffer (the raw-bytes,
- * not-refiltered case). Either way the *source* bytes may die as soon as
- * this returns; see vs_tr_inflight_t's comment.
+ * not-refiltered case). An inline push copies the source, so it may die as
+ * soon as this returns. A bulk push (payload_len at or above
+ * vs_tr_bulk_threshold()) does not: an owned payload is freed on completion,
+ * and a borrowed one must outlive the request -- vs_tr_drain_borrowed(),
+ * which vs_tr_writer_push_data() calls before it returns. See
+ * vs_tr_inflight_t's comment.
  *
  * Returns 1 if the member should be treated as unreachable for the rest of
  * this write (matching the existing member_unreachable convention), 0
@@ -2797,6 +2894,8 @@ vs_tr_push_one_item(vs_tr_t *tr, hg_addr_t addr, vs_member_id_t member_id, uint6
     hg_handle_t         handle;
     int                  unreachable = 0;
     uint64_t             t0          = 0;
+    hg_bulk_t            bulk        = HG_BULK_NULL;
+    double               timeout_ms  = 1000.0;
 
     /* Test-only: a push lost on the way. The step is still announced as
      * usual, which is exactly what a subscriber sees when a real push fails,
@@ -2830,6 +2929,28 @@ vs_tr_push_one_item(vs_tr_t *tr, hg_addr_t addr, vs_member_id_t member_id, uint6
     in.dcpl_enc.size   = dcpl_enc_len;
     in.type_enc.buf    = (void *)(uintptr_t)type_enc;
     in.type_enc.size   = type_enc_len;
+    in.bulk            = HG_BULK_NULL;
+    in.bulk_size       = 0;
+
+    /* Phase 1: a large payload travels by bulk. The subscriber pulls it
+     * while this request is outstanding, so the per-push timeout also has to
+     * cover the transfer: 1 s plus 1 ms per 64 KiB, a floor of ~64 MB/s, so
+     * a slow link is not mistaken for a dead peer. A failed registration
+     * just keeps the payload inline. */
+    if (tr && payload_len > 0 && payload_len >= vs_tr_bulk_threshold()) {
+        void     *seg     = (void *)(uintptr_t)payload_buf;
+        hg_size_t seg_len = (hg_size_t)payload_len;
+
+        if (HG_SUCCESS == margo_bulk_create(tr->mid, 1, &seg, &seg_len, HG_BULK_READ_ONLY, &bulk)) {
+            in.payload.buf  = NULL;
+            in.payload.size = 0;
+            in.bulk         = bulk;
+            in.bulk_size    = payload_len;
+            timeout_ms      = 1000.0 + (double)(payload_len / (64u * 1024u));
+        }
+        else
+            bulk = HG_BULK_NULL;
+    }
 
     /* Same bounded, best-effort forward vs_tr_writer_push_data() always
      * used here -- see its own comment (now on this function) on why one
@@ -2855,12 +2976,16 @@ vs_tr_push_one_item(vs_tr_t *tr, hg_addr_t addr, vs_member_id_t member_id, uint6
     if (HG_SUCCESS == margo_create(tr->mid, addr, tr->data_push_rpc_id, &handle)) {
         margo_request req;
 
-        if (HG_SUCCESS == margo_iforward_timed(handle, &in, 1000.0, &req)) {
-            if (0 == vs_tr_inflight_add(tr, handle, req, payload_owned, member_id)) {
+        if (HG_SUCCESS == margo_iforward_timed(handle, &in, timeout_ms, &req)) {
+            if (bulk != HG_BULK_NULL)
+                vs_push_stats_bulk++;
+            if (0 == vs_tr_inflight_add(tr, handle, req, payload_owned, member_id, bulk,
+                                        bulk != HG_BULK_NULL && payload_owned == NULL)) {
                 /* Owned by the in-flight list now -- completed, and its
-                 * payload freed, by vs_tr_drain_one(). */
+                 * payload and registration freed, by vs_tr_drain_one(). */
                 payload_owned = NULL;
                 handle        = HG_HANDLE_NULL;
+                bulk          = HG_BULK_NULL;
             }
             else {
                 /* Could not record it: complete it here rather than leak the
@@ -2878,6 +3003,11 @@ vs_tr_push_one_item(vs_tr_t *tr, hg_addr_t addr, vs_member_id_t member_id, uint6
     }
     else
         unreachable = 1;
+
+    /* Not handed to the in-flight list (a failed create or forward, or the
+     * request already completed above): nothing is pulling from it now. */
+    if (bulk != HG_BULK_NULL)
+        margo_bulk_free(bulk);
 
     if (vs_push_stats_on) {
         uint64_t t1 = vs_now_ns();
@@ -3352,6 +3482,10 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
         free(sub_dcpl_enc);
         free(sub_pred_enc);
         free(sub_want_type_enc);
+        /* A bulk push of this subscriber's converted copy pulls from it until
+         * it completes. */
+        if (s_conv_buf)
+            vs_tr_drain_borrowed(tr);
         free(s_conv_buf);
         }
 
@@ -3368,6 +3502,11 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
             }
             free(snapshot);
         }
+
+        /* buf is the caller's and need only outlive this call, so a bulk push
+         * still pulling from it completes here. Inline pushes, and bulk ones
+         * from an owned buffer, stay in flight until the step is announced. */
+        vs_tr_drain_borrowed(tr);
     }
 
     return 0;

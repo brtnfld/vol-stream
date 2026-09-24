@@ -752,7 +752,8 @@ connector layout:
 | `VOL_STREAM_MAX_PENDING_BYTES` | byte count | unlimited | Caps the connector's in-step staging buffer |
 | `VOL_STREAM_SPILL_DIR` | directory path | `/tmp` | Where `H5VL_STREAM_QUEUE_SPILL` writes node-local bytes |
 | `VOL_STREAM_CONCENTRATION` | integer > 1 | `1` (off) | Subfiling-style I/O-concentrator topology for parallel writers: N ranks funnel their writes through one |
-| `VOL_STREAM_PUSH_STATS` | any non-`0` value | off | Report per-push timing from the transport |
+| `VOL_STREAM_BULK_THRESHOLD` | byte count | `65536` | A push payload at least this large is registered and pulled by the subscriber (Mercury bulk) rather than copied inline into the RPC. `0` sends every non-empty payload by bulk. The default is provisional until measured on an RDMA fabric |
+| `VOL_STREAM_PUSH_STATS` | any non-`0` value | off | Report per-push timing from the transport, including how many pushes went by bulk |
 | `VOL_STREAM_DEBUG_REFILTER` | any value | off | Trace per-subscriber re-filtering |
 | `VOL_STREAM_DEBUG_PREDICATE` | any value | off | Trace predicate evaluation |
 | `VOL_STREAM_TEST_DROP_PUSH` | push index `k` | unset | **Test only.** The writer silently skips the k-th data push it issues (counting from 0), while still announcing the step, so tests can reach a subscriber's lost-push handling. Never set it in production |
@@ -2152,6 +2153,7 @@ typedef enum H5VL_stream_pred_op_t {
 | `VOL_STREAM_MAX_PENDING_BYTES` | Cap on the in-step staging buffer |
 | `VOL_STREAM_SPILL_DIR` | Node-local directory for `SPILL` |
 | `VOL_STREAM_CONCENTRATION` | I/O-concentrator fan-in for parallel writers |
+| `VOL_STREAM_BULK_THRESHOLD` | Payload size from which a push goes by bulk (default 64 KiB) |
 | `VOL_STREAM_PUSH_STATS` | Per-push timing |
 | `VOL_STREAM_DEBUG_REFILTER`, `VOL_STREAM_DEBUG_PREDICATE` | Routing traces |
 
