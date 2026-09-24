@@ -106,6 +106,7 @@ static uint64_t vs_push_stats_bytes       = 0;
 static uint64_t vs_push_stats_last_end_ns = 0;
 static uint64_t vs_push_stats_tail_ns     = 0;
 static uint64_t vs_push_stats_bulk        = 0; /* pushes whose payload went by bulk */
+static uint64_t vs_push_stats_bulk_regs   = 0; /* margo_bulk_create() calls those needed */
 
 /* Phase 1 (RFC sec:bulk-phase1): a payload of at least this many bytes is
  * registered with margo_bulk_create() and pulled by the subscriber instead
@@ -253,13 +254,15 @@ MERCURY_GEN_PROC(vs_subscribe_out_t, ((int32_t)(status))((int32_t)(matched)))
  * unfiltered bytes, the original M8/M8.5 behavior. delivery is the
  * VS_TR_DELIVERY_* bits: which narrowing the writer could not apply exactly
  * to this push, so the subscriber knows it may hold a superset. bulk/
- * bulk_size (Phase 1): when bulk is not HG_BULK_NULL the payload blob is
+ * bulk_size/bulk_offset (Phase 1): when bulk is not HG_BULK_NULL the payload
+ * is bulk_size bytes at bulk_offset within that registration -- one
+ * registration serves many pushes (see vs_tr_region_t) -- and the blob is
  * empty and the bytes are pulled from the writer's registered memory
  * instead -- see vs_tr_bulk_threshold(). */
 MERCURY_GEN_PROC(vs_data_push_in_t,
                   ((uint64_t)(physical_step))((hg_string_t)(path))((uint64_t)(elem_start))((uint64_t)(
                       elem_count))((vs_blob_t)(payload))((vs_blob_t)(dcpl_enc))((vs_blob_t)(type_enc))(
-                      (uint32_t)(filter_mask))((uint32_t)(delivery))((hg_bulk_t)(bulk))((uint64_t)(bulk_size)))
+                      (uint32_t)(filter_mask))((uint32_t)(delivery))((hg_bulk_t)(bulk))((uint64_t)(bulk_size))((uint64_t)(bulk_offset)))
 MERCURY_GEN_PROC(vs_data_push_out_t, ((int32_t)(status)))
 
 /* M10: reader -> writer, "what is in this stream?". The reply's is_writer is
@@ -314,6 +317,19 @@ typedef struct vs_tr_pending_t {
  * outlive the call -- still holds for every caller. An owned source (the
  * refilter's output) is freed on completion as before, so it needs no such
  * wait. */
+/* Phase 1: memory a bulk push may pull from, registered once and shared.
+ * A registration pins and maps memory, which on an RDMA provider costs far
+ * more than a copy of a small payload, so it is made once per source buffer
+ * -- the step's whole staging buffer, or one write's data -- and every push
+ * from inside it names its slice by offset. Registered lazily, on the first
+ * bulk push that needs it, and released by vs_tr_writer_release_sources()
+ * once nothing is pulling from it any more. */
+typedef struct vs_tr_region_t {
+    const uint8_t *base;
+    uint64_t       len;
+    hg_bulk_t      bulk; /* HG_BULK_NULL until first needed */
+} vs_tr_region_t;
+
 typedef struct vs_tr_inflight_t {
     hg_handle_t     handle;
     margo_request   req;
@@ -568,6 +584,10 @@ struct vs_tr_t {
     size_t             n_inflight;
     size_t             n_borrowed_bulk; /* in-flight pushes pulling from caller memory */
     int                push_only_set;    /* vs_tr_writer_push_data_to(): one member only */
+    vs_tr_region_t    *regions;          /* see vs_tr_region_t */
+    size_t             n_regions, cap_regions;
+    void             **deferred;         /* freed once no borrowed pull is in flight */
+    size_t             n_deferred, cap_deferred;
     vs_member_id_t     push_only_member;
     int64_t            bulk_threshold;  /* this file's setting, -1 = default */
     size_t             cap_inflight;
@@ -1613,7 +1633,8 @@ vs_data_push_ult(hg_handle_t handle)
 
             if (dst && HG_SUCCESS == margo_bulk_create(mid, 1, &dst, &dst_len, HG_BULK_WRITE_ONLY, &local)) {
                 ok = HG_SUCCESS == margo_bulk_transfer(mid, HG_BULK_PULL, margo_get_info(handle)->addr,
-                                                       in.bulk, 0, local, 0, (size_t)in.bulk_size);
+                                                       in.bulk, (size_t)in.bulk_offset, local, 0,
+                                                       (size_t)in.bulk_size);
                 margo_bulk_free(local);
             }
             if (ok) {
@@ -1792,17 +1813,23 @@ vs_tr_stop(vs_tr_t *tr)
      * without ending the step -- must complete before margo_finalize()
      * below, and its payload freed rather than leaked. */
     vs_tr_drain_pushes(tr);
+    vs_tr_writer_release_sources(tr);
+    free(tr->regions);
+    free(tr->deferred);
+    tr->regions  = NULL;
+    tr->deferred = NULL;
 
     if (vs_push_stats_on > 0 && vs_push_stats_n > 0)
         fprintf(stderr,
                 "[vol-stream push stats] %llu pushes, %.3f ms total in the forward "
                 "(%.1f us/push), %.2f MiB pushed; %.3f ms of writer work follows the last "
                 "push of a step before that step is announced (the window an async push "
-                "could overlap into); %llu via bulk\n",
+                "could overlap into); %llu via bulk (%llu registrations)\n",
                 (unsigned long long)vs_push_stats_n, (double)vs_push_stats_ns / 1e6,
                 (double)vs_push_stats_ns / 1e3 / (double)vs_push_stats_n,
                 (double)vs_push_stats_bytes / (1024.0 * 1024.0),
-                (double)vs_push_stats_tail_ns / 1e6, (unsigned long long)vs_push_stats_bulk);
+                (double)vs_push_stats_tail_ns / 1e6, (unsigned long long)vs_push_stats_bulk,
+                (unsigned long long)vs_push_stats_bulk_regs);
 
     pthread_mutex_lock(&tr->pending_lock);
     tr->stopped = 1;
@@ -3073,6 +3100,123 @@ vs_tr_drain_borrowed(vs_tr_t *tr)
         vs_tr_drain_one(tr);
 } /* end vs_tr_drain_borrowed() */
 
+/* Record [base, base+len) as memory bulk pushes may pull from. Cheap: it is
+ * only registered if a bulk push from inside it is actually made. */
+static void
+vs_tr_region_add(vs_tr_t *tr, const void *base, uint64_t len)
+{
+    size_t i;
+
+    if (!tr || !base || len == 0)
+        return;
+    for (i = 0; i < tr->n_regions; i++)
+        if (tr->regions[i].base == (const uint8_t *)base && tr->regions[i].len == len)
+            return;
+    if (tr->n_regions == tr->cap_regions) {
+        size_t          new_cap = tr->cap_regions ? tr->cap_regions * 2 : 8;
+        vs_tr_region_t *grown   = (vs_tr_region_t *)realloc(tr->regions, new_cap * sizeof(*grown));
+
+        if (!grown)
+            return; /* a push from it registers on its own instead */
+        tr->regions     = grown;
+        tr->cap_regions = new_cap;
+    }
+    tr->regions[tr->n_regions].base = (const uint8_t *)base;
+    tr->regions[tr->n_regions].len  = len;
+    tr->regions[tr->n_regions].bulk = HG_BULK_NULL;
+    tr->n_regions++;
+} /* end vs_tr_region_add() */
+
+/* The registration covering [p, p+len), made now if not yet, and p's offset
+ * in it. The first region added that covers it wins, so a step's whole
+ * staging buffer, added before its writes, serves them all. HG_BULK_NULL if
+ * none covers it. */
+static hg_bulk_t
+vs_tr_region_bulk(vs_tr_t *tr, const void *p, uint64_t len, uint64_t *offset)
+{
+    const uint8_t *q = (const uint8_t *)p;
+    size_t         i;
+
+    for (i = 0; i < tr->n_regions; i++) {
+        vs_tr_region_t *r = &tr->regions[i];
+
+        if (q < r->base || q + len > r->base + r->len)
+            continue;
+        if (r->bulk == HG_BULK_NULL) {
+            void     *seg     = (void *)(uintptr_t)r->base;
+            hg_size_t seg_len = (hg_size_t)r->len;
+
+            if (HG_SUCCESS != margo_bulk_create(tr->mid, 1, &seg, &seg_len, HG_BULK_READ_ONLY, &r->bulk)) {
+                r->bulk = HG_BULK_NULL;
+                return HG_BULK_NULL;
+            }
+            vs_push_stats_bulk_regs++;
+        }
+        *offset = (uint64_t)(q - r->base);
+        return r->bulk;
+    }
+    return HG_BULK_NULL;
+} /* end vs_tr_region_bulk() */
+
+/* Free p at the next vs_tr_writer_release_sources(), with the region that
+ * may cover it -- never earlier, even with no pull in flight, since a region
+ * left naming freed memory could match a later allocation at that address. */
+static void
+vs_tr_defer_free(vs_tr_t *tr, void *p)
+{
+    void **grown;
+
+    if (!p)
+        return;
+    if (tr->n_deferred == tr->cap_deferred) {
+        size_t new_cap = tr->cap_deferred ? tr->cap_deferred * 2 : 8;
+
+        if (NULL == (grown = (void **)realloc(tr->deferred, new_cap * sizeof(*grown)))) {
+            size_t i = 0;
+
+            /* Cannot record it: complete the pulls, drop its region, free. */
+            vs_tr_drain_borrowed(tr);
+            while (i < tr->n_regions)
+                if (tr->regions[i].base == (const uint8_t *)p) {
+                    if (tr->regions[i].bulk != HG_BULK_NULL)
+                        margo_bulk_free(tr->regions[i].bulk);
+                    tr->regions[i] = tr->regions[--tr->n_regions];
+                }
+                else
+                    i++;
+            free(p);
+            return;
+        }
+        tr->deferred     = grown;
+        tr->cap_deferred = new_cap;
+    }
+    tr->deferred[tr->n_deferred++] = p;
+} /* end vs_tr_defer_free() */
+
+void
+vs_tr_writer_add_region(vs_tr_t *tr, const void *base, uint64_t len)
+{
+    vs_tr_region_add(tr, base, len);
+} /* end vs_tr_writer_add_region() */
+
+void
+vs_tr_writer_release_sources(vs_tr_t *tr)
+{
+    size_t i;
+
+    if (!tr)
+        return;
+    vs_tr_drain_borrowed(tr);
+    /* Deregister before freeing: some regions cover deferred buffers. */
+    for (i = 0; i < tr->n_regions; i++)
+        if (tr->regions[i].bulk != HG_BULK_NULL)
+            margo_bulk_free(tr->regions[i].bulk);
+    tr->n_regions = 0;
+    for (i = 0; i < tr->n_deferred; i++)
+        free(tr->deferred[i]);
+    tr->n_deferred = 0;
+} /* end vs_tr_writer_release_sources() */
+
 /* One vs_data_push_in_t RPC to one already-resolved member address.
  * Factored out of vs_tr_writer_push_data()'s per-run loop so that loop can
  * call this once per run (the original M8/M8.5 behavior) or, when a
@@ -3109,7 +3253,8 @@ vs_tr_push_one_item(vs_tr_t *tr, hg_addr_t addr, vs_member_id_t member_id, uint6
     hg_handle_t         handle;
     int                  unreachable = 0;
     uint64_t             t0          = 0;
-    hg_bulk_t            bulk        = HG_BULK_NULL;
+    hg_bulk_t            bulk        = HG_BULK_NULL; /* this push's own registration, if any */
+    int                  by_bulk     = 0;
     double               timeout_ms  = 1000.0;
 
     /* Test-only: a push lost on the way. The step is still announced as
@@ -3152,19 +3297,36 @@ vs_tr_push_one_item(vs_tr_t *tr, hg_addr_t addr, vs_member_id_t member_id, uint6
      * cover the transfer: 1 s plus 1 ms per 64 KiB, a floor of ~64 MB/s, so
      * a slow link is not mistaken for a dead peer. A failed registration
      * just keeps the payload inline. */
+    in.bulk_offset     = 0;
     if (tr && payload_len > 0 && payload_len >= vs_tr_bulk_threshold(tr->bulk_threshold)) {
-        void     *seg     = (void *)(uintptr_t)payload_buf;
-        hg_size_t seg_len = (hg_size_t)payload_len;
+        hg_bulk_t use = HG_BULK_NULL;
+        uint64_t  off = 0;
 
-        if (HG_SUCCESS == margo_bulk_create(tr->mid, 1, &seg, &seg_len, HG_BULK_READ_ONLY, &bulk)) {
+        /* Borrowed memory: a slice of a region registered once and shared
+         * (vs_tr_region_t). Owned memory -- the refilter's output -- is one
+         * push's alone, so it gets a registration of its own, freed with it. */
+        if (!payload_owned)
+            use = vs_tr_region_bulk(tr, payload_buf, payload_len, &off);
+        if (use == HG_BULK_NULL) {
+            void     *seg     = (void *)(uintptr_t)payload_buf;
+            hg_size_t seg_len = (hg_size_t)payload_len;
+
+            if (HG_SUCCESS == margo_bulk_create(tr->mid, 1, &seg, &seg_len, HG_BULK_READ_ONLY, &bulk)) {
+                use = bulk;
+                vs_push_stats_bulk_regs++;
+            }
+            else
+                bulk = HG_BULK_NULL;
+        }
+        if (use != HG_BULK_NULL) {
             in.payload.buf  = NULL;
             in.payload.size = 0;
-            in.bulk         = bulk;
+            in.bulk         = use;
             in.bulk_size    = payload_len;
+            in.bulk_offset  = off;
             timeout_ms      = 1000.0 + (double)(payload_len / (64u * 1024u));
+            by_bulk         = 1;
         }
-        else
-            bulk = HG_BULK_NULL;
     }
 
     /* Same bounded, best-effort forward vs_tr_writer_push_data() always
@@ -3192,10 +3354,10 @@ vs_tr_push_one_item(vs_tr_t *tr, hg_addr_t addr, vs_member_id_t member_id, uint6
         margo_request req;
 
         if (HG_SUCCESS == margo_iforward_timed(handle, &in, timeout_ms, &req)) {
-            if (bulk != HG_BULK_NULL)
+            if (by_bulk)
                 vs_push_stats_bulk++;
             if (0 == vs_tr_inflight_add(tr, handle, req, payload_owned, member_id, bulk,
-                                        bulk != HG_BULK_NULL && payload_owned == NULL)) {
+                                        by_bulk && payload_owned == NULL)) {
                 /* Owned by the in-flight list now -- completed, and its
                  * payload and registration freed, by vs_tr_drain_one(). */
                 payload_owned = NULL;
@@ -3259,6 +3421,9 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
     self_id = tr->self_id;
 
     write_end = write_start + write_count;
+
+    /* The whole write's data, as one region its bulk pushes share. */
+    vs_tr_region_add(tr, buf, write_count * elem_size);
 
     /* Fresh unreachable-member set per write, matching the synchronous
      * version's scope exactly: a member given up on here is retried from
@@ -3517,6 +3682,7 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
                                       sub_want_type_enc_len, &conv, &conv_esz) &&
                 conv_esz > 0) {
                 s_conv_buf     = conv;
+                vs_tr_region_add(tr, conv, overlap_count * conv_esz);
                 s_buf          = conv;
                 s_base         = overlap_start;
                 s_elem_size    = conv_esz;
@@ -3701,11 +3867,9 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
         free(sub_dcpl_enc);
         free(sub_pred_enc);
         free(sub_want_type_enc);
-        /* A bulk push of this subscriber's converted copy pulls from it until
-         * it completes. */
-        if (s_conv_buf)
-            vs_tr_drain_borrowed(tr);
-        free(s_conv_buf);
+        /* A bulk push of this subscriber's converted copy may still be
+         * pulling from it; it is freed once none is. */
+        vs_tr_defer_free(tr, s_conv_buf);
         }
 
         /* Whatever wasn't matched to a member above (e.g. a subscriber SSG
@@ -3721,11 +3885,6 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
             }
             free(snapshot);
         }
-
-        /* buf is the caller's and need only outlive this call, so a bulk push
-         * still pulling from it completes here. Inline pushes, and bulk ones
-         * from an owned buffer, stay in flight until the step is announced. */
-        vs_tr_drain_borrowed(tr);
     }
 
     return 0;

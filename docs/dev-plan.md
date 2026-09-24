@@ -1232,6 +1232,16 @@ matches the code. Each item is documented for users in
   first, and end_step collects its notes and pushes them as its last action.
   A `Discard` drop is reported that way (`t_queue_policy`), and so is the
   parallel Spill-as-Block warning, which had never been visible.
+- **Phase 1 follow-ups: shared registrations, overlapped transfers.** A
+  borrowed bulk push now pulls from a region registered once -- the step's
+  whole staging buffer, or one write's data -- at an offset carried in the
+  push (a wire change), so a step registers once however many pushes it
+  makes; the refilter's owned output still registers per push. And
+  `vs_tr_writer_push_data()` no longer waits for its pulls: they complete
+  at the end of the step's replay (`vs_tr_writer_release_sources()`), so a
+  large transfer overlaps the rest of the replay. A subscriber's converted
+  copy is freed there too rather than waited on. `bulk_regions`: 32 bulk
+  pushes of a column from one registration, values checked.
 - **No crash when HDF5 walks open objects mid-step.** A dataset created in
   the open step has no native object until the step commits, but HDF5 asks
   for one whenever it walks the open dataset IDs (a file close's flush, a
@@ -1313,9 +1323,7 @@ the one list. ★ marks what is being worked on next.
 - **Bulk transfer (RFC Phase 1) is built** (see *After M10*). Still open
   from its gate: the throughput comparison against a Phase 0 baseline (needs
   an RDMA fabric), the 1 GiB run (`T_BULK_MIB=1024 t_bulk_push`, by hand),
-  and an ASan build with the transport. Follow-ups: one registration per
-  step instead of per push, and overlapping a borrowed-buffer pull with the
-  rest of the step instead of waiting for it in `vs_tr_writer_push_data()`.
+  and an ASan build with the transport.
 - HMEM provider and device-direct delivery (RFC Phases 2 and 3), after Phase 1.
 - The payload-size sweep on a real RDMA fabric (RFC Phase 0), which needs
   multi-node hardware. It sets Phase 1's priority and threshold, not whether

@@ -6853,6 +6853,13 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
     }
 
 done:
+#ifdef VOL_STREAM_HAVE_MERCURY
+    /* The step's large pushes have been pulling from its payloads while the
+     * rest of the replay ran; every caller frees those once this returns,
+     * so the pulls complete here (see vs_tr_writer_release_sources()). */
+    if (file_obj->file_state && file_obj->file_state->transport)
+        vs_tr_writer_release_sources(file_obj->file_state->transport);
+#endif
     free(replay_under);
     free(needs_close);
     free(step_root);
@@ -6898,6 +6905,12 @@ H5VL__stream_replay_step(H5VL_stream_t *file_obj)
                                       H5VL__stream_stage_payload(fs)) < 0)
         return -1;
 
+#ifdef VOL_STREAM_HAVE_MERCURY
+    /* The staged step's payloads are slices of one buffer: register it once
+     * for every bulk push the step makes. */
+    if (fs->transport && payload_buf && payload_len > 0)
+        vs_tr_writer_add_region(fs->transport, payload_buf, (uint64_t)payload_len);
+#endif
     ret_value = H5VL__stream_replay_manifest(file_obj, manifest_buf, manifest_len, payload_buf, fs->pending,
                                                fs->n_pending);
 
@@ -11670,6 +11683,7 @@ H5VL__stream_backfill_one(H5VL_stream_file_state_t *fs, uint64_t member, const c
     H5VL__stream_encode_space(space, &senc, &slen);
     vs_tr_writer_push_data_to(fs->transport, member, k, path, buf, (uint64_t)esize, 0, (uint64_t)n, tenc,
                               (uint64_t)tlen, senc, (uint64_t)slen);
+    vs_tr_writer_release_sources(fs->transport); /* buf is freed below */
     ok = 1;
 
 done:

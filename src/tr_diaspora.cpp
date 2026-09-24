@@ -1369,6 +1369,17 @@ vs_tr_writer_announce_to(vs_tr_t *, uint64_t, uint64_t, uint64_t)
 }
 
 void
+vs_tr_writer_add_region(vs_tr_t *, const void *, uint64_t)
+{
+}
+
+void
+vs_tr_writer_release_sources(vs_tr_t *)
+{
+    /* Payloads are copied into the Diaspora event before the call returns. */
+}
+
+void
 vs_tr_set_bulk_threshold(vs_tr_t *, int64_t)
 {
     /* Payloads travel through Diaspora's own data path; no bulk threshold. */

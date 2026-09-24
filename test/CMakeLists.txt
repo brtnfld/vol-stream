@@ -159,6 +159,16 @@ if(VOL_STREAM_HAVE_MERCURY)
     TIMEOUT 60
   )
 
+  # One bulk registration serves all of a step's pushes: 32 bulk pushes of a
+  # column, one registration of the step's staging buffer.
+  add_executable(t_bulk_regions t_bulk_regions.c)
+  target_link_libraries(t_bulk_regions PRIVATE vol_stream)
+  add_test(NAME bulk_regions COMMAND t_bulk_regions)
+  set_tests_properties(bulk_regions PROPERTIES
+    ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
+    TIMEOUT 60
+  )
+
   # Phase 1's gate: one large push (256 MiB by default; T_BULK_MIB overrides,
   # e.g. 1024 for the RFC's 1 GiB) goes by bulk and arrives intact, while a
   # small push in the same step stays inline.

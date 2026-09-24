@@ -268,6 +268,21 @@ typedef struct vs_tr_run_t {
  * loss. */
 #define VS_TR_MAX_PRED_RUNS 64
 
+/* Writer side, Phase 1: sources of bulk pushes.
+ *
+ * vs_tr_writer_push_data() may return while subscribers are still pulling
+ * large payloads from buf, so a transfer overlaps whatever the writer does
+ * next. The caller must therefore keep every buffer it has pushed from alive
+ * until it calls vs_tr_writer_release_sources(), which completes those pulls
+ * and releases their registrations. Call it before freeing any of them --
+ * the replay does, once per step.
+ *
+ * vs_tr_writer_add_region() names a larger buffer the pushes come from --
+ * the step's whole staging buffer -- so one registration serves all of them.
+ * Optional: each write's own buffer is a region anyway. */
+void vs_tr_writer_add_region(vs_tr_t *tr, const void *base, uint64_t len);
+void vs_tr_writer_release_sources(vs_tr_t *tr);
+
 /* Writer side, Phase 1: this file's bulk threshold in bytes (see
  * VOL_STREAM_BULK_THRESHOLD, which overrides it when set), or -1 for the
  * default. Call once, right after vs_tr_start(). */
