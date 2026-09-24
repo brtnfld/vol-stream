@@ -13,9 +13,9 @@ anything else in this repository.
 | **Connector value** | `1091` — **provisional**, see [§3.8](#38-a-note-on-the-connector-value) |
 | **VOL type** | Pass-through, derived from HDF5's own `src/H5VLpassthru.c` |
 | **Default underlying VOL** | Native (POSIX / MPI-IO / Lustre / GPFS) |
-| **Streaming transport** | Mercury + Margo + SSG (the [Mochi](https://www.mcs.anl.gov/research/projects/mochi/) stack); optional BAKE for spill |
+| **Streaming transport** | Mercury + Margo + Flock (the [Mochi](https://www.mcs.anl.gov/research/projects/mochi/) stack); optional BAKE for spill |
 | **Required HDF5** | **HDF5 2.x (`develop`) only** — see the warning below |
-| **Client languages** | C, C++ (via the C API). Python is [partially reachable](#54-example-3-python-h5py-interoperability) |
+| **Client languages** | C, C++ (via the C API). Python: a subscriber package, `volstream` ([§5.4](#54-example-3-python)) |
 | **Public header** | [`src/H5VLstream.h`](../src/H5VLstream.h) |
 | **License** | Same as HDF5 |
 
@@ -146,7 +146,7 @@ flowchart TB
 
     subgraph STREAM ["stream path — only if subscribed"]
       ROUTE["selection intersect<br/>+ predicate + re-filter"]
-      MARGO["Mercury / Margo RPC<br/>SSG group membership"]
+      MARGO["Mercury / Margo RPC<br/>Flock group membership"]
       SUB["live subscriber process<br/>H5Fget_subscribed_data()"]
     end
 
@@ -177,10 +177,12 @@ In plain text:
         +--> Native VOL --> HDF5 file on disk  (/step/<n>/<path>)
 ```
 
-Note the back-arrow. Because subscribers acknowledge steps, the writer knows how
-far behind the slowest tracked consumer is, and can apply a
+Note the back-arrow. Readers that acknowledge steps let the writer know how far
+behind the slowest tracked consumer is, so it can apply a
 [queue policy](#43-backpressure-and-failure-isolation-the-queue-policy) instead
-of either blocking forever or dropping data silently.
+of either blocking forever or dropping data silently. A reader advancing with
+`H5Fbegin_step()` acknowledges automatically; a subscriber opts in with
+`H5Fack_stream_step()` (in Python, `backpressure=True`).
 
 ### 1.5 What the file on disk actually looks like
 
@@ -269,17 +271,15 @@ honestly in [§8.1](#81-faq)). What it buys:
 Everything documented in this guide is implemented and exercised by the test
 suite unless a callout says otherwise. In summary: step capture and atomic
 replay; a decoupled reader with logical-step navigation; the Mercury/Margo
-transport with SSG rendezvous and late-joiner seeding; deferred (`H5ES`) write
-requests; parallel writers including heterogeneous per-rank object sets and an
-optional I/O-concentrator topology; queue policy with reader acknowledgement and
-BAKE-backed spill; the subscription protocol with subvolume, per-subscriber
-precision, and predicate pushdown; and the `h5stream` tool.
-
-> [!NOTE]
-> The `README.md` at the root of this repository still carries a "Status: M1"
-> banner and a roadmap table that predate almost all of the above, and its
-> `H5Fbegin_step(fid, 1, &step)` snippet is missing the `wall_time_ns` argument
-> the current header requires. **This document supersedes it.**
+transport with Flock rendezvous (SSG through M10) and late-joiner seeding;
+deferred (`H5ES`) write requests; parallel writers including heterogeneous
+per-rank object sets and an optional I/O-concentrator topology; queue policy
+with reader acknowledgement (automatic for cursor readers, opt-in for
+subscribers via `H5Fack_stream_step()`) and BAKE-backed spill; the
+subscription protocol with subvolume, per-subscriber precision, type
+narrowing, and predicate pushdown; live schema discovery; end of stream for
+subscribers when the writer leaves; the `h5stream` tool; and the `volstream`
+Python subscriber.
 
 ### 2.2 Data-model support
 
@@ -324,7 +324,9 @@ Stated plainly so you can plan around them:
   builds a single chunk spanning the pushed run. This affects how a re-filtered
   push is stored in transit, not which elements are chosen.
 - **`h5py` cannot open a step.** The step API is optional operations; `h5py` has
-  no binding for `H5VLfile_optional_op()`. See [§5.4](#54-example-3-python-h5py-interoperability).
+  no binding for `H5VLfile_optional_op()`. Python reaches the stream through
+  the separate `volstream` package instead, as a subscriber only; see
+  [§5.4](#54-example-3-python).
 - **`h5dump` cannot address a past revision of an archive.** `--vfd-name onion`
   exists but `--vfd-info` is cast straight to `H5FD_onion_fapl_info_t *`, so
   there is no way to spell a revision number on the command line. Measured:
@@ -391,7 +393,9 @@ either side of that change cannot interoperate.
 
 ### 2.5 How the behavior in this guide is verified
 
-The `ctest` suite has 44 targets. The load-bearing ones, and what each pins:
+The `ctest` suite has about two dozen targets without the transport and over 60
+with it and the Python package (the count grows with every fix, so check
+`ctest -N`). The load-bearing ones, and what each pins:
 
 | Test | Asserts |
 |---|---|
@@ -406,6 +410,10 @@ The `ctest` suite has 44 targets. The load-bearing ones, and what each pins:
 | `parallel_concentration*` | The concentrator actually logged writing on another rank's behalf rather than silently no-op'ing |
 | `queue_policy`, `parallel_lag` | Block/Discard/Spill behavior under real reader lag |
 | `subscribe`, `predicate`, `subvolume_*`, `precision*` | The routing narrowings, including that an unsubscribed sibling object is never sent |
+| `step_rewrite` | A dataset, and an attribute on it, rewritten every step through handles kept open from step 0: each step holds its own values, and no later write lands on an earlier step's copy |
+| `step_grouping` | Every push of a step is queued by the time its step-ready arrives, steps never interleave, a lagging reader must carry one push over, and a late joiner's first step drains empty |
+| `eos` | End of stream: never reported while the writer is present or a step is unconsumed; reported once the writer has left and its last step is consumed, including for a writer that never committed a step; waits then return at once |
+| `python_*` | The `volstream` package against a live C writer: reassembly, narrowing, iteration, end of stream, a lost push (via `VOL_STREAM_TEST_DROP_PUSH`), backpressure, growth, compound types and attributes, deflate, several Files in one process, Ctrl-C, `fork()`, and exit without `close()` |
 | `plugin_scratch` | The `HDF5_VOL_CONNECTOR` path specifically — the one configuration where the connector's internal scratch files could recurse back into itself |
 
 > [!NOTE]
@@ -425,7 +433,7 @@ CI covers these axes:
 | Mercury NA plugin | `na+sm` (gating) · `ofi+tcp` (a subset, non-gating) |
 | Rank shapes | 3→2 · 7→3 (coprime, where M×N projection bugs surface) |
 | Sanitizers | ASan · UBSan · TSan |
-| Python binding | CPython 3.12 with NumPy and CPU-only torch, `na+sm` only |
+| Python binding | CPython 3.12 with NumPy and CPU-only torch; `na+sm` (gating) and `ofi+tcp` (non-gating); installed with pip and tested from outside the source tree |
 
 ---
 
@@ -763,20 +771,23 @@ connector layout:
 ### 4.2 Rendezvous
 
 There is no broker to configure and no contact file to manage by hand. A writer
-creates an SSG group at `H5Fcreate()`/`H5Fopen()` time and writes its group id
-to a sidecar file next to the data file:
+creates a Flock group at `H5Fcreate()`/`H5Fopen()` time (SSG until the
+migration after M10), and Flock keeps a sidecar file next to the data file
+current with the group's members:
 
 ```
 example_series.h5           <- the HDF5 file
-example_series.h5.vsgroup   <- the SSG group id, how consumers find the writer
+example_series.h5.vsgroup   <- the Flock group file, how consumers find the writer
 ```
 
-A consumer loads the sidecar and joins. SSG's SWIM failure detector handles
+A consumer loads the sidecar and joins. Flock's SWIM failure detector handles
 liveness, so a consumer that dies is simply absent from the next group view —
 there is no vol-stream-level liveness tracking and no risk of a dead consumer
 stalling the writer. A consumer that joins mid-stream is seeded with the
 writer's current step, so its first `H5Fwait_step_ready()` returns immediately
-rather than blocking for a write it already missed.
+rather than blocking for a write it already missed. The same membership
+updates tell a subscriber when the writer leaves, which is how it sees the end
+of the stream.
 
 > [!IMPORTANT]
 > **The sidecar is the handshake.** A consumer must wait for
@@ -1481,10 +1492,36 @@ receive one push per writer entry overlapping that range, and a non-contiguous
 selection or a fragmented predicate match produces one push per contiguous run.
 Each carries its own `elem_start`/`elem_count`, so reassembly is unambiguous.
 
-### 5.4 Example 3: Python (`h5py`) interoperability
+### 5.4 Example 3: Python
 
-An unmodified `h5py` script picks up the connector from the environment, with
-no code changes:
+**Consuming a live stream: `volstream`.** A subscriber-only package built on the
+C API above (design and gaps in [`python-plan.md`](python-plan.md)). Build it
+with `-DVOL_STREAM_BUILD_PYTHON=ON`, or `pip install .` from the repository root
+against the same HDF5 the connector uses:
+
+```python
+import numpy as np
+import volstream
+
+# Subscribe to one quadrant of a simulation's 2-D field, delivered as float32
+# and compressed in transit. Shapes and types come from the writer's schema;
+# a (start, count) selection is fixed, while a whole-dataset subscription
+# ({"/temperature": None}) also follows growth along the first dimension.
+with volstream.follow("run.h5", {"/temperature": ((0, 0), (64, 64))}, deflate=4) as stream:
+    stream.subscribe_type("/temperature", np.float32)
+    for step in stream:                  # ends when the writer closes the file
+        t = step["/temperature"]         # ndarray; masked if part was not sent
+        print(step.phys, t.mean())
+```
+
+`next_step()` returns one `Step` per committed step; `get()` returns single raw
+pushes. `backpressure=True` makes the writer's queue policy count this reader.
+`volstream.torch.StreamDataset` wraps a stream for a PyTorch `DataLoader`
+(`num_workers=0`). A `File` is refused after `fork()`, releases the GIL while it
+waits, and is interruptible with Ctrl-C.
+
+**Writing: `h5py` under the connector.** An unmodified `h5py` script picks up the
+connector from the environment, with no code changes:
 
 ```bash
 export HDF5_PLUGIN_PATH=/path/to/vol-stream/build
@@ -1510,8 +1547,8 @@ with h5py.File("from_python.h5", "w") as f:
 > `H5VLfile_optional_op()`, and `h5py` has no binding for that. So a `h5py`
 > script running under the connector writes ordinary, correct HDF5 through the
 > pass-through path and **never opens a step**, which means it never streams
-> anything. Dedicated `h5py` bindings are postponed, not abandoned; until they
-> land, the streaming side of vol-stream is reachable from C and C++ only.
+> anything. `volstream` above is subscriber-only; a Python *writer* is out of
+> scope, so the producing side of a stream is C and C++ only.
 
 Python is fully useful on the **consuming** side of a finished stream, which is
 where most analysis code sits anyway:
@@ -1538,14 +1575,17 @@ with h5py.File("snapshot.h5", "r") as f:
 
 ### 5.5 Worked demonstrations in this repository
 
-Two complete, runnable use cases ship in `examples/`, both built only when the
-transport is available. Each is a pair of independent programs — a simulation
-and a live monitor — not a test harness:
+Five runnable use cases ship in `examples/`, built only when the transport is
+available (CI builds them; it does not run them). Each is a set of independent
+programs, not a test harness; each has its own `README.md`:
 
 | Example | What it does |
 |---|---|
 | `examples/heat_diffusion/` | 2-D transient heat conduction (explicit FTCS) streaming its temperature field once per timestep; `heat_monitor` subscribes to `/temperature` and redraws an ASCII heatmap plus running statistics as the simulation converges |
 | `examples/reaction_diffusion/` | Gray–Scott reaction–diffusion, same two-program shape |
+| `examples/narrowing_demo/` | One write per step, narrowed per subscriber at the writer: precision, filter, or a value condition |
+| `examples/detector_pipeline/` | A multi-module detector feeding five consumer roles that discover the stream's structure from its schema (RFC section A.2), including a monitor that turns per-frame status into decisions |
+| `examples/vfd_swmr/` | A proof of concept composing vol-stream with VFD SWMR so the live file itself becomes readable |
 
 Run either with its `run_demo.sh`, or by hand in two terminals:
 
@@ -1659,7 +1699,7 @@ categories apart:
 - **`write capture`** / **`step manifest`** — capture, encode/decode, or replay
   failed. These are the ones that mean data did not land. A rejected datatype
   ([§2.2](#22-data-model-support)) surfaces here.
-- **`transport`** — Mercury/SSG. Note that a transport failure at file-open time
+- **`transport`** — Mercury/Flock. Note that a transport failure at file-open time
   does *not* surface as a failed `H5Fcreate()`; see the fail-soft note in
   [§4.3](#43-backpressure-and-failure-isolation-the-queue-policy).
 
@@ -2098,12 +2138,13 @@ typedef enum H5VL_stream_pred_op_t {
 |---|---|
 | [`src/H5VLstream.h`](../src/H5VLstream.h) | Public header — the authoritative API contract, with per-call caveats |
 | [`src/H5VLstream.c`](../src/H5VLstream.c) | The connector: callbacks, capture, manifest, replay, routing |
-| [`src/tr_mercury.c`](../src/tr_mercury.c) | Transport: Mercury/Margo RPCs, SSG groups, push and ack |
+| [`src/tr_mercury.c`](../src/tr_mercury.c) | Transport: Mercury/Margo RPCs, Flock groups, push and ack |
 | [`src/tr_bake.c`](../src/tr_bake.c) | BAKE spill provider |
 | [`src/vol_stream.fbs`](../src/vol_stream.fbs) | flatcc schema for the step manifest |
 | [`tools/h5stream.c`](../tools/h5stream.c) | The `h5stream` tool |
-| [`test/`](../test/) | 44 ctest targets — see [§2.5](#25-how-the-behavior-in-this-guide-is-verified) |
-| [`examples/`](../examples/) | Two runnable simulation + live-monitor demonstrations |
+| [`test/`](../test/) | The C ctest targets — see [§2.5](#25-how-the-behavior-in-this-guide-is-verified) |
+| [`python/`](../python/) | The `volstream` Python subscriber and its tests — see [§5.4](#54-example-3-python) |
+| [`examples/`](../examples/) | Five runnable demonstrations — see [§5.5](#55-worked-demonstrations-in-this-repository) |
 | [`benchmark/adios2_compare/`](../benchmark/adios2_compare/) | The ADIOS2 SST comparison, reproducibly |
 
 **Historical design records.** `docs/design-plan.md` and `docs/dev-plan.md` are
@@ -2131,10 +2172,11 @@ conventions and traps a change has to respect.
 |---|---|
 | `src/H5VLstream.c` | The connector proper: ~123 VOL class callbacks, step state machine, capture, manifest build/replay, reader resolution, routing policy. Large, and deliberately one translation unit — the callbacks share a lot of static state |
 | `src/H5VLstream.h` | The public surface: the step API, the info struct, the enums. The authoritative API contract |
-| `src/tr_mercury.c/.h` | Transport: Mercury RPCs, Margo progress, SSG groups, push/ack, the in-flight request list |
+| `src/tr_mercury.c/.h` | Transport: Mercury RPCs, Margo progress, Flock groups, push/ack, the in-flight request list |
 | `src/tr_bake.c/.h` | The embedded BAKE provider used by the `SPILL` queue policy |
 | `src/vol_stream.fbs` | flatcc schema for the step manifest |
 | `tools/h5stream.c` | The `h5stream` tool — also the best worked example of *consuming* a stream from outside |
+| `python/` | The `volstream` Python subscriber: `_volstream.c` (the extension, one method per connector call) and `volstream/` (reassembly, iteration, the torch dataset) |
 
 The connector is built with **hidden visibility**, so its ~140 internal
 callbacks stay private and only the step API is exported. That is why

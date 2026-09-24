@@ -151,9 +151,15 @@ It matters a great deal to one whose job is *checking status*. So `monitor`
 pairs two calls per frame: `H5Fwait_step_ready()` first, which reports that
 the writer's transport announced a newly committed step regardless of
 whether any subscription matched it, and only once that confirms a step
-really happened does it poll `H5Fget_subscribed_data()` to see whether the
-predicate matched. A miss immediately after a confirmed commit is now a
-real "no signal this frame," not silence that could mean anything.
+really happened does it drain `H5Fget_subscribed_data()` to see whether the
+predicate matched. The drain does not block: the writer delivers all of a
+step's pushes before it announces the step (pinned by
+`test/t_step_grouping.c`), so an empty queue right after a confirmed commit is
+a real "no signal this frame," not silence that could mean anything. A hit
+frame arrives as several pushes -- one per contiguous run of matching pixels
+across the four module writes -- so the monitor drains all of them before
+scoring the step, and if it has fallen behind it holds the next step's first
+push over for that step instead of discarding it.
 
 **The decision it drives.** Two thresholds, both in `detector_common.h`:
 `DETECTOR_MONITOR_GOOD_HITS` hits observed declares signal established;
@@ -211,10 +217,11 @@ written on does not have -- left as a documented gap rather than a guess.
   fire inside an eight-frame demo run. A real facility would size these
   against real frame rates and real false-positive costs; nothing here
   argues for these particular numbers.
-- **Compiled, not run.** Every mode here has been syntax-checked against a
-  real HDF5 build, not built, linked, or executed -- the Mochi stack is not
-  available on the machine this was written on. `monitor`'s paired
-  `H5Fwait_step_ready()`/`H5Fget_subscribed_data()` design follows both
-  calls' documented contracts, but the actual timing between a step commit
-  and its subscription push has not been observed end to end. Treat the
-  ordering as reasoned from the API docs, not as verified.
+- **Built, not run.** CI's transport job compiles and links every mode; no
+  test executes this example. The ordering `monitor` relies on -- a step's
+  pushes queued before its step-ready arrives -- is now pinned by
+  `test/t_step_grouping.c` rather than reasoned from the API docs. Two bugs
+  in `monitor`'s loop were found by review, not by running it, and fixed: it
+  read one push per step where a hit frame produces several, and it
+  discarded a later step's push instead of holding it. Its decision output
+  against the default scene has still not been observed.

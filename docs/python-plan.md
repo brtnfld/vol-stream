@@ -8,6 +8,14 @@ Same two rules as [`dev-plan.md`](dev-plan.md). No changes to HDF5, and
 borrow by default — which here means the extension wraps the connector's
 existing C API and adds no protocol.
 
+> **Status (2026-09-24): P0–P5 are implemented and pass CI**, each milestone's
+> "As built" note records where it departed from this plan, and
+> [Known gaps](#known-gaps) lists what remains. Two connector changes came
+> out of this work and were made in C rather than worked around:
+> `H5Fack_stream_step()` (backpressure for subscribers) and end of stream for
+> subscribers; a third, capturing attribute writes through a handle kept
+> open across steps, was a bug the binding's tests found.
+
 ## Both premises re-verified, 2026-09-23
 
 `sec:pysub-not-h5py` rejects an h5py binding for two reasons. Neither was
@@ -45,17 +53,27 @@ and Windows.
 
 ## The call surface
 
-`sec:pysub`'s table, with one addition:
+`sec:pysub`'s table, with one addition. As built (see the P milestones for why
+each differs from the original):
 
 | Python | Wraps |
 |---|---|
-| `open()` / `close()` | `H5Fopen()` with the connector on the FAPL, `H5Fclose()` |
-| `schema()` | `H5Fget_stream_schema()` / `H5Ffree_stream_schema()` |
-| `subscribe(paths, sel=, dcpl=)` | `H5Fsubscribe()` |
-| `subscribe_type(path, dtype)` | `H5Fsubscribe_type()` |
-| `subscribe_predicate(...)` | `H5Fsubscribe_predicate()` |
-| `get(timeout_ms)` | `H5Fget_subscribed_data()` |
-| `wait_step_ready()`, `logical_steps()`, `step_status()` | read-only status calls |
+| `open(path, backpressure=)` / `File.close()`, context manager | `H5Fopen()` with the connector on the FAPL, `H5Fclose()` |
+| `follow(path, selections, backpressure=, deflate=)` | `open()` plus `subscribe()`, to every numeric dataset by default |
+| `File.schema()` | `H5Fget_stream_schema()` / `H5Ffree_stream_schema()`, returning `{path: Var(dtype, shape, is_attr)}` |
+| `File.subscribe(selections, deflate=)` | `H5Fsubscribe()`, a DCPL for `deflate` |
+| `File.subscribe_type(path, dtype)` | `H5Fsubscribe_type()` |
+| `File.subscribe_predicate(path, op, value)` | `H5Fsubscribe_predicate()` |
+| `File.next_step()`, `File.steps()`, `for step in f` | `H5Fwait_step_ready()` plus a zero-timeout drain of `H5Fget_subscribed_data()`, reassembled per step |
+| `File.get()` | `H5Fget_subscribed_data()`, one raw push |
+| `File.end_of_stream` | `H5Fstep_status()` reporting `H5F_STEP_EOS` |
+| (with `backpressure=True`) | `H5Fack_stream_step()` after each step |
+| `volstream.torch.StreamDataset` | `follow()` wrapped as a PyTorch `IterableDataset` |
+
+`logical_steps()` and `step_status()` from the original table were not built:
+logical-step navigation belongs to the reader cursor (`H5Fbegin_step()`), which
+this subscriber does not use, and the only step state a subscriber needs is
+end of stream.
 
 **`schema()` is the addition, and it should arguably lead.** The RFC's
 table predates M10. `H5Fget_stream_schema()` is what makes a *generic*
@@ -96,7 +114,7 @@ This is *in the exit gate*, not after it — the gate requires clean exit on
 cannot be a later phase. Teardown lands in P3, before the Pythonic layer
 that would make it easy to get wrong.
 
-### 2. Multi-run reassembly — answered by the transport, not yet pinned
+### 2. Multi-run reassembly — answered by the transport, pinned by P0
 
 No test asks "is this step's set of pushes complete."
 `test/t_subvolume_strided.c` is the fragmented-selection test ("one
@@ -380,7 +398,7 @@ fails there.
 
 ## Known gaps
 
-What P0–P4 do not cover, in one place. Each item is either untested, not
+What P0–P5 do not cover, in one place. Each item is either untested, not
 supported, or depends on something outside this binding.
 
 ### Untested
@@ -389,9 +407,6 @@ supported, or depends on something outside this binding.
   CI's `ofi+tcp` pass as well as its `na+sm` one, but that pass is
   non-gating (it tolerates a known libfabric teardown stall; see ci.yml), so
   an `ofi+tcp` failure is reported rather than blocking.
-- **Two Files open at once in one process**, including two on the same file.
-  Nothing tests it. The connector starts a transport per file, and whether
-  two transports coexist in one process has not been checked.
 - **`volstream.torch` outside CI.** It is tested only where torch is
   installed (the CI job installs the CPU wheel). Elsewhere the test is skipped.
 - **macOS with the transport.** CI is Linux only. On macOS (checked locally
@@ -413,11 +428,12 @@ supported, or depends on something outside this binding.
   exposes the C API's `plists` argument for deflate, the one filter every
   HDF5 build has, with one chunk spanning the selection. Other filters
   (bslz4, zstd, zfp) and a requested chunk shape are not exposed.
-- **A dataset whose extent changes after `subscribe()`.** Shapes and the
-  flat-index-to-coordinate mapping come from the schema at subscribe time.
-  Growth along the first dimension still maps correctly, but the returned
-  array keeps the subscribed shape. A change to any other dimension would
-  place elements wrongly. Re-subscribe after a resize.
+- **A dataset resized in any dimension but the first.** A whole-dataset
+  subscription follows growth along the first dimension: it is made against
+  an unbounded first dimension so the writer sends new rows, and the returned
+  array grows to hold them (rows not written that step are masked). An
+  explicit `(start, count)` selection stays fixed. A change to any other
+  dimension would place elements wrongly; re-subscribe after one.
 - **`num_workers > 0` in a DataLoader.** Refused, by design (see P4).
 
 ### Depends on the connector or the Mochi stack
@@ -429,6 +445,10 @@ supported, or depends on something outside this binding.
   it is safer than reporting it early. (A writer that leaves before
   announcing any step is now recognised from its answer to `subscribe()`,
   which every Python reader makes; `t_eos` covers that case.)
+- **An attribute written in a step where its dataset is not** replays onto
+  a group of the dataset's name in that step (user guide §2.3). A Python
+  subscriber still receives the attribute; the caveat is in the file the
+  writer leaves behind.
 - **mochi-flock 0.8.0** crashes when several readers join at once
   (mochi-hpc/mochi-flock#8). A Python consumer is exposed like any other
   reader. CI builds Flock `main` plus a local patch.

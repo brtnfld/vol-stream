@@ -4,11 +4,13 @@ An HDF5 VOL connector for **streaming** — step-based, reader-driven data movem
 between a running simulation and whatever consumes its output, without going
 through a filesystem.
 
-> **Status: M1.** Every callback forwards to the underlying connector unchanged, so
-> behaviour is identical to native HDF5 — asserted byte-for-byte. The step API is
-> registered, discoverable, and tracks step state, but captures no data yet.
-> Nothing here is a supported HDF Group product, and the design is not yet
-> reviewed.
+> **Status: M0–M10 implemented, plus a Python subscriber.** Steps are captured
+> and replayed atomically; a reader can follow a live writer over Mercury,
+> subscribe to part of a stream, narrow it by type, precision or a value
+> predicate, discover its schema, apply backpressure, and see the end of the
+> stream. [`docs/user-guide.md`](docs/user-guide.md) describes what works and
+> its §2.3 lists what does not. Nothing here is a supported HDF Group product,
+> and the design is not yet reviewed.
 
 ## Why
 
@@ -29,6 +31,8 @@ Two documents carry the reasoning:
 |---|---|
 | [`docs/design-plan.md`](docs/design-plan.md) | Why the VOL and not a VFD, where ADIOS2 is beatable, what to borrow |
 | [`docs/dev-plan.md`](docs/dev-plan.md) | The milestones, resolved design decisions, CI matrix |
+| [`docs/user-guide.md`](docs/user-guide.md) | What is implemented, how to build and use it, known limitations |
+| [`docs/python-plan.md`](docs/python-plan.md) | The Python subscriber: design, milestones, known gaps |
 
 ## Design in one paragraph
 
@@ -45,8 +49,12 @@ step API ships in this repo's own header.
 
 ## Building
 
-Requires HDF5 1.14+ (developed against `develop`, `H5VL_VERSION` 3) and, for a
-parallel HDF5, an MPI implementation.
+Requires HDF5 2.x (`develop`; 1.14 does not compile) and, for a parallel HDF5,
+an MPI implementation. The live transport additionally needs the Mochi stack
+(Mercury, Argobots, Margo, Flock); without it the connector still builds, with
+step capture, replay and the reader cursor but no live channel. See
+[`docs/user-guide.md` §3](docs/user-guide.md#3-installation--runtime-activation)
+for versions, including why CI builds Flock from `main` with a local patch.
 
 ```bash
 cmake -S . -B build -DCMAKE_PREFIX_PATH=/path/to/hdf5-install
@@ -89,7 +97,7 @@ H5Pset_vol(fapl, vol_id, NULL);   /* NULL info defaults the under-VOL to native 
 hid_t fid = H5Fcreate("out.h5", H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
 
 const uint64_t step = 42;
-H5Fbegin_step(fid, 1, &step);
+H5Fbegin_step(fid, 1, &step, 0 /* wall_time_ns: 0 if the app does not track it */);
 /* ... H5Dwrite / H5Dwrite_multi as usual ... */
 H5Fend_step(fid);
 ```
@@ -102,12 +110,17 @@ VOL, which also ships `H5F*` calls from an out-of-tree connector.
 
 | Call | Purpose |
 |---|---|
-| `H5Fbegin_step(fid, n, ids)` | Open a step, carrying zero or more *logical* step ids |
+| `H5Fbegin_step(fid, n, ids, wall_time_ns)` | Open a step, carrying zero or more *logical* step ids |
 | `H5Fend_step(fid)` | Commit it atomically |
-| `H5Fstep_status(fid, &st)` | Query step state (`NOT_IN_STEP`, `IN_STEP`, `COMMITTING`, `EOS`) |
-| `H5Fsubscribe(fid, n, paths, spaces, plists)` | Reader declares interest |
+| `H5Fstep_status(fid, &st)` | Query step state (`NOT_IN_STEP`, `IN_STEP`, `COMMITTING`, `READING`, and `EOS` once a subscriber's writer has left) |
+| `H5Fwait_step_ready(fid, timeout, &phys, &wall)` | Reader: block until the writer announces a step |
+| `H5Fsubscribe(fid, n, paths, spaces, plists)` | Reader declares interest, optionally with a per-subscriber filter pipeline |
+| `H5Fsubscribe_type(fid, path, type)` | Have the writer convert a subscription's data before sending it |
 | `H5Fsubscribe_predicate(fid, path, op, type, value)` | Narrow a subscription to elements passing a value test, evaluated writer-side |
+| `H5Fget_subscribed_data(fid, timeout, ...)` | Take the next pushed payload |
 | `H5Fget_stream_schema(fid, timeout, &step, &n, &vars)` | Ask a live writer what the stream carries — every path, its datatype and extent |
+| `H5Fack_stream_step(fid, phys)` | Subscriber: report a consumed step, so the writer's queue policy counts it |
+| `H5Fset_stream_queue_policy(fid, policy, slots)` | Writer: Block, Discard or Spill when a tracked reader falls behind |
 
 `h5stream` inspects a stream from outside: `list` (steps and their contents),
 `tail` (follow a live writer, needs the transport), `schema` (what a live
@@ -135,6 +148,22 @@ H5VLquery_optional(fid, H5VL_SUBCLS_FILE, op, &flags);
 That reporting is what substitutes for a dedicated streaming capability flag,
 which would need a library change.
 
+### From Python
+
+`volstream` is a subscriber-only Python package built on the same C API; it
+needs no h5py, which cannot reach these operations and vendors its own
+libhdf5 besides. Build it with `-DVOL_STREAM_BUILD_PYTHON=ON`, or
+`pip install .` against the same HDF5 (see
+[`docs/python-plan.md`](docs/python-plan.md)):
+
+```python
+import volstream
+
+with volstream.follow("run.h5", {"/entry/data/data": None}) as stream:
+    for step in stream:            # ends when the writer closes the file
+        frame = step["/entry/data/data"]   # a NumPy array
+```
+
 ## Plugin signatures
 
 HDF5 can be built with `-DHDF5_REQUIRE_SIGNED_PLUGINS=ON`, and such a build
@@ -150,12 +179,15 @@ set up a keystore.
 
 ## Testing
 
-`ctest` runs two tests. The **smoke** test checks the connector loads, is
-actually the one in use, round-trips data, and has its step operations registered
-and queryable. The **step** test is the M1 gate: it writes the same content three
-ways — native, through the connector, and through the connector with every write
-bracketed in a step — and requires all three files to be **byte-identical**, then
-exercises the step state machine including the calls that must be refused.
+`ctest` runs the suite: about two dozen tests without the transport, and over
+60 with it and the Python package. [`docs/user-guide.md` §2.5](docs/user-guide.md#25-how-the-behavior-in-this-guide-is-verified)
+lists the load-bearing ones. The oldest two still anchor it: **smoke** checks
+the connector loads, is actually the one in use, round-trips data, and has its
+step operations registered and queryable; **step** writes the same content
+three ways — native, through the connector, and through the connector with every
+write bracketed in a step — and requires all three files to be
+**byte-identical**, then exercises the step state machine including the calls
+that must be refused.
 
 Byte-identity needs `H5Pset_obj_track_times(..., false)` on both the FCPL and the
 DCPL. Object headers store four timestamps by default, and disabling them on the
@@ -179,15 +211,17 @@ is meant to catch. It needs an HDF5 built with `-DHDF5_TEST_API=ON`:
 |---|---|---|
 | M0 | Skeleton, CI, regression net | done |
 | M1 | Step API surface and step state | done |
-| M2 | flatcc manifest, capture, replay invariant | |
-| M3 | Decoupled reader | |
-| M4 | Mercury transport, Margo progress, deferred I/O | |
-| M5 | SSG rendezvous and late joiners | |
-| M6 | Parallel writer and real M×N | |
-| M7 | Queue policy and BAKE spill | |
-| M8 | Subscription protocol | |
-| M9 | Tools, bindings, and the long tail | |
-| M10 | Live schema discovery | |
+| M2 | flatcc manifest, capture, replay invariant | done |
+| M3 | Decoupled reader | done |
+| M4 | Mercury transport, Margo progress, deferred I/O | done |
+| M5 | Rendezvous and late joiners (SSG, since migrated to Flock) | done |
+| M6 | Parallel writer and real M×N | done |
+| M7 | Queue policy and BAKE spill | done |
+| M8 | Subscription protocol | done |
+| M9 | Tools and the long tail (ADIOS2 bridge dropped) | done |
+| M10 | Live schema discovery | done |
+| — | Python subscriber (P0–P5 in [`docs/python-plan.md`](docs/python-plan.md)) | done |
+| — | End of stream for subscribers | done |
 
 Stretch goals — real ideas, no milestone number or exit gate — are recorded
 in [`docs/dev-plan.md`](docs/dev-plan.md#stretch-goals): a ParaView/VisIt
@@ -201,7 +235,7 @@ Only four things are written here rather than borrowed: step semantics, queue
 policy, the subscription protocol, and the HDF5-to-step mapping. Everything else
 comes from a library that does that one job better — HDF5's own
 `H5Tencode`/`H5Sencode2`/`H5Pencode2` for the manifest contents, flatcc for its
-framing, Mercury and Margo for transport and progress, SSG for membership. See
+framing, Mercury and Margo for transport and progress, Flock for membership. See
 [`docs/dev-plan.md`](docs/dev-plan.md).
 
 ## Provenance and license

@@ -1,16 +1,18 @@
 # Pinned development environment for vol-stream.
 #
-# Checked in from M0 so a build is reproducible and an upstream change shows up
-# as a CI failure on the floating environment rather than as a broken install
-# for a user. CI runs this pinned environment and a floating one; see
-# .github/workflows/ci.yml.
+# Checked in from M0 as a reproducible starting point. CI does NOT use it:
+# .github/workflows/ci.yml builds HDF5 and the Mochi stack from source (see its
+# transport job for the exact versions, and why mochi-flock is built from
+# main plus a patch). This file has not been kept in step with that and may
+# need updating before use.
 #
 #   spack env create vol-stream spack/spack.yaml
 #   spack env activate vol-stream
 #   spack install
 #
-# mercury, argobots and mochi-margo (M4) are builtin Spack packages. ssg (M5)
-# and bake (M7) are not -- add the Mochi namespace first when those land:
+# mercury, argobots and mochi-margo (M4) are builtin Spack packages. The group
+# membership library (mochi-ssg through M10, mochi-flock since) and bake (M7)
+# are not -- add the Mochi namespace first:
 #
 #   git clone https://github.com/mochi-hpc/mochi-spack-packages
 #   spack repo add mochi-spack-packages/spack_repo/mochi
@@ -18,10 +20,8 @@
 # As of this writing that repo's package.py files use a newer Spack package
 # API (spack_repo.builtin.build_systems imports) than Spack 0.23 supports --
 # spack info/list on a package from it fails with "cannot unpack
-# non-iterable NoneType object" on that version. If that bites, mochi-ssg
-# builds cleanly from source instead (autotools: ./prepare.sh then
-# ./configure --disable-mpi --disable-pmix against an already-installed
-# margo), which is what .github/workflows/ci.yml's m4-transport job does.
+# non-iterable NoneType object" on that version. If that bites, build the
+# Mochi packages from source the way ci.yml does.
 #
 spack:
   specs:

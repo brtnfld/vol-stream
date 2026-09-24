@@ -1,7 +1,8 @@
 # Streaming in HDF5: beating ADIOS2, not adopting it
 
 Design research behind `vol-stream`. A typeset version with diagrams is in
-[`design-plan.pdf`](design-plan.pdf).
+[`design-plan.pdf`](design-plan.pdf); both date from 2026-08-09, before any of
+the implementation. For what was built, see [`user-guide.md`](user-guide.md).
 
 HDF5 has five partial answers to streaming and no complete one. The gap is not
 transport — it is that **HDF5 has no step**. Matching ADIOS2 is the floor, not
@@ -144,7 +145,7 @@ The Mochi stack covers most of it, and Mercury was developed jointly by Argonne
 | manifest framing + evolution | flatcc (FlatBuffers in C) | a hand-rolled envelope |
 | transport + RDMA | Mercury | socket and verbs plumbing |
 | progress engine, threading | Argobots + Margo | a hand-written progress thread |
-| rendezvous, membership | SSG | contact files and a join protocol |
+| rendezvous, membership | SSG, replaced by mochi-flock after SSG's deprecation | contact files and a join protocol |
 | queue spill to node-local | BAKE | an on-disk spill format |
 | precision / compression | ZFP · SZ via `H5PL_TYPE_FILTER` | a lossy codec |
 | conformance testing | HDF5 `test/API` | a data-model test suite |

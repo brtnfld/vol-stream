@@ -1,7 +1,10 @@
 # vol-stream: development and implementation plan
 
-A typeset version with diagrams is in [`dev-plan.pdf`](dev-plan.pdf). The
-architectural reasoning is in [`design-plan.md`](design-plan.md).
+A typeset version with diagrams is in [`dev-plan.pdf`](dev-plan.pdf); it is a
+snapshot from 2026-08-09 and predates everything from M2 on. The architectural
+reasoning is in [`design-plan.md`](design-plan.md). For what is implemented now,
+[`user-guide.md`](user-guide.md) is current; this plan is the development
+record.
 
 Two rules govern this plan. **No changes to HDF5** — everything is reachable from
 an out-of-tree connector. And **borrow by default** — we write the step
@@ -450,7 +453,9 @@ with deferral on.
 ### M5 — Rendezvous and late joiners · S
 
 SSG for group membership — what SST's `RegistrationMethod`,
-`RendezvousReaderCount` and late-joiner discovery amount to.
+`RendezvousReaderCount` and late-joiner discovery amount to. *(Migrated to
+mochi-flock after M10, when SSG was deprecated by its own maintainers; see
+[After M10](#after-m10).)*
 
 **Exit gate.** A writer starts with no readers and proceeds; a reader attaches at
 step 500 and gets a coherent view; a reader leaving mid-stream does not stall the
@@ -761,7 +766,9 @@ rather than passing by construction.
 ### M9 — Tools and the long tail · M
 
 **Scope narrowed 2026-08-15.** An ADIOS2 interop bridge is **dropped** — not
-deferred. h5py bindings are **postponed**, not abandoned.
+deferred. h5py bindings are **postponed**, not abandoned. *(Superseded
+2026-09-24: Python reaches the stream through a separate subscriber package,
+not h5py; see [`python-plan.md`](python-plan.md).)*
 
 In scope:
 
@@ -1166,6 +1173,45 @@ nothing here changes that — but the metadata such a plugin has to have before
 it can be written now exists, and on both tools' current releases the
 connector itself is loadable.
 
+## After M10
+
+Work done after the last numbered milestone, recorded here so the plan still
+matches the code. Each item is documented for users in
+[`user-guide.md`](user-guide.md).
+
+- **Membership moved from SSG to mochi-flock.** SSG was deprecated by its
+  maintainers; `src/tr_mercury.c` now uses Flock's SWIM backend behind the same
+  `vs_tr_*` seam. CI found two Flock bugs under concurrent joins: a group-file
+  race fixed on Flock's `main` (7b484c5) but unreleased, and a crash when a
+  joiner's provider receives gossip before `init_group()` returns
+  (mochi-hpc/mochi-flock#8, fix proposed as #9). CI builds Flock `main` with
+  that fix applied from `.github/patches/`, and the Flock 0.8.0 release is a
+  documented known limitation.
+- **A Python subscriber**, `volstream`, milestones P0–P5 in
+  [`python-plan.md`](python-plan.md): a CPython extension over the C API,
+  NumPy arrays per step, pip-installable against the machine's own HDF5.
+- **Per-step push grouping is a pinned guarantee.** The writer finishes
+  delivering a step's pushes before it announces the step, so a subscriber
+  woken by step-ready can drain that step without waiting. `test/t_step_grouping.c`
+  pins it, including a lagging reader and a late joiner.
+- **End of stream for subscribers.** `H5F_STEP_EOS` was declared but never
+  set. A subscriber now treats every writer member leaving the group as the
+  end of the stream: steps announced before the departure are still delivered,
+  and afterwards `H5Fstep_status()` reports `H5F_STEP_EOS` and the waits return
+  at once. Step-ready messages carry the writer's member id (a wire change), and
+  a writer is also recognised from its answer to subscribe, schema and ack
+  requests. `test/t_eos.c`.
+- **Opt-in backpressure for subscribers.** `H5Fack_stream_step()` sends the ack
+  a cursor reader sends from `H5Fbegin_step()`, so a writer's queue policy can
+  count a subscriber.
+- **Attribute writes through a handle kept open across steps are captured.**
+  The same bug `t_step_rewrite` pins for datasets, left open for attributes:
+  such a write was never pushed and overwrote the earlier step's copy. Fixed by
+  synthesizing the step's own Attr entry; `t_step_rewrite` covers it.
+- **A test-only fault hook.** `VOL_STREAM_TEST_DROP_PUSH=<k>` makes a writer
+  skip its k-th push while still announcing the step, the only way to reach a
+  subscriber's lost-push handling in a healthy run.
+
 ## Stretch goals
 
 Recorded rather than scheduled: real ideas with no milestone number, no exit
@@ -1252,10 +1298,11 @@ shape — replacing Ascent's typically co-located, in-memory hand-off with
 |---|---|---|
 | HDF5 version | develop only (see note) | The documented failure mode; `H5VL_VERSION` is 3 and will move |
 | MPI | MPICH · OpenMPI | Intercommunicator and dynamic-process behaviour differ in practice |
-| Mercury NA plugin | `na+sm` · `ofi+tcp` · `ofi+verbs` | Where transport bugs live; shared-memory and TCP run on any CI box |
+| Mercury NA plugin | `na+sm` (gating) · `ofi+tcp` (subset, non-gating) | Where transport bugs live; shared-memory and TCP run on any CI box. `ofi+verbs` needs RDMA hardware CI does not have |
 | rank shapes | 3→2 · 7→3 (uneven) | Coprime counts are where M×N projection bugs surface |
 | encode round-trip | byte-order assertion (see note) | The manifest leans on HDF5's encoders; prove them across byte order |
-| Spack env | pinned lockfile · latest deps | Pinned is reproducible; floating detects upstream breakage early |
+| Mochi stack | pinned releases, Flock from `main` plus a patch | Built from source in the transport job; Spack environments are planned, not in CI |
+| Python | CPython 3.12, NumPy, CPU torch; installed with pip | The subscriber package, including its installed form |
 
 **Cross-endian, without a big-endian machine (2026-08-15).** Reviewing the
 format against this row turned up a real portability bug rather than
