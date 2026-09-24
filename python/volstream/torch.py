@@ -30,8 +30,8 @@ class StreamDataset(IterableDataset):
     This does not apply backpressure: the writer does not wait for a slow
     consumer.
 
-    max_steps, timeout and idle_timeout bound iteration as in
-    volstream.File.steps(); without any of them it runs until interrupted.
+    Iteration ends when the writer closes the file, or on max_steps, timeout
+    or idle_timeout, as in volstream.File.steps().
     """
 
     def __init__(self, path, selections=None, *, transform=None, max_steps=None, timeout=None,

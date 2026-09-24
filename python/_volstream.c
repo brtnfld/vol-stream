@@ -717,6 +717,22 @@ RawFile_get(RawFileObject *self, PyObject *args)
     return result;
 }
 
+/* True once every writer has left and every step it announced was consumed. */
+static PyObject *
+RawFile_end_of_stream(RawFileObject *self, PyObject *Py_UNUSED(ignored))
+{
+    H5F_step_status_t st     = H5F_STEP_NOT_IN_STEP;
+    herr_t            status;
+
+    if (check_usable(self) < 0)
+        return NULL;
+    HDF5_BEGIN
+    status = H5Fstep_status(self->fid, &st);
+    H5Eclear2(H5E_DEFAULT);
+    HDF5_END
+    return PyBool_FromLong(status >= 0 && st == H5F_STEP_EOS);
+}
+
 static PyObject *
 RawFile_get_closed(RawFileObject *self, void *Py_UNUSED(closure))
 {
@@ -743,6 +759,8 @@ static PyMethodDef RawFile_methods[] = {
      "wait_step_ready(timeout_ms) -> (physical_step, wall_time_ns) or None on timeout"},
     {"get", (PyCFunction)RawFile_get, METH_VARARGS,
      "get(timeout_ms) -> (physical_step, path, elem_start, elem_count, Buffer) or None on timeout"},
+    {"end_of_stream", (PyCFunction)RawFile_end_of_stream, METH_NOARGS,
+     "True once every writer has left and every step it announced was consumed"},
     {NULL, NULL, 0, NULL}};
 
 static PyGetSetDef RawFile_getset[] = {

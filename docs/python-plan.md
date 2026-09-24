@@ -345,11 +345,15 @@ As built:
   every step. Its docstring says it applies no backpressure (see P3's open
   item).
 
-Open: the connector declares `H5F_STEP_EOS` but never sets it, so a
-subscriber cannot tell a finished writer from a paused one. Iteration can
-end only on a bound the caller supplies. Ending `for step in f:` when the
-writer closes needs the reader side to turn the writer's departure from
-the group into an end-of-stream signal.
+End of stream: a subscriber treats the writer leaving the group (closing
+the file, or its process dying) as the end of the stream. Steps the writer
+announced before leaving are still delivered. After the last one,
+`H5Fstep_status()` reports `H5F_STEP_EOS` and the waits return at once, so
+`for step in f:` ends by itself. The reader recognises the writer from its
+step announcements (which now carry its member id) or from the join seed,
+and a parallel writer's stream ends when every rank has left. A writer that
+leaves before announcing any step to a reader is not detected. Pinned in C
+by `test/t_eos.c` and in Python by `python_stream_eos`.
 
 ### P5 — CI and packaging · M
 

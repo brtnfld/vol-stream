@@ -17,8 +17,10 @@ ctest entry per mode) so every scenario gets a fresh transport.
              notification may be left queued: get() drains them.
   torch      StreamDataset through a DataLoader. Skipped (exit 77) if torch
              is not installed.
+  eos        The writer commits three steps and closes. Unbounded iteration
+             must yield all three and then end by itself.
 
-usage: test_stream.py <stream_writer executable> <column|narrowing|iterate|getonly|torch>
+usage: test_stream.py <stream_writer executable> <column|narrowing|iterate|getonly|torch|eos>
 """
 
 import os
@@ -243,13 +245,33 @@ class TorchTest(StreamTest):
         self.assertEqual(self.writer.wait(timeout=60), 0)
 
 
+class EndOfStreamTest(StreamTest):
+    mode = "eos"
+
+    def test_iteration_ends_when_writer_leaves(self):
+        self.wait_for("committed")
+        with volstream.follow(self.path) as f:
+            self.assertFalse(f.end_of_stream, "end of stream reported with the writer still in the group")
+            self.touch("ready")
+            t0 = time.monotonic()
+            # The timeout is only a backstop so a broken build fails rather
+            # than hangs; ending well before it is the assertion.
+            seen = list(f.steps(timeout=60))
+            took = time.monotonic() - t0
+            self.assertEqual([s["/grid"][0, 0] for s in seen], [value(s, 0, 0) for s in (1, 2, 3)])
+            self.assertLess(took, 30, f"iteration ended only at its timeout ({took:.1f} s)")
+            self.assertTrue(f.end_of_stream)
+            self.assertIsNone(f.next_step(10000))
+        self.assertEqual(self.writer.wait(timeout=60), 0)
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     WRITER = sys.argv.pop(1)
     mode = sys.argv.pop(1)
     cases = {"column": ColumnTest, "narrowing": NarrowingTest, "iterate": IterateTest,
-             "getonly": GetOnlyTest, "torch": TorchTest}
+             "getonly": GetOnlyTest, "torch": TorchTest, "eos": EndOfStreamTest}
     if mode not in cases:
         sys.exit(__doc__)
     if mode == "torch":

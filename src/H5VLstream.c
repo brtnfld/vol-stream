@@ -11164,6 +11164,14 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
             return -1;
 
         *sargs->status = o->file_state->step_state;
+#ifdef VOL_STREAM_HAVE_MERCURY
+        /* A subscriber has reached the end of the stream once every writer
+         * has left the group and every step it announced has been consumed.
+         * Only a reader ever sees a writer announce a step, so this cannot
+         * report EOS on the writer side. */
+        if (o->file_state->transport && vs_tr_reader_end_of_stream(o->file_state->transport))
+            *sargs->status = H5F_STEP_EOS;
+#endif
         return 0;
     }
     else if (args->op_type == H5VL_stream_op_subscribe) {

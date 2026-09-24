@@ -376,6 +376,11 @@ int vs_tr_reader_leave_group(vs_tr_t *tr);
  * case a caller wants to re-query later. */
 int vs_tr_reader_get_current_step(vs_tr_t *tr, uint64_t *physical_step, uint64_t *wall_time_ns);
 
+/* Reader: 1 once every writer member this reader has seen announce a step
+ * has left the group and no step notification is left to consume -- no
+ * further step can arrive. 0 otherwise, including before any writer is known. */
+int vs_tr_reader_end_of_stream(vs_tr_t *tr);
+
 /* Reader side: block up to timeout_ms for a step_ready notification (one
  * may already be queued -- from before this call, or seeded by
  * vs_tr_reader_join_group()'s late-joiner query), filling *physical_step

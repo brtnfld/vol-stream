@@ -21,12 +21,14 @@
  *              cleanly costs nothing; one that did not costs about a second a
  *              step in push timeouts until the transport declares it dead.
  *   idle       then nothing until "go" (write step 1) or "done".
+ *   eos        then steps 1..3 back to back, and closes at once without
+ *              waiting for "done": the reader sees the writer leave.
  *
  * Synchronization is by empty files in <syncdir>: the writer touches
  * "committed" after step 0 and "writes_done" after its last step, and waits
  * for "ready" (the reader has subscribed) and "done" (the reader has closed).
  *
- * usage: stream_writer <column|narrowing|lifecycle|idle> <file> <syncdir>
+ * usage: stream_writer <column|narrowing|lifecycle|idle|eos> <file> <syncdir>
  */
 
 #include <stdio.h>
@@ -125,8 +127,9 @@ main(int argc, char **argv)
     int         s;
 
     if (argc != 4 || (strcmp(argv[1], "column") != 0 && strcmp(argv[1], "narrowing") != 0 &&
-                      strcmp(argv[1], "lifecycle") != 0 && strcmp(argv[1], "idle") != 0)) {
-        fprintf(stderr, "usage: %s <column|narrowing|lifecycle|idle> <file> <syncdir>\n", argv[0]);
+                      strcmp(argv[1], "lifecycle") != 0 && strcmp(argv[1], "idle") != 0 &&
+                      strcmp(argv[1], "eos") != 0)) {
+        fprintf(stderr, "usage: %s <column|narrowing|lifecycle|idle|eos> <file> <syncdir>\n", argv[0]);
         return 2;
     }
     mode = argv[1];
@@ -160,7 +163,7 @@ main(int argc, char **argv)
             }
         }
     }
-    else if (!strcmp(mode, "narrowing")) {
+    else if (!strcmp(mode, "narrowing") || !strcmp(mode, "eos")) {
         for (s = 1; s <= 3; s++)
             if (write_step(fid, space, &ds, s) < 0)
                 return 1;
@@ -195,8 +198,10 @@ main(int argc, char **argv)
     }
     touch("writes_done");
 
-    /* Outlive the reader so its departure comes before the group goes away. */
-    wait_for("done", 60);
+    /* Outlive the reader so its departure comes before the group goes away --
+     * except in eos mode, where the writer leaving first is the point. */
+    if (strcmp(mode, "eos") != 0)
+        wait_for("done", 60);
 
     H5Dclose(ds);
     H5Sclose(space);

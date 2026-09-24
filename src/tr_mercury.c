@@ -56,6 +56,9 @@
  * public API and its implementation is not expected to change. */
 typedef uint64_t vs_member_id_t;
 
+/* Writer members a reader tracks for end of stream: one per writer rank. */
+#define VS_EOS_MAX_WRITERS 1024
+
 #define VS_MEMBER_ID_INVALID ((vs_member_id_t)0)
 
 /* Every process in a vol-stream group registers its Flock provider at this
@@ -114,7 +117,10 @@ vs_now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 } /* end vs_now_ns() */
 
-MERCURY_GEN_PROC(vs_step_ready_in_t, ((uint64_t)(physical_step))((uint64_t)(wall_time_ns)))
+/* writer_member_id: the announcing writer's own member id, so a reader can
+ * recognise that member leaving the group as the end of the stream. */
+MERCURY_GEN_PROC(vs_step_ready_in_t,
+                 ((uint64_t)(physical_step))((uint64_t)(wall_time_ns))((uint64_t)(writer_member_id)))
 MERCURY_GEN_PROC(vs_step_ready_out_t, ((int32_t)(status)))
 MERCURY_GEN_PROC(vs_get_current_step_in_t, ((int32_t)(unused)))
 MERCURY_GEN_PROC(vs_get_current_step_out_t, ((int32_t)(status))((uint64_t)(physical_step))((uint64_t)(wall_time_ns)))
@@ -392,6 +398,15 @@ struct vs_tr_t {
     size_t           cap_pending;
     int              stopped;
 
+    /* End of stream, reader side, under pending_lock: every member that has
+     * announced a step or answered as the writer when this reader joined, and
+     * whether each has since left the group. A parallel writer has one member
+     * per rank, so the stream ends only when all of them are gone. See
+     * vs_tr_reader_end_of_stream(). */
+    vs_member_id_t eos_writers[VS_EOS_MAX_WRITERS];
+    unsigned char  eos_writer_gone[VS_EOS_MAX_WRITERS];
+    size_t         n_eos_writers;
+
     /* M7, reader side: the group member that answered a get_current_step
      * query, cached the first time vs_tr_reader_get_current_step() finds it
      * so vs_tr_reader_ack_step() does not need to re-probe every member on
@@ -426,6 +441,7 @@ struct vs_tr_t {
      * drained independently and carry different payloads. */
     pthread_mutex_t     data_lock;
     pthread_cond_t      data_cond;
+    int                 data_eos; /* every writer has left; under data_lock */
     vs_tr_data_item_t *data_queue;
     size_t              n_data;
     size_t              cap_data;
@@ -761,6 +777,36 @@ vs_tr_snapshot_members(vs_tr_t *tr, vs_member_id_t self_id, vs_member_id_t **out
  * Small helpers
  *-------------------------------------------------------------------------
  */
+/* Caller holds pending_lock. */
+static void
+vs_note_writer(vs_tr_t *tr, vs_member_id_t id)
+{
+    size_t i;
+
+    for (i = 0; i < tr->n_eos_writers; i++)
+        if (tr->eos_writers[i] == id)
+            return;
+    if (tr->n_eos_writers < VS_EOS_MAX_WRITERS) {
+        tr->eos_writers[tr->n_eos_writers]     = id;
+        tr->eos_writer_gone[tr->n_eos_writers] = 0;
+        tr->n_eos_writers++;
+    }
+}
+
+/* Caller holds pending_lock. False until at least one writer is known. */
+static int
+vs_all_writers_gone(vs_tr_t *tr)
+{
+    size_t i;
+
+    if (tr->n_eos_writers == 0)
+        return 0;
+    for (i = 0; i < tr->n_eos_writers; i++)
+        if (!tr->eos_writer_gone[i])
+            return 0;
+    return 1;
+}
+
 static void
 vs_push_pending(vs_tr_t *tr, uint64_t physical_step, uint64_t wall_time_ns)
 {
@@ -920,7 +966,25 @@ vs_membership_cb(void *group_data, flock_update_t update_type, const char *addr_
         /* fall through to purge subscriptions keyed by the old identity */
     }
     else if (update_type == FLOCK_MEMBER_DIED || update_type == FLOCK_MEMBER_LEFT) {
+        int all_gone;
+
         vs_tr_member_remove(tr, member_id);
+
+        /* End of stream: wake anyone waiting once every writer is gone. */
+        pthread_mutex_lock(&tr->pending_lock);
+        for (i = 0; i < tr->n_eos_writers; i++)
+            if (tr->eos_writers[i] == member_id)
+                tr->eos_writer_gone[i] = 1;
+        all_gone = vs_all_writers_gone(tr);
+        if (all_gone)
+            pthread_cond_broadcast(&tr->pending_cond);
+        pthread_mutex_unlock(&tr->pending_lock);
+        if (all_gone) {
+            pthread_mutex_lock(&tr->data_lock);
+            tr->data_eos = 1;
+            pthread_cond_broadcast(&tr->data_cond);
+            pthread_mutex_unlock(&tr->data_lock);
+        }
     }
     else {
         return;
@@ -1015,6 +1079,9 @@ vs_step_ready_ult(hg_handle_t handle)
     out.status = -1;
 
     if (tr && HG_SUCCESS == margo_get_input(handle, &in)) {
+        pthread_mutex_lock(&tr->pending_lock);
+        vs_note_writer(tr, (vs_member_id_t)in.writer_member_id);
+        pthread_mutex_unlock(&tr->pending_lock);
         vs_push_pending(tr, in.physical_step, in.wall_time_ns);
         out.status = 0;
         margo_free_input(handle, &in);
@@ -1930,6 +1997,9 @@ vs_tr_reader_get_current_step(vs_tr_t *tr, uint64_t *physical_step, uint64_t *wa
                          * vs_tr_reader_ack_step() can target it directly. */
                         tr->writer_member_id     = member_id;
                         tr->has_writer_member_id = 1;
+                        pthread_mutex_lock(&tr->pending_lock);
+                        vs_note_writer(tr, member_id);
+                        pthread_mutex_unlock(&tr->pending_lock);
                         ret = 0;
                     }
                     margo_free_output(handle, &out);
@@ -2129,8 +2199,9 @@ vs_tr_writer_broadcast_step_ready(vs_tr_t *tr, uint64_t physical_step, uint64_t 
     if ((n_members = vs_tr_snapshot_members(tr, self_id, &members)) <= 0)
         return 0;
 
-    in.physical_step = physical_step;
-    in.wall_time_ns   = wall_time_ns;
+    in.physical_step    = physical_step;
+    in.wall_time_ns     = wall_time_ns;
+    in.writer_member_id = (uint64_t)self_id;
 
     for (i = 0; i < n_members; i++) {
         vs_member_id_t member_id = members[i];
@@ -2196,7 +2267,7 @@ vs_tr_reader_wait_step_ready(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physica
     vs_tr_compute_deadline(timeout_ms, &deadline);
 
     pthread_mutex_lock(&tr->pending_lock);
-    while (tr->n_pending == 0 && !tr->stopped) {
+    while (tr->n_pending == 0 && !tr->stopped && !vs_all_writers_gone(tr)) {
         if (ETIMEDOUT == pthread_cond_timedwait(&tr->pending_cond, &tr->pending_lock, &deadline))
             break;
     }
@@ -2213,6 +2284,19 @@ vs_tr_reader_wait_step_ready(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physica
     pthread_mutex_unlock(&tr->pending_lock);
 
     return ret;
+}
+
+int
+vs_tr_reader_end_of_stream(vs_tr_t *tr)
+{
+    int eos;
+
+    if (!tr)
+        return 0;
+    pthread_mutex_lock(&tr->pending_lock);
+    eos = vs_all_writers_gone(tr) && tr->n_pending == 0;
+    pthread_mutex_unlock(&tr->pending_lock);
+    return eos;
 }
 
 uint64_t
@@ -3225,7 +3309,7 @@ vs_tr_reader_wait_data(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physical_step
     vs_tr_compute_deadline(timeout_ms, &deadline);
 
     pthread_mutex_lock(&tr->data_lock);
-    while (tr->n_data == 0 && !tr->stopped) {
+    while (tr->n_data == 0 && !tr->stopped && !tr->data_eos) {
         if (ETIMEDOUT == pthread_cond_timedwait(&tr->data_cond, &tr->data_lock, &deadline))
             break;
     }

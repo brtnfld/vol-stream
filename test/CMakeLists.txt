@@ -56,7 +56,7 @@ add_test(NAME retention COMMAND t_retention)
 if(VOL_STREAM_HAVE_MERCURY)
   foreach(t t_transport t_rendezvous t_queue_policy t_subscribe t_precision t_precision_dual
            t_chunk_zerocopy t_chunk_shape_split t_subvolume_nd t_strided_write t_predicate t_subvolume_strided
-           t_subvolume_grow t_rendezvous_barrier t_schema t_step_grouping)
+           t_subvolume_grow t_rendezvous_barrier t_schema t_step_grouping t_eos)
     add_executable(${t} ${t}.c)
     target_link_libraries(${t} PRIVATE vol_stream)
   endforeach()
@@ -91,7 +91,10 @@ if(VOL_STREAM_HAVE_MERCURY)
   # interleave with the next step's -- the contract per-step consumers
   # (docs/python-plan.md's P0) rely on. See the test's own comment.
   add_test(NAME step_grouping COMMAND t_step_grouping)
-  set_tests_properties(transport rendezvous queue_policy subscribe precision chunk_zerocopy chunk_shape_split subvolume_nd strided_write predicate subvolume_strided subvolume_grow schema step_grouping PROPERTIES
+  # A subscriber sees the writer leaving the group as the end of the stream,
+  # after every step it announced. See the test's own comment.
+  add_test(NAME eos COMMAND t_eos)
+  set_tests_properties(transport rendezvous queue_policy subscribe precision chunk_zerocopy chunk_shape_split subvolume_nd strided_write predicate subvolume_strided subvolume_grow schema step_grouping eos PROPERTIES
     ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
     TIMEOUT 60
   )

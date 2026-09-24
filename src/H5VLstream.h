@@ -266,7 +266,9 @@ typedef enum H5F_step_status_t {
     H5F_STEP_NOT_IN_STEP = 0, /**< No step is open                     */
     H5F_STEP_IN_STEP     = 1, /**< A step is open and accepting writes */
     H5F_STEP_COMMITTING  = 2, /**< end_step in progress                */
-    H5F_STEP_EOS         = 3, /**< Writer closed; no further steps     */
+    H5F_STEP_EOS         = 3, /**< Subscriber: every writer has left the
+                                *   group and every step it announced has
+                                *   been consumed; no further steps      */
     H5F_STEP_READING     = 4  /**< M3: reader positioned at a step; begin_step
                                 *   advances it                             */
 } H5F_step_status_t;
@@ -364,6 +366,9 @@ H5VL_STREAM_API herr_t H5Fend_step(hid_t file_id);
 
 /**
  * \brief Query the step state of \p file_id.
+ *
+ * On a subscriber (a reader with the transport enabled) this reports
+ * H5F_STEP_EOS once the stream has ended; see H5Fwait_step_ready().
  *
  * \param file_id  File opened through the vol-stream connector
  * \param status   Out: current step status
@@ -661,15 +666,23 @@ H5VL_STREAM_API herr_t H5Ffree_stream_schema(size_t n_vars, H5F_stream_var_t *va
  * immediately, seeded by the join itself, rather than blocking for a write
  * the reader already missed.
  *
+ * End of stream: when the writer leaves the group -- H5Fclose(), or its
+ * process dying -- steps it had already announced are still returned, and
+ * after the last of them this returns -1 at once instead of waiting out
+ * \p timeout_ms, and H5Fstep_status() reports H5F_STEP_EOS. A writer is
+ * recognised from the step announcements it sends, or from the join seed; one
+ * that leaves before announcing any step to this reader is not detected. A
+ * parallel writer's stream ends when every rank has left.
+ *
  * \param file_id       File opened through the vol-stream connector for
  *                      reading, with the transport enabled (see
  *                      VOL_STREAM_NA in dev-plan.md's M4 section)
  * \param timeout_ms    Milliseconds to wait, or 0 to poll without blocking
  * \param physical_step OUT: the physical step that committed
  * \param wall_time_ns  OUT: its wall_time_ns, or NULL if not wanted
- * \return \herr_t, -1 on timeout or if the transport is unavailable for
- *         this file (VOL_STREAM_NA was unset, the connector was built
- *         without Mercury, or \p file_id is not a reader)
+ * \return \herr_t, -1 on timeout, at end of stream, or if the transport is
+ *         unavailable for this file (VOL_STREAM_NA was unset, the connector
+ *         was built without Mercury, or \p file_id is not a reader)
  */
 H5VL_STREAM_API herr_t H5Fwait_step_ready(hid_t file_id, uint64_t timeout_ms, uint64_t *physical_step,
                     uint64_t *wall_time_ns);

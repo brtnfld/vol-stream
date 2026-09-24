@@ -332,14 +332,19 @@ class File:
         arrays = {path: self._subs[path].assemble(plist) for path, plist in by_path.items()}
         return Step(phys, wall_ns, arrays)
 
+    @property
+    def end_of_stream(self):
+        """True once the writer has left and every step it committed has been returned."""
+        return self._raw.end_of_stream()
+
     def steps(self, max_steps=None, timeout=None, idle_timeout=None, poll_ms=1000):
         """Yield Steps as the writer commits them.
 
-        A quiet stream does not end iteration on its own: the connector has
-        no end-of-stream signal, so a pause and a finished writer look the
-        same. Iteration ends only on a bound you give it: max_steps steps,
-        timeout seconds in total, or idle_timeout seconds without a step.
-        With none of them it runs until you break out or interrupt it.
+        Iteration ends when the writer closes the file (or its process
+        exits), after every step it committed has been yielded. A writer that
+        is only paused keeps iteration waiting. It also ends on any bound you
+        give it: max_steps steps, timeout seconds in total, or idle_timeout
+        seconds without a step. Break out or interrupt it to stop sooner.
 
         The generator holds nothing that needs cleaning up; the File does.
         Close the File, or use it as a context manager, when you are done.
@@ -360,6 +365,8 @@ class File:
                 count += 1
                 last = time.monotonic()
                 yield step
+            elif self.end_of_stream:
+                return
 
     def __iter__(self):
         return self.steps()
