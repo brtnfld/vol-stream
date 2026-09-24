@@ -1221,6 +1221,73 @@ matches the code. Each item is documented for users in
   where rank 2 or more used to be ignored. `t_chunk_shape_split` covers a
   (2, 8) chunk on an 8x8 dataset.
 
+## Remaining gaps
+
+As of 2026-09-24. Each is documented where it applies (user guide §2.3,
+[`python-plan.md`](python-plan.md)'s Known gaps, the RFC's open items); this is
+the one list. ★ marks what is being worked on next.
+
+**Transport**
+
+- ★ **Bulk transfer for the push payload (RFC Phase 1).** A push carries its
+  bytes inline in the RPC record, which caps large-message throughput and
+  keeps device memory out of reach. Move payloads above a size threshold to
+  `margo_bulk_create()`/`margo_bulk_transfer()` (pull), keep small ones
+  inline, and keep a step's payload alive until its pushes drain.
+- HMEM provider and device-direct delivery (RFC Phases 2 and 3), after Phase 1.
+- The payload-size sweep on a real RDMA fabric (RFC Phase 0), which needs
+  multi-node hardware. It sets Phase 1's priority and threshold, not whether
+  Phase 1 happens.
+
+**Protocol and semantics**
+
+- Subscriptions are not retroactive: a reader that joins at step 500 cannot
+  get the steps it missed (subscribe-with-start-step).
+- A reader that vanishes costs the writer push timeouts until SWIM declares
+  it dead. A writer that leaves before any step or answer reaches a reader is
+  not recognised as the end of the stream.
+- An attribute written in a step that does not write its dataset replays onto
+  a group of that name, which can shadow the dataset (user guide §2.3).
+- Error-stack coverage is incomplete, and a `Discard` drop is not reported to
+  the application.
+- No fault tolerance for a rank failure inside a collective commit.
+- Objects from a failed replay are never reclaimed.
+- Writer and reader cannot cross an HDF5 major.minor boundary.
+
+**Configuration and release**
+
+- Settings are environment variables only; there is no FAPL configuration path.
+- Connector value 1091 is provisional; request an official one before release.
+- The `FLUSH_REFRESH` capability flag is reported and misleading.
+
+**Measurement**
+
+- Metadata growth is unmeasured beyond 50 steps.
+- The ADIOS2 SST comparison is single-node, single-rank and statistically
+  informal.
+- `precision_dual` (the literal M8 exit gate) is still `DISABLED`.
+
+**Python binding** (details in [`python-plan.md`](python-plan.md))
+
+- Variable-length, reference and bitfield types are refused.
+- Per-subscriber precision is deflate only; other filters and chunk shape are
+  not exposed.
+- A whole-dataset subscription follows growth along the first dimension only.
+- `StreamDataset` is `num_workers=0` only (by design).
+- One process-wide HDF5 lock: a blocking wait on one `File` can delay a call on
+  another by up to 100 ms.
+- A step that arrives in several pushes is copied into one array.
+- Source build only, by design; no wheel.
+- Stale RPATH entries on macOS.
+
+**CI and upstream**
+
+- Flock is built from `main` with a patch until mochi-flock#9, or an
+  equivalent fix, is released.
+- The `ofi+tcp` pass does not gate.
+- The diaspora backend is not built in CI, so changes to it are unverified.
+- CI is Linux only; `volstream.torch` is tested only where torch is installed.
+
 ## Stretch goals
 
 Recorded rather than scheduled: real ideas with no milestone number, no exit
