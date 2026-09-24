@@ -1,0 +1,23 @@
+python/CMakeLists.txt
+  s_3816fb7b7c4a27::t_a691f40e687ffa 79-81,92,105
+.github/workflows/ci.yml
+  s_3816fb7b7c4a27::t_a691f40e687ffa 399-405,443
+docs/python-plan.md
+  s_3816fb7b7c4a27::t_95afb60968da36 388-391,397-402,443-444
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1abbbab2a192e1eafdb831e84ff346ec4f02aebe",
+  "prompts": {},
+  "sessions": {
+    "s_3816fb7b7c4a27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b5b5c72-aca3-496b-8412-0fb9ae85948c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
