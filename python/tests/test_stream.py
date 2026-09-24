@@ -9,6 +9,10 @@ ctest entry per mode) so every scenario gets a fresh transport.
              steps ahead. The reader joins after step 0 is committed, so that
              step must never be returned. The writer waits for the reader in
              H5Fwait_subscribers(), with no sentinel file.
+  early      The column scenario, but the writer waits in the barrier before
+             step 0 and the reader subscribes with expect= before any schema
+             exists, so step 0 is delivered too. A wrong expect= must raise
+             once the schema is seen.
   narrowing  The whole grid, delivered as int16 and filtered by a predicate:
              one step where everything matches, one where some rows do, and
              one where nothing does.
@@ -165,6 +169,43 @@ class ColumnTest(StreamTest):
         self.assertEqual(phys, sorted(set(phys)), "physical steps not strictly increasing")
         self.assertIsNone(self.file.next_step(500), "a step arrived after the last one")
         self.assert_writer_ok()
+
+
+class EarlyTest(ColumnTest):
+    """The column scenario with the reader subscribed before step 0 exists."""
+
+    writer_env = {"STREAM_WRITER_SUBSCRIBERS": "1", "STREAM_WRITER_EARLY": "1"}
+
+    def test_column(self):
+        # The writer has created the file and waits in H5Fwait_subscribers()
+        # before step 0, so there is no schema yet: expect= stands in for it.
+        self.wait_for("created")
+        self.file = volstream.open(self.path)
+        self.file.subscribe({"/grid": ((0, COL), (ROWS, 1))}, expect={"/grid": ((ROWS, COLS), np.int32)})
+        self.assertIn("/grid", self.file._unverified, "nothing left to check against the schema")
+
+        # Step 0 is delivered too: the barrier held the writer until now.
+        for s in range(0, LOCKSTEP + 1):
+            step = self.file.next_step(20000)
+            self.check_column(step, s)
+            if s:
+                self.touch(f"ack.{s}")
+        self.assertEqual(self.file._unverified, {}, "the expectation was never checked against the schema")
+
+        self.wait_for("writes_done")
+        for s in range(LOCKSTEP + 1, LAST + 1):
+            self.check_column(self.file.next_step(5000), s)
+        self.assertIsNone(self.file.next_step(500), "a step arrived after the last one")
+        self.assert_writer_ok()
+
+    def test_wrong_expectation(self):
+        # Mismatches are caught when the schema is first seen, not left to
+        # misplace data.
+        self.wait_for("created")
+        self.file = volstream.open(self.path)
+        self.file.subscribe("/grid", expect={"/grid": ((ROWS, COLS), np.float64)})
+        with self.assertRaisesRegex(volstream.Error, "expected as shape"):
+            self.file.next_step(20000)
 
 
 class NarrowingTest(StreamTest):
@@ -497,7 +538,7 @@ if __name__ == "__main__":
         sys.exit(__doc__)
     WRITER = sys.argv.pop(1)
     mode = sys.argv.pop(1)
-    cases = {"column": ColumnTest, "narrowing": NarrowingTest, "iterate": IterateTest,
+    cases = {"column": ColumnTest, "early": EarlyTest, "narrowing": NarrowingTest, "iterate": IterateTest,
              "getonly": GetOnlyTest, "torch": TorchTest, "eos": EndOfStreamTest, "drop": DropTest,
              "ack": BackpressureTest, "noack": NoBackpressureTest,
              "twostreams": MultiFileTest, "samestream": MultiFileTest, "reopen": MultiFileTest,

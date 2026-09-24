@@ -1522,6 +1522,20 @@ pushes. `backpressure=True` makes the writer's queue policy count this reader.
 (`num_workers=0`). A `File` is refused after `fork()`, releases the GIL while it
 waits, and is interruptible with Ctrl-C.
 
+A subscription is not retroactive, and the schema exists only once the writer
+has committed a step, so by default a Python reader sees the steps after the
+first. To receive every step, have the writer call `H5Fwait_subscribers()`
+before its first step, and subscribe without the schema by saying what to
+expect:
+
+```python
+f = volstream.open("run.h5")
+f.subscribe("/temperature", expect={"/temperature": ((128, 128), np.float64)})
+```
+
+The expectation is checked against the schema when the first step arrives. A
+mismatched type, rank, or trailing dimension raises `volstream.Error`.
+
 **Writing: `h5py` under the connector.** An unmodified `h5py` script picks up the
 connector from the environment, with no code changes:
 

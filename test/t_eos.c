@@ -22,11 +22,15 @@
  *   4. A writer that leaves without ever committing a step is still
  *      recognised, because the subscriber learned who the writer is when
  *      its H5Fsubscribe() was answered. EOS is reported for it too.
+ *   5. A writer whose process is killed says nothing on the way out; the
+ *      subscriber reports EOS once SWIM declares it dead, after delivering
+ *      the steps it announced.
  *
  * Two processes per scenario, na+sm. The writer is the one that leaves first
  * here, the opposite of every other two-process test.
  */
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +45,9 @@
 #define FNAME "t_eos.h5"
 
 #define FNAME_NOSTEP "t_eos_nostep.h5"
+#define FNAME_KILLED "t_eos_killed.h5"
+
+#define KILLED_READY_SENTINEL "t_eos.killed_ready"
 
 #define READY_SENTINEL        "t_eos.reader_ready"
 #define NOSTEP_READY_SENTINEL "t_eos.nostep_ready"
@@ -330,6 +337,141 @@ run_writer_nostep(void)
     return 0;
 }
 
+/* Scenario 5: the writer's process is killed, not closed. Nothing announces
+ * the departure; SWIM has to notice the silence and declare it dead. */
+static int
+run_reader_killed(void)
+{
+    hid_t    vol_id, fapl, fid, space;
+    hsize_t  dims = N;
+    uint64_t phys = 0, wall = 0;
+    double   t0;
+    int      s, i, rc = 0;
+
+    if ((vol_id = H5VL_stream_register()) < 0 || (fapl = H5Pcreate(H5P_FILE_ACCESS)) < 0 ||
+        H5Pset_vol(fapl, vol_id, NULL) < 0 || H5Pset_file_locking(fapl, false, true) < 0) {
+        printf("reader: FAIL setup\n");
+        return 1;
+    }
+    for (i = 0; i < 100 && access(FNAME_KILLED ".vsgroup", F_OK) != 0; i++)
+        usleep(100000);
+    if ((fid = H5Fopen(FNAME_KILLED, H5F_ACC_RDONLY, fapl)) < 0 ||
+        (space = H5Screate_simple(1, &dims, NULL)) < 0) {
+        printf("reader: FAIL open/join\n");
+        return 1;
+    }
+    {
+        const char *paths[1]  = {"/x"};
+        const hid_t spaces[1] = {space};
+
+        if (H5Fsubscribe(fid, 1, paths, spaces, NULL) < 0) {
+            printf("reader: FAIL subscribe\n");
+            return 1;
+        }
+    }
+    H5Sclose(space);
+    touch_sentinel(KILLED_READY_SENTINEL);
+
+    for (s = 0; s < 2; s++) {
+        if (H5Fwait_step_ready(fid, 20000, &phys, &wall) >= 0)
+            printf("  ok    step %d announced before the writer was killed\n", s);
+        else {
+            printf("  FAIL  step %d never announced\n", s);
+            rc = 1;
+        }
+    }
+
+    t0 = now_s();
+    while (!is_eos(fid) && now_s() - t0 < 60)
+        usleep(100000);
+    if (is_eos(fid))
+        printf("  ok    a killed writer: EOS once SWIM declared it dead (%.2f s)\n", now_s() - t0);
+    else {
+        printf("  FAIL  a killed writer was never reported as the end of the stream (60 s)\n");
+        rc = 1;
+    }
+    t0 = now_s();
+    if (H5Fwait_step_ready(fid, 10000, &phys, &wall) < 0 && now_s() - t0 < 1.0)
+        printf("  ok    and H5Fwait_step_ready() returns at once (%.3f s)\n", now_s() - t0);
+    else {
+        printf("  FAIL  H5Fwait_step_ready() did not return at once (%.3f s)\n", now_s() - t0);
+        rc = 1;
+    }
+
+    H5Fclose(fid);
+    H5Pclose(fapl);
+    H5VLclose(vol_id);
+    return rc;
+}
+
+static int
+run_writer_killed(void)
+{
+    hid_t   vol_id, fapl, fid, space, ds = H5I_INVALID_HID;
+    hsize_t dims = N;
+    int     s;
+
+    if ((vol_id = H5VL_stream_register()) < 0 || (fapl = H5Pcreate(H5P_FILE_ACCESS)) < 0 ||
+        H5Pset_vol(fapl, vol_id, NULL) < 0 || H5Pset_file_locking(fapl, false, true) < 0 ||
+        (fid = H5Fcreate(FNAME_KILLED, H5F_ACC_TRUNC, H5P_DEFAULT, fapl)) < 0 ||
+        (space = H5Screate_simple(1, &dims, NULL)) < 0) {
+        printf("writer: FAIL setup\n");
+        return 1;
+    }
+    if (wait_for_sentinel(KILLED_READY_SENTINEL, 300) < 0) {
+        printf("writer: FAIL reader never subscribed\n");
+        return 1;
+    }
+    for (s = 0; s < 2; s++)
+        if (write_step(fid, space, &ds, s) < 0)
+            return 1;
+    /* Give the step announcements time to leave, then die without a word. */
+    sleep(1);
+    fflush(NULL);
+    kill(getpid(), SIGKILL);
+    return 1; /* not reached */
+}
+
+/* Like run_pair(), but the writer runs in a child too, since it is killed. */
+static int
+run_pair_killed(void)
+{
+    pid_t rpid, wpid;
+    int   reader_status = 0, writer_status = 0, nerrors = 0;
+
+    printf("-- a writer whose process is killed\n");
+    fflush(NULL);
+    if ((rpid = fork()) < 0) {
+        perror("fork");
+        return 1;
+    }
+    if (rpid == 0) {
+        int rc = run_reader_killed();
+
+        fflush(NULL);
+        _exit(rc);
+    }
+    if ((wpid = fork()) < 0) {
+        perror("fork");
+        return 1;
+    }
+    if (wpid == 0)
+        _exit(run_writer_killed());
+    if (waitpid(wpid, &writer_status, 0) < 0 || waitpid(rpid, &reader_status, 0) < 0) {
+        perror("waitpid");
+        return 1;
+    }
+    if (!(WIFSIGNALED(writer_status) && WTERMSIG(writer_status) == SIGKILL)) {
+        printf("\nwriter was not killed as intended (status=%d)\n", writer_status);
+        nerrors++;
+    }
+    if (!(WIFEXITED(reader_status) && WEXITSTATUS(reader_status) == 0)) {
+        printf("\nreader process reported failure (status=%d)\n", reader_status);
+        nerrors++;
+    }
+    return nerrors;
+}
+
 /* Fork the reader, run the writer here, and report. Returns failures. */
 static int
 run_pair(const char *name, int (*reader)(void), int (*writer)(void))
@@ -376,6 +518,9 @@ clean(void)
     unlink(FNAME);
     unlink(FNAME_NOSTEP ".vsgroup");
     unlink(FNAME_NOSTEP);
+    unlink(KILLED_READY_SENTINEL);
+    unlink(FNAME_KILLED ".vsgroup");
+    unlink(FNAME_KILLED);
 }
 
 int
@@ -389,6 +534,7 @@ main(void)
     clean();
     nerrors += run_pair("-- a writer that committed steps", run_reader, run_writer);
     nerrors += run_pair("-- a writer that never committed a step", run_reader_nostep, run_writer_nostep);
+    nerrors += run_pair_killed();
     clean();
 
     if (nerrors) {

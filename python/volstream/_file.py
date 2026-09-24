@@ -178,6 +178,23 @@ def _close_all():
             pass
 
 
+def _check_expected(expected, actual):
+    """Raise unless a subscribe(expect=) declaration matches the schema.
+
+    Dimension 0 may differ: a dataset can grow along it, and routing needs
+    only the trailing dimensions to agree."""
+    same_shape = actual.shape is not None and (
+        actual.shape == expected.shape
+        if expected.is_attr
+        else len(actual.shape) == len(expected.shape) and actual.shape[1:] == expected.shape[1:]
+    )
+    if actual.dtype != expected.dtype or actual.is_attr != expected.is_attr or not same_shape:
+        raise Error(
+            f"{expected.path!r} was expected as shape {expected.shape} {expected.dtype}, but the writer "
+            f"describes it as shape {actual.shape} {actual.dtype}"
+        )
+
+
 def _growing_extent(shape):
     """The extent a whole-dataset subscription is made against: the dataset's
     own, with dimension 0 made as large as it can be.
@@ -213,6 +230,7 @@ class File:
         self.backpressure = backpressure
         self._subs = {}
         self._held = None  # a Push popped past the end of a step, for a later one
+        self._unverified = {}  # subscribe(expect=) paths not yet checked against the schema
         _open_files.add(self)
 
     @property
@@ -250,12 +268,21 @@ class File:
             for path, is_attr, dims, type_json in entries
         }
 
-    def subscribe(self, selections, timeout_ms=10000, deflate=None):
+    def subscribe(self, selections, timeout_ms=10000, deflate=None, expect=None):
         """Subscribe to one or more datasets.
 
         selections is a path, a list of paths, or a dict mapping each path to
         None (the whole dataset) or a (start, count) pair of tuples. Shapes
         and types come from the writer's schema.
+
+        expect maps paths to (shape, dtype) for objects the writer has not
+        described yet. The schema exists only once the writer has committed a
+        step, so this is how to subscribe before its first one -- typically
+        while it waits in H5Fwait_subscribers(). If every path is in expect,
+        the schema is not asked for. Each expected path is checked against
+        the schema once it exists (when the first step arrives), and a type,
+        rank, or trailing dimension that does not match raises Error rather
+        than misplacing data.
 
         The first subscribe() on a file also discards every step committed
         before it: those steps carry nothing for this reader, including the
@@ -273,10 +300,17 @@ class File:
         elif not isinstance(selections, dict):
             selections = {path: None for path in selections}
 
-        schema = self.schema(timeout_ms)
+        declared = {
+            path: Var(path, np.dtype(dtype), tuple(int(d) for d in shape), "@" in path.rsplit("/", 1)[-1])
+            for path, (shape, dtype) in (expect or {}).items()
+        }
+        schema = {} if all(p in declared for p in selections) else self.schema(timeout_ms)
+        for path, var in declared.items():
+            if path in schema:
+                _check_expected(var, schema[path])
         entries, subs = [], {}
         for path, sel in selections.items():
-            var = schema.get(path)
+            var = schema.get(path) or declared.get(path)
             if var is None:
                 raise KeyError(f"{path!r} is not in the stream's schema")
             if var.dtype is None:
@@ -305,6 +339,7 @@ class File:
         last = self._discard_backlog() if not self._subs else None
         self._raw.subscribe(entries)
         self._subs.update(subs)
+        self._unverified.update((p, declared[p]) for p in subs if p in declared and p not in schema)
         if last is not None and self.backpressure:
             # Those steps are done with as far as this reader is concerned;
             # acking them makes it a tracked reader from subscribe() on,
@@ -369,6 +404,8 @@ class File:
         if ready is None:
             return None
         phys, wall_ns = ready
+        if self._unverified:
+            self._verify_expected()
 
         # The writer delivers every push of a step before announcing it, so
         # everything for this step is already queued: drain without waiting.
@@ -453,6 +490,18 @@ class File:
         sub = self._subs.get(path)
         data = sub.values(buf, count) if sub else np.frombuffer(buf, dtype=np.uint8)
         return Push(phys, path, start, data)
+
+    def _verify_expected(self):
+        # A step has committed, so the schema exists. If the writer cannot be
+        # asked (it may already have left), try again at the next step.
+        try:
+            schema = self.schema(2000)
+        except Error:
+            return
+        for path, var in list(self._unverified.items()):
+            if path in schema:
+                del self._unverified[path]
+                _check_expected(var, schema[path])
 
     def _discard_backlog(self):
         """Drop the step notifications queued before the first subscription.

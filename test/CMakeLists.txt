@@ -98,6 +98,8 @@ if(VOL_STREAM_HAVE_MERCURY)
     ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
     TIMEOUT 60
   )
+  # eos's killed-writer case waits for SWIM to declare the writer dead.
+  set_tests_properties(eos PROPERTIES TIMEOUT 150)
 
   # Benchmark, not a correctness gate in the usual sense: the growing
   # time-series array (t_dset_resize.c's supported re-create-each-step

@@ -44,7 +44,10 @@
  * waits after step 0 in H5Fwait_subscribers() for n subscribers, and ignores
  * "ready": the subscription itself, over the transport, is what releases it.
  * Step 0 still comes first, since a Python subscriber needs the schema it
- * publishes before it can subscribe.
+ * publishes before it can subscribe -- unless STREAM_WRITER_EARLY is also
+ * set, in which case the writer waits before step 0, for a reader that
+ * subscribes with subscribe(expect=). The writer touches "created" once the
+ * file exists, for such a reader to open it.
  *
  * usage: stream_writer <column|narrowing|lifecycle|idle|eos|block|grow|types> <file> <syncdir>
  */
@@ -253,6 +256,13 @@ main(int argc, char **argv)
         (fid = H5Fcreate(argv[2], H5F_ACC_TRUNC, H5P_DEFAULT, fapl)) < 0 ||
         (space = H5Screate_simple(2, dims, NULL)) < 0) {
         fprintf(stderr, "stream_writer: FAIL setup (transport up?)\n");
+        return 1;
+    }
+
+    touch("created");
+    if (getenv("STREAM_WRITER_EARLY") && (subs = getenv("STREAM_WRITER_SUBSCRIBERS")) != NULL &&
+        H5Fwait_subscribers(fid, strtoull(subs, NULL, 10), 60000) < 0) {
+        fprintf(stderr, "stream_writer: gave up waiting for %s subscribers before step 0\n", subs);
         return 1;
     }
 

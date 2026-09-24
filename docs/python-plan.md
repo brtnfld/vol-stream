@@ -370,10 +370,14 @@ No shared filesystem between the two sides: `python_stream_column` and
 `python_lifecycle_break` run the writer with `STREAM_WRITER_SUBSCRIBERS=1`,
 so it waits in `H5Fwait_subscribers()` rather than for a "ready" file, and
 the subscription arriving over the transport is what releases it. The other
-modes still use the file. The writer commits step 0 before it waits, because
-a Python `subscribe()` checks its paths against the schema that step 0
-publishes. A C subscriber can subscribe before any step exists
-(`t_rendezvous_barrier`); a Python one cannot yet. Because the writer is
+modes still use the file. There the writer commits step 0 before it waits,
+because a Python `subscribe()` checks its paths against the schema that step
+0 publishes. To subscribe before any step exists, as a C subscriber can
+(`t_rendezvous_barrier`), pass `subscribe(..., expect={path: (shape, dtype)})`.
+It stands in for the schema, and is checked against it when the first step
+arrives: a mismatched type, rank or trailing dimension raises rather than
+misplacing data. `python_stream_early` runs the writer's barrier before step
+0 and requires step 0 itself to be delivered. Because the writer is
 released before `subscribe()` returns, the notifications queued before the
 subscription are drained before subscribing, not after. Otherwise the
 writer's first step could be announced in time to be thrown away with them.
@@ -385,7 +389,7 @@ announced before leaving are still delivered. After the last one,
 `for step in f:` ends by itself. The reader recognises the writer from its
 step announcements (which now carry its member id) or from the join seed,
 and a parallel writer's stream ends when every rank has left. A writer that
-leaves before announcing any step to a reader is not detected. Pinned in C
+leaves before announcing any step to a reader is not detected. A killed writer is reported once SWIM declares it dead. Pinned in C
 by `test/t_eos.c` and in Python by `python_stream_eos`.
 
 ### P5 — CI and packaging · M
