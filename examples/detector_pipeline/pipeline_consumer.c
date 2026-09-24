@@ -400,33 +400,70 @@ main(int argc, char **argv)
             steps_seen++;
 
             {
-                uint64_t data_phys = 0, elem_start = 0, elem_count = 0;
-                char    *path = NULL;
-                void    *buf  = NULL;
-                size_t   size = 0;
-                int      got;
+                int step_hit = 0;
+                int first    = 1;
 
-                /* "got" (the call succeeded) and "matched" (it was THIS
-                 * step) are tracked separately so a success on an
-                 * unexpected phys -- not expected in this sequential,
-                 * one-subscriber setup, but not ruled out either -- still
-                 * gets its allocation freed rather than leaked. */
-                got = (H5Fget_subscribed_data(fid, (uint64_t)step_timeout, &data_phys, &path, &buf, &size,
-                                               &elem_start, &elem_count) >= 0);
+                /*
+                 * A predicate match is delivered as one push per maximal
+                 * contiguous run (H5Fsubscribe_predicate()'s own doc
+                 * comment), and detector_writer.c writes each frame as 4
+                 * separate module H5Dwrite() calls -- so a single hit step
+                 * can queue more than one item here, not just one. Drain
+                 * all of them before scoring the step, or a later poll
+                 * would pop this step's leftover backlog and compare it
+                 * against the wrong phys.
+                 *
+                 * Only the first poll needs the full step_timeout -- it is
+                 * the one that tells "no signal this step" apart from
+                 * "writer hasn't gotten here yet" (which
+                 * H5Fwait_step_ready() has already ruled out). Any further
+                 * run was queued by this same already-committed step, so it
+                 * is either sitting in the queue already or never coming;
+                 * poll for it without blocking.
+                 */
+                for (;;) {
+                    uint64_t data_phys = 0, elem_start = 0, elem_count = 0;
+                    char    *path = NULL;
+                    void    *buf  = NULL;
+                    size_t   size = 0;
+                    int      got;
 
-                if (got && data_phys == phys) {
-                    hit_count++;
-                    miss_streak = 0;
+                    /* "got" (the call succeeded) and "matched" (it was THIS
+                     * step) are tracked separately so a success on an
+                     * unexpected phys -- not expected in this sequential,
+                     * one-subscriber setup, but not ruled out either -- still
+                     * gets its allocation freed rather than leaked. */
+                    got = (H5Fget_subscribed_data(fid, first ? (uint64_t)step_timeout : 0, &data_phys,
+                                                   &path, &buf, &size, &elem_start, &elem_count) >= 0);
+                    first = 0;
+
+                    if (!got)
+                        break;
+
+                    if (data_phys != phys) {
+                        /* Belongs to a step not yet confirmed via
+                         * H5Fwait_step_ready() -- free it and stop draining;
+                         * whatever comes after it belongs no earlier than
+                         * this one does either. */
+                        free(path);
+                        free(buf);
+                        break;
+                    }
+
+                    step_hit = 1;
                     printf("monitor: step %llu  SIGNAL  (%llu element(s) above threshold, %zu byte(s))\n",
                            (unsigned long long)phys, (unsigned long long)elem_count, size);
+                    free(path);
+                    free(buf);
+                }
+
+                if (step_hit) {
+                    hit_count++;
+                    miss_streak = 0;
                 }
                 else {
                     miss_streak++;
                     printf("monitor: step %llu  no signal\n", (unsigned long long)phys);
-                }
-                if (got) {
-                    free(path);
-                    free(buf);
                 }
             }
 
