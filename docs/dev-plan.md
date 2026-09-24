@@ -1232,6 +1232,14 @@ matches the code. Each item is documented for users in
   first, and end_step collects its notes and pushes them as its last action.
   A `Discard` drop is reported that way (`t_queue_policy`), and so is the
   parallel Spill-as-Block warning, which had never been visible.
+- **Flush and refresh behave consistently, so `FLUSH_REFRESH` is accurate.**
+  The flag only promises that the calls are supported, and the library never
+  reads it, so nothing needed a core change. Inside an open step `H5Dflush()`
+  and `H5Gflush()` used to fail and `H5Fflush()` could crash (the native flush
+  walks open dataset IDs, and one created in the step has no native object
+  yet). Now every flush succeeds, a file flush is deferred to the step's
+  commit, a refresh fails with a reason, and a reader's virtual group
+  refreshes. `t_flush_refresh`.
 - **Backfill for late joiners: `H5Fsubscribe_from()`.** A reader that joins
   at step 500 can get steps from any earlier one. The writer reads each
   missed step back from its own file on its own thread (HDF5 is not
@@ -1333,7 +1341,11 @@ the one list. ★ marks what is being worked on next.
 **Configuration and release**
 
 - Connector value 1091 is provisional; request an official one before release.
-- The `FLUSH_REFRESH` capability flag is reported and misleading.
+- A flush of the underlying file while a dataset created in the open step is
+  still open crashes in native code: the native flush walks every open
+  dataset ID, and that dataset has no native object yet. `H5Fflush()` is
+  deferred to the step's commit, so the common route is safe; closing a
+  second native handle to the same file in the same process mid-step is not.
 
 **Measurement**
 

@@ -1664,11 +1664,11 @@ VOL_STREAM_NA=ofi+tcp ./examples/heat_diffusion/heat_monitor 28 150
 > [!CAUTION]
 > **`H5Fflush()` does not commit an open step, and reports success anyway.**
 
-The flush forwards to the underlying connector and makes everything *already
-replayed* durable. But the current step's captured entries are still in the
-connector's staging buffer and are not part of that. So `H5Fflush()` during a
-step succeeds over a file that is missing everything written since
-`H5Fbegin_step()`.
+The step is the unit of durability: until `H5Fend_step()` commits it, its
+writes are captured in the connector's staging buffer, not in the file. A
+flush during a step therefore cannot include them. It succeeds, and the
+connector flushes the file as soon as that step commits, so the step it was
+asked during is durable once `H5Fend_step()` returns.
 
 This is the intended contract, not an oversight. The step is the unit of
 durability and atomicity; a flush that committed half a step would publish a
@@ -1679,17 +1679,19 @@ defensively, and erroring would break callers doing nothing wrong.
 
 | Call | During an open step | Between steps |
 |---|---|---|
-| `H5Fflush()` | Forwards to native; **does not commit the step**; returns success | Forwards to native; makes committed steps durable |
-| `H5Dflush()` | Same | Same |
+| `H5Fflush()` | Succeeds; **does not commit the step**; the file is flushed when the step commits | Forwards to native; makes committed steps durable |
+| `H5Dflush()`, `H5Gflush()` | Succeed; nothing of the step is in the file to flush | Forward to native |
+| `H5Drefresh()`, `H5Grefresh()` | **Fail**, with a frame saying why: the file does not yet hold the step, so there is nothing to reload | Forward to native. On a reader, reload the step it is positioned on; they never advance it (`H5Fbegin_step()` does) |
 | `H5Fend_step()` | **The only call that publishes a step.** Waits for every deferred operation issued since `begin`, validates, replays atomically, pushes to subscribers | n/a |
 
 > [!NOTE]
-> This cannot be discovered through `H5Pget_vol_cap_flags()`, which reports
-> `H5VL_CAP_FLAG_FLUSH_REFRESH` inherited from the underlying connector and
-> admits no such qualification. Expressing it properly would need a new
-> capability flag in HDF5 itself, which the project's no-library-changes
-> constraint rules out — so it is documented at `H5Fbegin_step()` in
-> [`H5VLstream.h`](../src/H5VLstream.h), where a user actually meets it.
+> `H5Pget_vol_cap_flags()` reports `H5VL_CAP_FLAG_FLUSH_REFRESH`, and that is
+> accurate: HDF5 defines it only as "flush/refresh calls are supported", and
+> the library itself never reads it (only its API test suite does, to skip
+> tests). The calls above are supported, with the step semantics in the
+> table; refresh inside a writer's open step is the one refusal, and it says
+> why. What the flag cannot say is that a flush never commits an open step --
+> that is the table's job. `test/t_flush_refresh.c` pins every row.
 
 **Does `H5Fend_step()` wait for a broker ACK?** By default, no — the push is
 issued and the call returns after the durable replay completes. Consumer

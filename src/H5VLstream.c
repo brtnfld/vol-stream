@@ -343,6 +343,7 @@ struct H5VL_stream_file_state_t {
      * variable that is set overrides each -- see the H5VL__stream_cfg_*()
      * helpers. */
     int                          has_subscribed;     /* a reader's first subscribe has been made */
+    int                          flush_after_step;   /* H5Fflush() during the open step: flush at commit */
     char                        *cfg_na;             /* NULL: no transport */
     int                          cfg_stage_payload;  /* -1 default (on) */
     uint64_t                     cfg_max_pending;    /* 0: no limit */
@@ -10682,6 +10683,36 @@ H5VL_stream_dataset_get(void *dset, H5VL_dataset_get_args_t *args, hid_t dxpl_id
 } /* end H5VL_stream_dataset_get() */
 
 /*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_step_flush_refresh
+ *
+ * Purpose:     Flush or refresh on an object that belongs to the writer's
+ *              open step. The step is this connector's unit of durability:
+ *              until H5Fend_step() commits it, its writes are captured in
+ *              memory, not in the file. So a flush has nothing of the step's
+ *              to write and succeeds, the same contract as H5Fflush() --
+ *              committed steps durable, the open one not (see
+ *              H5VL_FILE_FLUSH in file_specific). A refresh would reload
+ *              from a file that does not yet hold the step, so it fails
+ *              with a reason rather than quietly reloading an earlier
+ *              step's copy.
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_step_flush_refresh(int is_flush, const char *refresh_call)
+{
+    char msg[256];
+
+    if (is_flush)
+        return 0;
+    snprintf(msg, sizeof(msg),
+             "%s inside an open step has nothing to reload: the step's writes are captured, not yet in "
+             "the file. Refresh after H5Fend_step()",
+             refresh_call);
+    H5VL_STREAM_ERR(H5VL_stream_err_step_g, msg);
+    return -1;
+} /* end H5VL__stream_step_flush_refresh() */
+
+/*-------------------------------------------------------------------------
  * Function:    H5VL_stream_dataset_specific
  *
  * Purpose:     Specific operation on a dataset
@@ -10702,9 +10733,16 @@ H5VL__stream_dataset_specific_impl(void *obj, H5VL_dataset_specific_args_t *args
     printf("------- VOL-STREAM H5Dspecific\n");
 #endif
 
-    /* M2: not supported against a placeholder (H5Dset_extent, H5Dflush,
-     * H5Drefresh on a not-yet-real object) -- a documented gap, not part of
-     * the M2 exit-gate matrix. */
+    /* Flush and refresh inside an open step, on a dataset created in it (a
+     * placeholder) or on a live one being captured (below): see
+     * H5VL__stream_step_flush_refresh(). */
+    if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER &&
+        (args->op_type == H5VL_DATASET_FLUSH || args->op_type == H5VL_DATASET_REFRESH))
+        return H5VL__stream_step_flush_refresh(args->op_type == H5VL_DATASET_FLUSH, "H5Drefresh()");
+
+    /* M2: not supported against a placeholder (H5Dset_extent on a
+     * not-yet-real object) -- a documented gap, not part of the M2
+     * exit-gate matrix. */
     if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER)
         return -1;
 
@@ -10733,15 +10771,12 @@ H5VL__stream_dataset_specific_impl(void *obj, H5VL_dataset_specific_args_t *args
      * uses it -- instead of querying the real, never-actually-resized
      * object -- when this step's own write synthesizes its own copy. */
     if (H5VL__stream_dset_capture(o)) {
+        if (args->op_type == H5VL_DATASET_FLUSH || args->op_type == H5VL_DATASET_REFRESH)
+            /* Not passed through: under_object is an earlier step's
+             * committed copy, so a refresh would reload the wrong object.
+             * See H5VL__stream_step_flush_refresh(). */
+            return H5VL__stream_step_flush_refresh(args->op_type == H5VL_DATASET_FLUSH, "H5Drefresh()");
         if (args->op_type != H5VL_DATASET_SET_EXTENT)
-            /* H5Dflush/H5Drefresh: still declined here. Neither mutates
-             * shape or values, so passing them through to under_object
-             * (an earlier step's real, already-fully-committed object)
-             * would not corrupt anything the way an unguarded
-             * H5Dset_extent did -- but it would be a no-op or a refresh
-             * against the wrong (stale) object, not a documented gap this
-             * connector claims to fill, so it is left declined rather than
-             * quietly doing something a caller did not ask for. */
             return -1;
 
         {
@@ -11382,6 +11417,17 @@ H5VL_stream_file_specific(void *file, H5VL_file_specific_args_t *args, hid_t dxp
         /* Set object pointer for operation */
         new_o = NULL;
     } /* end else-if */
+    else if (args->op_type == H5VL_FILE_FLUSH && o->file_state && !o->file_state->is_reader &&
+             o->file_state->step_state != H5F_STEP_NOT_IN_STEP) {
+        /* Inside an open step the flush is deferred to the step's commit,
+         * not forwarded now. Forwarding crashed: the native flush walks every
+         * open dataset ID, and one created in this step has no native object
+         * yet (H5VLget_object() gives it NULL, which the native code
+         * dereferences). Deferring is also the better contract -- the step
+         * this flush was asked during is durable as soon as it commits. */
+        o->file_state->flush_after_step = 1;
+        return 0;
+    }
     else {
         /* H5VL_FILE_FLUSH deliberately does NOT commit an open step.
          *
@@ -11401,10 +11447,9 @@ H5VL_stream_file_specific(void *file, H5VL_file_specific_args_t *args, hid_t dxp
          * doing nothing wrong.
          *
          * Documented at H5Fbegin_step() in H5VLstream.h, where a user will
-         * actually meet it. It cannot be expressed through the capability
-         * flags: H5Pget_vol_cap_flags() reports H5VL_CAP_FLAG_FLUSH_REFRESH
-         * inherited from the native connector, which admits no such
-         * qualification. */
+         * actually meet it. H5VL_CAP_FLAG_FLUSH_REFRESH stays reported: its
+         * contract is only that the calls are supported, which they are --
+         * see test/t_flush_refresh.c. */
 
         /* Keep the correct underlying VOL ID for later */
         under_vol_id = o->under_vol_id;
@@ -11814,6 +11859,21 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
         (void)committed_step;
         (void)committed_wall_time_ns;
 #endif
+
+        /* An H5Fflush() asked for during this step, now that it is committed
+         * and every object in it is real. */
+        if (o->file_state->flush_after_step) {
+            H5VL_file_specific_args_t flush_args;
+
+            o->file_state->flush_after_step  = 0;
+            flush_args.op_type               = H5VL_FILE_FLUSH;
+            flush_args.args.flush.obj_type   = H5I_FILE;
+            flush_args.args.flush.scope      = H5F_SCOPE_GLOBAL;
+            if (H5VLfile_specific(H5VL__stream_file_under(o->file_state), o->file_state->file_under_vol_id,
+                                  &flush_args, H5P_DATASET_XFER_DEFAULT, NULL) < 0)
+                H5VL_STREAM_ERR(H5VL_stream_err_step_g,
+                                "the flush requested during this step failed after it committed");
+        }
 
 #ifdef H5_HAVE_PARALLEL
         /* Matches the barrier at the top of begin_step(): keeps a rank that
@@ -12531,6 +12591,18 @@ H5VL_stream_group_specific(void *obj, H5VL_group_specific_args_t *args, hid_t dx
 #ifdef ENABLE_STREAM_LOGGING
     printf("------- VOL-STREAM GROUP Specific\n");
 #endif
+
+    /* A reader-mode virtual group holds nothing to flush or reload: each
+     * object opened under it resolves to its own step's copy at open time. */
+    if (o->obj_state == H5VL_STREAM_OBJ_READER_VIRTUAL &&
+        (args->op_type == H5VL_GROUP_FLUSH || args->op_type == H5VL_GROUP_REFRESH))
+        return 0;
+
+    /* A group created in the writer's open step: see
+     * H5VL__stream_step_flush_refresh(). */
+    if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER &&
+        (args->op_type == H5VL_GROUP_FLUSH || args->op_type == H5VL_GROUP_REFRESH))
+        return H5VL__stream_step_flush_refresh(args->op_type == H5VL_GROUP_FLUSH, "H5Grefresh()");
 
     /* M3: see H5VL_stream_group_get() -- no single underlying object for a
      * reader-mode virtual group. */
