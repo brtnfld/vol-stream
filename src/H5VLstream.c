@@ -479,6 +479,8 @@ struct H5VL_stream_t {
     H5VL_stream_obj_state_t   obj_state;
     size_t                    pending_index; /* valid only when obj_state ==
                                                * H5VL_STREAM_OBJ_PLACEHOLDER */
+    int                       is_dataset;    /* a dataset placeholder -- see
+                                               * H5VL_stream_get_object() */
     H5VL_stream_step_completion_t *deferred_completion; /* valid only when obj_state ==
                                                            * H5VL_STREAM_OBJ_DEFERRED_REQUEST;
                                                            * a reference this request object
@@ -9229,6 +9231,67 @@ H5VL_stream_str_to_info(const char *str, void **_info)
     return 0;
 } /* end H5VL_stream_str_to_info() */
 
+/*-------------------------------------------------------------------------
+ * The native stand-in for a dataset created in an open step -- see
+ * H5VL_stream_get_object(). One per process: a scalar dataset in an
+ * in-memory native file (core driver, no backing store), created on first
+ * use and closed as the library shuts down (H5atclose(), which runs before
+ * open files are torn down). It is never read or written; it only has to be
+ * a valid native dataset that belongs to no stream file.
+ *-------------------------------------------------------------------------
+ */
+static hid_t H5VL_stream_standin_file_g = H5I_INVALID_HID;
+static hid_t H5VL_stream_standin_dset_g = H5I_INVALID_HID;
+static void *H5VL_stream_standin_obj_g  = NULL; /* the native H5D_t behind standin_dset_g */
+
+static void
+H5VL__stream_standin_close(void *ctx)
+{
+    (void)ctx;
+    H5VL_stream_standin_obj_g = NULL;
+    if (H5VL_stream_standin_dset_g >= 0)
+        H5Dclose(H5VL_stream_standin_dset_g);
+    if (H5VL_stream_standin_file_g >= 0)
+        H5Fclose(H5VL_stream_standin_file_g);
+    H5VL_stream_standin_dset_g = H5VL_stream_standin_file_g = H5I_INVALID_HID;
+} /* end H5VL__stream_standin_close() */
+
+/* Made where it is safe to create a file -- a dataset placeholder's creation
+ * -- never inside H5VL_stream_get_object(), which runs during HDF5's walk of
+ * its ID lists. Plain public calls, with the native connector named on the
+ * FAPL so HDF5_VOL_CONNECTOR cannot route the stand-in back through this
+ * connector. */
+static void
+H5VL__stream_standin_dataset(void)
+{
+    hid_t fapl = H5I_INVALID_HID, native = H5I_INVALID_HID, space = H5I_INVALID_HID;
+
+    if (H5VL_stream_standin_obj_g)
+        return;
+
+    if ((native = H5VLget_connector_id_by_name("native")) < 0 || (fapl = H5Pcreate(H5P_FILE_ACCESS)) < 0 ||
+        H5Pset_fapl_core(fapl, 4096, false) < 0 || H5Pset_vol(fapl, native, NULL) < 0)
+        goto done;
+    if ((H5VL_stream_standin_file_g =
+             H5Fcreate("vol-stream-standin", H5F_ACC_TRUNC, H5P_DEFAULT, fapl)) < 0 ||
+        (space = H5Screate(H5S_SCALAR)) < 0 ||
+        (H5VL_stream_standin_dset_g = H5Dcreate2(H5VL_stream_standin_file_g, "standin", H5T_NATIVE_INT, space,
+                                                 H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT)) < 0 ||
+        NULL == (H5VL_stream_standin_obj_g = H5VLobject(H5VL_stream_standin_dset_g))) {
+        H5VL__stream_standin_close(NULL);
+        goto done;
+    }
+    H5atclose(H5VL__stream_standin_close, NULL);
+
+done:
+    if (space >= 0)
+        H5Sclose(space);
+    if (fapl >= 0)
+        H5Pclose(fapl);
+    if (native >= 0)
+        H5VLclose(native);
+} /* end H5VL__stream_standin_dataset() */
+
 /*---------------------------------------------------------------------------
  * Function:    H5VL_stream_get_object
  *
@@ -9247,6 +9310,19 @@ H5VL_stream_get_object(const void *obj)
 #ifdef ENABLE_STREAM_LOGGING
     printf("------- VOL-STREAM Get object\n");
 #endif
+
+    /* A dataset created in the open step has no native object until the
+     * step commits. HDF5 asks for one anyway whenever it walks the open
+     * dataset IDs -- the flush that closing a file or another handle to it
+     * runs, H5D__flush_all_cb() -- and dereferences whatever it gets, so
+     * NULL crashed it. It gets a stand-in instead: a real dataset in a
+     * private in-memory file, which that walk skips because it belongs to a
+     * different file. */
+    if (!o->under_object && o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER && o->is_dataset)
+        /* Only read here, never created: this runs inside HDF5's walk of
+         * the ID lists, where creating a file would re-enter it. The
+         * placeholder's creation made it (H5VL__stream_standin_dataset()). */
+        return H5VL_stream_standin_obj_g;
 
     return H5VLget_object(o->under_object, o->under_vol_id);
 } /* end H5VL_stream_get_object() */
@@ -9993,7 +10069,12 @@ H5VL_stream_attr_close(void *attr, hid_t dxpl_id, void **req)
     /* M2: nothing underlying exists yet for a placeholder -- see the same
      * note in H5VL_stream_dataset_close(). */
     if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER) {
-        o->file_state->pending[o->pending_index].owner_wrapper = NULL;
+        /* The step may be gone already -- H5Fclose() discards an open step
+         * while this handle is still open -- and with it the pending list,
+         * or the slot may now belong to another entry. */
+        if (o->file_state && o->file_state->pending && o->pending_index < o->file_state->n_pending &&
+            o->file_state->pending[o->pending_index].owner_wrapper == o)
+            o->file_state->pending[o->pending_index].owner_wrapper = NULL;
         H5VL_stream_free_obj(o);
         return 0;
     }
@@ -10072,6 +10153,8 @@ H5VL__stream_dataset_create_impl(void *obj, const H5VL_loc_params_t *loc_params,
         H5VL__stream_file_state_incref(o->file_state);
         dset->path                                = strdup(entry.path);
         dset->obj_state                           = H5VL_STREAM_OBJ_PLACEHOLDER;
+        dset->is_dataset                          = 1;
+        H5VL__stream_standin_dataset(); /* for H5VL_stream_get_object(); see there */
         dset->pending_index                       = idx;
         o->file_state->pending[idx].owner_wrapper = dset;
 
@@ -10914,7 +10997,12 @@ H5VL_stream_dataset_close(void *dset, hid_t dxpl_id, void **req)
      * t_step.c-style "H5Dcreate2, H5Dwrite, H5Dclose, all inside the step"
      * pattern; closing before end_step is perfectly normal. */
     if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER) {
-        o->file_state->pending[o->pending_index].owner_wrapper = NULL;
+        /* The step may be gone already -- H5Fclose() discards an open step
+         * while this handle is still open -- and with it the pending list,
+         * or the slot may now belong to another entry. */
+        if (o->file_state && o->file_state->pending && o->pending_index < o->file_state->n_pending &&
+            o->file_state->pending[o->pending_index].owner_wrapper == o)
+            o->file_state->pending[o->pending_index].owner_wrapper = NULL;
         H5VL_stream_free_obj(o);
         return 0;
     }

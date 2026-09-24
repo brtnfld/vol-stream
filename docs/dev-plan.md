@@ -1232,6 +1232,14 @@ matches the code. Each item is documented for users in
   first, and end_step collects its notes and pushes them as its last action.
   A `Discard` drop is reported that way (`t_queue_policy`), and so is the
   parallel Spill-as-Block warning, which had never been visible.
+- **No crash when HDF5 walks open objects mid-step.** A dataset created in
+  the open step has no native object until the step commits, but HDF5 asks
+  for one whenever it walks the open dataset IDs (a file close's flush, a
+  second handle's close) and dereferenced the NULL it got. The connector now
+  hands it a stand-in: one real dataset in a private in-memory file, which
+  those walks skip. And closing the file with such a dataset still open
+  discarded the step under it, so the dataset's own close wrote into freed
+  step state; it now checks. `t_open_step_objects` crashes without either.
 - **Flush and refresh behave consistently, so `FLUSH_REFRESH` is accurate.**
   The flag only promises that the calls are supported, and the library never
   reads it, so nothing needed a core change. Inside an open step `H5Dflush()`
@@ -1341,11 +1349,9 @@ the one list. ★ marks what is being worked on next.
 **Configuration and release**
 
 - Connector value 1091 is provisional; request an official one before release.
-- A flush of the underlying file while a dataset created in the open step is
-  still open crashes in native code: the native flush walks every open
-  dataset ID, and that dataset has no native object yet. `H5Fflush()` is
-  deferred to the step's commit, so the common route is safe; closing a
-  second native handle to the same file in the same process mid-step is not.
+- A second, native handle to a file the connector has open in the same
+  process is not supported: HDF5 shares one file state between them, and
+  closing the native handle mid-step fails (with an error, not a crash).
 
 **Measurement**
 
