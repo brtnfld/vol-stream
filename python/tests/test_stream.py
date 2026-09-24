@@ -27,11 +27,14 @@ ctest entry per mode) so every scenario gets a fresh transport.
   samestream The same stream opened twice at once in one process; both
              copies must receive every step.
   reopen     Open, close, and open the same stream again in one process.
+  deflate    subscribe(deflate=6): the writer must actually re-filter this
+             subscriber's data (its VOL_STREAM_DEBUG_REFILTER trace says so),
+             and the values must arrive decoded and exact.
   drop       The column scenario with one push lost on the way (the writer's
              test-only VOL_STREAM_TEST_DROP_PUSH): that step must arrive as a
              masked array with exactly the lost row masked.
 
-usage: test_stream.py <stream_writer executable> <column|narrowing|iterate|getonly|torch|eos|drop|ack|noack|twostreams|samestream|reopen>
+usage: test_stream.py <stream_writer executable> <column|narrowing|iterate|getonly|torch|eos|drop|ack|noack|twostreams|samestream|reopen|deflate>
 """
 
 import os
@@ -63,6 +66,7 @@ class StreamTest(unittest.TestCase):
     mode = None
     writer_env = {}
     capture_writer = False
+    capture_writer_stderr = False
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -72,7 +76,8 @@ class StreamTest(unittest.TestCase):
         env.setdefault("VOL_STREAM_NA", "na+sm")
         env.update(self.writer_env)
         self.writer = subprocess.Popen([WRITER, self.mode, self.path, self.sync], env=env,
-                                       stdout=subprocess.PIPE if self.capture_writer else None, text=True)
+                                       stdout=subprocess.PIPE if self.capture_writer else None,
+                                       stderr=subprocess.PIPE if self.capture_writer_stderr else None, text=True)
         self.file = None
 
     def tearDown(self):
@@ -315,6 +320,26 @@ class MultiFileTest(StreamTest):
         self.assertEqual(self.writer.wait(timeout=60), 0)
 
 
+class DeflateTest(StreamTest):
+    mode = "narrowing"
+    writer_env = {"VOL_STREAM_DEBUG_REFILTER": "1"}
+    capture_writer_stderr = True
+
+    def test_deflate(self):
+        self.wait_for("committed")
+        with volstream.follow(self.path, "/grid", deflate=6) as f:
+            self.touch("ready")
+            got = [step["/grid"] for step in f.steps(max_steps=3, timeout=30)]
+            self.touch("done")
+            _, err = self.writer.communicate(timeout=60)
+        self.assertEqual(self.writer.returncode, 0)
+        self.assertEqual(len(got), 3, "not every step arrived")
+        for s, a in enumerate(got, start=1):
+            self.assertNotIsInstance(a, np.ma.MaskedArray)
+            np.testing.assert_array_equal(a, whole_grid(s), err_msg=f"step {s}")
+        self.assertIn("refilter  filter=1 ", err, "the writer never deflated this subscriber's data")
+
+
 def whole_grid(s):
     return np.array([[value(s, r, c) for c in range(COLS)] for r in range(ROWS)], dtype=np.int32)
 
@@ -416,7 +441,8 @@ if __name__ == "__main__":
     cases = {"column": ColumnTest, "narrowing": NarrowingTest, "iterate": IterateTest,
              "getonly": GetOnlyTest, "torch": TorchTest, "eos": EndOfStreamTest, "drop": DropTest,
              "ack": BackpressureTest, "noack": NoBackpressureTest,
-             "twostreams": MultiFileTest, "samestream": MultiFileTest, "reopen": MultiFileTest}
+             "twostreams": MultiFileTest, "samestream": MultiFileTest, "reopen": MultiFileTest,
+             "deflate": DeflateTest}
     if mode not in cases:
         sys.exit(__doc__)
     if mode == "torch":

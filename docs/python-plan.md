@@ -405,8 +405,10 @@ supported, or depends on something outside this binding.
 
 - **Attributes, and types other than atomic integer or float** (compound,
   string, enum, array). `subscribe()` raises `NotImplementedError`.
-- **Per-subscriber precision** (the C API's `plists` argument to
-  `H5Fsubscribe()`, a DCPL with a filter pipeline). Not exposed.
+- **Per-subscriber precision beyond deflate.** `subscribe(deflate=level)`
+  exposes the C API's `plists` argument for deflate, the one filter every
+  HDF5 build has, with one chunk spanning the selection. Other filters
+  (bslz4, zstd, zfp) and a requested chunk shape are not exposed.
 - **A dataset whose extent changes after `subscribe()`.** Shapes and the
   flat-index-to-coordinate mapping come from the schema at subscribe time.
   Growth along the first dimension still maps correctly, but the returned

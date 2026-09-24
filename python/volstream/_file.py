@@ -204,7 +204,7 @@ class File:
             for path, is_attr, dims, type_desc in entries
         }
 
-    def subscribe(self, selections, timeout_ms=10000):
+    def subscribe(self, selections, timeout_ms=10000, deflate=None):
         """Subscribe to one or more datasets.
 
         selections is a path, a list of paths, or a dict mapping each path to
@@ -217,6 +217,10 @@ class File:
         add or replace subscriptions without discarding anything. Subscribing
         to a path again clears any subscribe_type() or subscribe_predicate()
         on it.
+
+        deflate=level (0-9) has the writer compress these paths' data in
+        transit, for this subscriber only; what next_step() returns is always
+        decoded. Use separate subscribe() calls for different settings.
         """
         if isinstance(selections, str):
             selections = {selections: None}
@@ -237,10 +241,11 @@ class File:
                 raise NotImplementedError(f"{path!r} does not have a simple dataspace")
             if sel is None:
                 start, count = (0,) * len(var.shape), var.shape
-                entries.append((path, var.shape, None, None))
+                entry = (path, var.shape, None, None)
             else:
                 start, count = (tuple(int(x) for x in s) for s in sel)
-                entries.append((path, var.shape, start, count))
+                entry = (path, var.shape, start, count)
+            entries.append(entry if deflate is None else entry + (int(deflate),))
             subs[path] = _Subscription(var, start, count)
 
         first = not self._subs
@@ -414,7 +419,7 @@ def open(path, backpressure=False):
     return File(_volstream.open(path), backpressure)
 
 
-def follow(path, selections=None, timeout_ms=10000, backpressure=False):
+def follow(path, selections=None, timeout_ms=10000, backpressure=False, deflate=None):
     """Open a live stream and subscribe to it in one call.
 
     selections is anything File.subscribe() takes. By default every dataset
@@ -435,7 +440,7 @@ def follow(path, selections=None, timeout_ms=10000, backpressure=False):
             ]
             if not selections:
                 raise Error(f"{path!r}: the stream has no integer or float datasets to follow")
-        f.subscribe(selections, timeout_ms)
+        f.subscribe(selections, timeout_ms, deflate)
     except BaseException:
         f.close()
         raise

@@ -391,6 +391,7 @@ typedef struct {
     const char *path;
     int         rank;
     int         has_sel;
+    int         deflate; /* -1: no re-filtering */
     hsize_t     dims[H5S_MAX_RANK], start[H5S_MAX_RANK], count[H5S_MAX_RANK];
 } sub_entry_t;
 
@@ -422,15 +423,17 @@ parse_dims(PyObject *seq, const char *what, hsize_t *out, int *rank)
     return 0;
 }
 
-/* (path, dims, start, count); start and count None for the whole extent.
- * e->path borrows from the entry, which the caller keeps alive. */
+/* (path, dims, start, count[, deflate]); start and count None for the whole
+ * extent, deflate a level 0-9 or -1 for none. e->path borrows from the
+ * entry, which the caller keeps alive. */
 static int
 parse_entry(PyObject *entry, sub_entry_t *e)
 {
     PyObject *path, *dims_o, *start_o, *count_o;
-    int       srank, crank;
+    int       srank, crank, i;
 
-    if (!PyArg_ParseTuple(entry, "UOOO:subscribe entry", &path, &dims_o, &start_o, &count_o))
+    e->deflate = -1;
+    if (!PyArg_ParseTuple(entry, "UOOO|i:subscribe entry", &path, &dims_o, &start_o, &count_o, &e->deflate))
         return -1;
     if (NULL == (e->path = PyUnicode_AsUTF8(path)) || parse_dims(dims_o, "dims", e->dims, &e->rank) < 0)
         return -1;
@@ -449,6 +452,21 @@ parse_entry(PyObject *entry, sub_entry_t *e)
             return -1;
         }
     }
+    if (e->deflate != -1) {
+        if (e->deflate < 0 || e->deflate > 9) {
+            PyErr_Format(PyExc_ValueError, "deflate level must be 0-9, not %d", e->deflate);
+            return -1;
+        }
+        if (e->rank == 0) {
+            PyErr_Format(PyExc_ValueError, "%R is a scalar; it cannot be delivered deflated", path);
+            return -1;
+        }
+        for (i = 0; i < e->rank; i++)
+            if ((e->has_sel ? e->count[i] : e->dims[i]) == 0) {
+                PyErr_Format(PyExc_ValueError, "the selection of %R is empty; nothing to deflate", path);
+                return -1;
+            }
+    }
     return 0;
 }
 
@@ -460,6 +478,8 @@ RawFile_subscribe(RawFileObject *self, PyObject *args)
     sub_entry_t *e      = NULL;
     const char **paths  = NULL;
     hid_t       *spaces = NULL;
+    hid_t       *plists = NULL;
+    int          any_deflate = 0;
     herr_t       status = -1;
     hdf5_err_t   err    = {{0}, 0};
     PyObject    *result = NULL;
@@ -475,7 +495,8 @@ RawFile_subscribe(RawFileObject *self, PyObject *args)
     e      = PyMem_Calloc((size_t)n, sizeof(*e));
     paths  = PyMem_Calloc((size_t)n, sizeof(*paths));
     spaces = PyMem_Calloc((size_t)n, sizeof(*spaces));
-    if (!e || !paths || !spaces) {
+    plists = PyMem_Calloc((size_t)n, sizeof(*plists));
+    if (!e || !paths || !spaces || !plists) {
         PyErr_NoMemory();
         goto done;
     }
@@ -484,6 +505,8 @@ RawFile_subscribe(RawFileObject *self, PyObject *args)
             goto done;
         paths[i]  = e[i].path;
         spaces[i] = H5I_INVALID_HID;
+        plists[i] = H5P_DEFAULT;
+        any_deflate |= e[i].deflate >= 0;
     }
 
     HDF5_BEGIN
@@ -495,13 +518,27 @@ RawFile_subscribe(RawFileObject *self, PyObject *args)
                                                   NULL) < 0))
             status = -1;
     }
+    /* Per-subscriber precision: the writer re-filters this subscriber's data
+     * through the DCPL's pipeline in transit, one chunk spanning the
+     * selection; H5Fget_subscribed_data() hands back decoded values. */
+    for (i = 0; i < n && status >= 0; i++) {
+        if (e[i].deflate < 0)
+            continue;
+        if ((plists[i] = H5Pcreate(H5P_DATASET_CREATE)) < 0 ||
+            H5Pset_chunk(plists[i], e[i].rank, e[i].has_sel ? e[i].count : e[i].dims) < 0 ||
+            H5Pset_deflate(plists[i], (unsigned)e[i].deflate) < 0)
+            status = -1;
+    }
     if (status >= 0)
-        status = H5Fsubscribe(self->fid, (size_t)n, paths, spaces, NULL);
+        status = H5Fsubscribe(self->fid, (size_t)n, paths, spaces, any_deflate ? plists : NULL);
     if (status < 0)
         capture_error(&err);
-    for (i = 0; i < n; i++)
+    for (i = 0; i < n; i++) {
         if (spaces[i] >= 0)
             H5Sclose(spaces[i]);
+        if (plists[i] > 0 && plists[i] != H5P_DEFAULT)
+            H5Pclose(plists[i]);
+    }
     HDF5_END
 
     if (status < 0)
@@ -513,6 +550,7 @@ done:
     PyMem_Free(e);
     PyMem_Free(paths);
     PyMem_Free(spaces);
+    PyMem_Free(plists);
     Py_DECREF(fast);
     return result;
 }
@@ -766,7 +804,7 @@ static PyMethodDef RawFile_methods[] = {
     {"schema", (PyCFunction)RawFile_schema, METH_VARARGS,
      "schema(timeout_ms) -> (step, [(path, is_attr, dims, (kind, size, order))])"},
     {"subscribe", (PyCFunction)RawFile_subscribe, METH_VARARGS,
-     "subscribe([(path, dims, start, count), ...]); start/count None for the whole extent"},
+     "subscribe([(path, dims, start, count[, deflate]), ...]); start/count None for the whole extent"},
     {"subscribe_type", (PyCFunction)RawFile_subscribe_type, METH_VARARGS,
      "subscribe_type(path, kind, size); kind None clears the narrowing"},
     {"subscribe_predicate", (PyCFunction)RawFile_subscribe_predicate, METH_VARARGS,
