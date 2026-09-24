@@ -1232,6 +1232,12 @@ matches the code. Each item is documented for users in
   first, and end_step collects its notes and pushes them as its last action.
   A `Discard` drop is reported that way (`t_queue_policy`), and so is the
   parallel Spill-as-Block warning, which had never been visible.
+- **A failed step-API call says why.** Wrong role (a reader-only call on a
+  writer, or the reverse), no transport, no next step for a reader, an
+  unknown logical id, a failed replay, a bad subscribe argument, a predicate
+  on an unsubscribed path: each now pushes a frame naming the reason, not
+  just HDF5's generic callback failure. Timeouts stay silent, since polling
+  with 0 is normal. `t_error_messages`.
 - **Variable-length data reaches subscribers.** The writer pushes the
   serialized form capture already made (`vs_tr_writer_push_opaque()`, marked
   with an internal delivery bit), and `H5Fget_subscribed_data()` decodes it
@@ -1364,8 +1370,10 @@ the one list. ★ marks what is being worked on next.
   correct; only a native view of the step sees a group (user guide §2.3). A
   virtual dataset mapped onto the last real copy would make the native view
   right too.
-- Error-stack coverage is incomplete: many interior helpers still fail with
-  a bare -1 and no frame of their own.
+- Error-stack coverage is complete for the step API's reachable failures,
+  not yet for every interior helper of the object callbacks (dataset,
+  attribute and group creation and I/O), which still mostly rely on HDF5's
+  own frames.
 - No fault tolerance for a rank failure inside a collective commit.
 - Objects from a failed replay are never reclaimed.
 - Writer and reader cannot cross an HDF5 major.minor boundary.

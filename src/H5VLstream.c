@@ -5106,12 +5106,19 @@ H5VL__stream_reader_advance(H5VL_stream_file_state_t *fs, int has_target, uint64
     uint64_t next;
 
     if (!fs->index_built && H5VL__stream_reader_build_index(fs) < 0)
-        return -1;
+        H5VL_STREAM_GOTO_ERR(H5VL_stream_err_manifest_g, "could not read the file's step index", -1);
 
     next = has_target ? target_step : (fs->step_state == H5F_STEP_READING ? fs->current_step + 1 : 0);
 
-    if (next >= fs->n_steps_total)
-        return -1;
+    if (next >= fs->n_steps_total) {
+        char msg[200];
+
+        snprintf(msg, sizeof(msg),
+                 "no step %llu: the file holds %llu. A step committed after this reader opened the file "
+                 "needs it reopened -- the reader's step index does not grow live",
+                 (unsigned long long)next, (unsigned long long)fs->n_steps_total);
+        H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g, msg, -1);
+    }
 
     fs->current_step = next;
     fs->step_state    = H5F_STEP_READING;
@@ -12256,7 +12263,8 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
         if (sargs->n_logical > 0) {
             if (NULL ==
                 (o->file_state->logical_ids = (uint64_t *)malloc(sargs->n_logical * sizeof(uint64_t))))
-                return -1;
+                H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g, "out of memory recording the step's logical ids",
+                                     -1);
             memcpy(o->file_state->logical_ids, sargs->logical_ids, sargs->n_logical * sizeof(uint64_t));
             o->file_state->n_logical = sargs->n_logical;
         }
@@ -12357,7 +12365,10 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
 
         if (replay_ret < 0) {
             o->file_state->step_state = H5F_STEP_NOT_IN_STEP;
-            return -1;
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_manifest_g,
+                                 "the step could not be committed: replaying it into the file failed (see the "
+                                 "frames above), and it is discarded",
+                                 -1);
         }
 
         committed_step          = o->file_state->physical_step;
@@ -12448,14 +12459,18 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
             hid_t plist_id = sargs->plists ? sargs->plists[i] : H5P_DEFAULT;
 
             if (!sargs->paths[i] || sargs->paths[i][0] == '\0')
-                return -1;
+                H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g, "H5Fsubscribe(): a path is NULL or empty", -1);
             if (H5Sget_simple_extent_ndims(sargs->spaces[i]) < 0)
-                return -1;
+                H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g,
+                                     "H5Fsubscribe(): a space is not a valid simple dataspace", -1);
             if (plist_id != H5P_DEFAULT) {
                 hid_t cls = H5Pget_class(plist_id);
 
                 if (cls < 0 || H5Pequal(cls, H5P_DATASET_CREATE) <= 0)
-                    return -1;
+                    H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g,
+                                         "H5Fsubscribe(): a plists entry is not a dataset creation property "
+                                         "list (H5P_DEFAULT means no re-filtering)",
+                                         -1);
             }
         }
 
@@ -12529,14 +12544,16 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
         if (!sargs || !sargs->path || sargs->path[0] == '\0' || !sargs->value)
             return -1;
         if (sargs->op > H5VL_STREAM_PRED_NE)
-            return -1;
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g, "H5Fsubscribe_predicate(): not a comparison operator",
+                                 -1);
         /* A predicate compares against one scalar of a real datatype. That
          * the *data* turns out to be something the comparison cannot apply
          * to is discovered at push time by the writer, which then sends the
          * whole overlap (see H5VL__stream_eval_predicate()); what is
          * checkable here is only the constant the caller handed over. */
         if (H5Tget_class(sargs->type_id) == H5T_NO_CLASS)
-            return -1;
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g,
+                                 "H5Fsubscribe_predicate(): the constant's type_id is not a datatype", -1);
 
 #ifdef VOL_STREAM_HAVE_MERCURY
         if (o->file_state && o->file_state->transport) {
@@ -12546,7 +12563,8 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
 
             if (H5VL__stream_encode_predicate(sargs->op, sargs->type_id, sargs->value, &pred_enc,
                                                &pred_enc_len) < 0)
-                return -1;
+                H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g,
+                                     "H5Fsubscribe_predicate(): the constant could not be encoded", -1);
             /* Unlike H5Fsubscribe(), a failure here is reported: the writer
              * answering "you never subscribed to that path" means this
              * predicate will never be applied, and silently over-sending
@@ -12554,12 +12572,18 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
             rc = vs_tr_reader_subscribe_predicate(o->file_state->transport, sargs->path, pred_enc,
                                                     (uint64_t)pred_enc_len);
             free(pred_enc);
-            return rc == 0 ? 0 : -1;
+            if (rc != 0)
+                H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                                     "no subscription for that path on the writer -- call H5Fsubscribe() first",
+                                     -1);
+            return 0;
         }
-        /* No transport -- nothing to send a predicate to. */
-        return -1;
+        H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                             "H5Fsubscribe_predicate() needs the transport -- set VOL_STREAM_NA or the FAPL's na",
+                             -1);
 #else
-        return -1;
+        H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                             "this connector was built without the Mercury transport", -1);
 #endif
     }
     else if (args->op_type == H5VL_stream_op_begin_logical_step) {
@@ -12568,10 +12592,12 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
         size_t                                  i;
         int                                      found = -1;
 
-        if (!sargs || !o->file_state || !o->file_state->is_reader)
+        if (!sargs || !o->file_state)
             return -1;
+        if (!o->file_state->is_reader)
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g, "H5Fbegin_logical_step() is a reader-only call", -1);
         if (!o->file_state->index_built && H5VL__stream_reader_build_index(o->file_state) < 0)
-            return -1;
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_manifest_g, "could not read the file's step index", -1);
 
         for (i = 0; i < o->file_state->n_logical_map; i++)
             if (o->file_state->logical_map[i].logical_id == sargs->logical_id) {
@@ -12579,18 +12605,25 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
                 found = 0;
                 break;
             }
-        if (found < 0)
-            return -1;
+        if (found < 0) {
+            char msg[128];
+
+            snprintf(msg, sizeof(msg), "no step carries logical id %llu (see H5Fget_logical_steps())",
+                     (unsigned long long)sargs->logical_id);
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g, msg, -1);
+        }
 
         return H5VL__stream_reader_advance(o->file_state, 1, phys);
     }
     else if (args->op_type == H5VL_stream_op_get_logical_steps) {
         H5VL_stream_args_get_logical_steps_t *sargs = (H5VL_stream_args_get_logical_steps_t *)args->args;
 
-        if (!sargs || !sargs->n_logical || !o->file_state || !o->file_state->is_reader)
+        if (!sargs || !sargs->n_logical || !o->file_state)
             return -1;
+        if (!o->file_state->is_reader)
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g, "H5Fget_logical_steps() is a reader-only call", -1);
         if (!o->file_state->index_built && H5VL__stream_reader_build_index(o->file_state) < 0)
-            return -1;
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_manifest_g, "could not read the file's step index", -1);
 
         if (!sargs->logical_ids) {
             *sargs->n_logical = o->file_state->n_logical_map;
@@ -12611,14 +12644,22 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
 #ifdef VOL_STREAM_HAVE_MERCURY
         H5VL_stream_args_wait_step_ready_t *sargs = (H5VL_stream_args_wait_step_ready_t *)args->args;
 
-        if (!sargs || !sargs->physical_step || !o->file_state || !o->file_state->is_reader ||
-            !o->file_state->transport)
+        if (!sargs || !sargs->physical_step || !o->file_state)
             return -1;
+        if (!o->file_state->is_reader)
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g, "H5Fwait_step_ready() is a reader-only call", -1);
+        if (!o->file_state->transport)
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                                 "H5Fwait_step_ready() needs the transport -- set VOL_STREAM_NA or the FAPL's na",
+                                 -1);
 
+        /* A timeout is ordinary -- polling with 0 is normal use -- so it
+         * pushes no frame. */
         return (herr_t)vs_tr_reader_wait_step_ready(o->file_state->transport, sargs->timeout_ms,
                                                      sargs->physical_step, sargs->wall_time_ns);
 #else
-        return -1;
+        H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                             "this connector was built without the Mercury transport", -1);
 #endif
     }
     else if (args->op_type == H5VL_stream_op_ack_step) {
@@ -12627,19 +12668,33 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
          * that consumes steps through H5Fwait_step_ready() instead. */
         H5VL_stream_args_ack_step_t *sargs = (H5VL_stream_args_ack_step_t *)args->args;
 
-        if (!sargs || !o->file_state || !o->file_state->is_reader || !o->file_state->transport)
+        if (!sargs || !o->file_state)
             return -1;
-
-        return (herr_t)vs_tr_reader_ack_step(o->file_state->transport, sargs->physical_step);
+        if (!o->file_state->is_reader)
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g, "H5Fack_stream_step() is a reader-only call", -1);
+        if (!o->file_state->transport)
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                                 "H5Fack_stream_step() needs the transport -- set VOL_STREAM_NA or the FAPL's na",
+                                 -1);
+        if (vs_tr_reader_ack_step(o->file_state->transport, sargs->physical_step) < 0)
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                                 "the writer could not be reached to acknowledge the step (best-effort: the "
+                                 "next ack corrects it)",
+                                 -1);
+        return 0;
 #else
-        return -1;
+        H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                             "this connector was built without the Mercury transport", -1);
 #endif
     }
     else if (args->op_type == H5VL_stream_op_set_queue_policy) {
         H5VL_stream_args_set_queue_policy_t *sargs = (H5VL_stream_args_set_queue_policy_t *)args->args;
 
-        if (!sargs || !o->file_state || o->file_state->is_reader)
+        if (!sargs || !o->file_state)
             return -1;
+        if (o->file_state->is_reader)
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g,
+                                 "H5Fset_stream_queue_policy() is a writer-only call", -1);
 
         o->file_state->queue_policy_set = 1;
         o->file_state->queue_policy      = sargs->policy;
@@ -12763,9 +12818,15 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
             (H5VL_stream_args_get_subscribed_data_t *)args->args;
 
         if (!sargs || !sargs->physical_step || !sargs->path || !sargs->buf || !sargs->size ||
-            !sargs->elem_start || !sargs->elem_count || !o->file_state || !o->file_state->is_reader ||
-            !o->file_state->transport)
+            !sargs->elem_start || !sargs->elem_count || !o->file_state)
             return -1;
+        if (!o->file_state->is_reader)
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g, "H5Fget_subscribed_data() is a reader-only call", -1);
+        if (!o->file_state->transport)
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                                 "H5Fget_subscribed_data() needs the transport -- set VOL_STREAM_NA or the "
+                                 "FAPL's na",
+                                 -1);
 
         {
             uint64_t size64 = 0;
@@ -12851,7 +12912,8 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
             return (herr_t)r;
         }
 #else
-        return -1;
+        H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                             "this connector was built without the Mercury transport", -1);
 #endif
     }
     else if (args->op_type == H5VL_stream_op_get_stream_schema) {
@@ -12862,10 +12924,18 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
         uint64_t                               step      = 0;
         herr_t                                 ret;
 
-        if (!sargs || !sargs->n_vars || !sargs->vars || !o->file_state || !o->file_state->is_reader ||
-            !o->file_state->transport)
+        if (!sargs || !sargs->n_vars || !sargs->vars || !o->file_state)
             return -1;
+        if (!o->file_state->is_reader)
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g, "H5Fget_stream_schema() is a reader-only call", -1);
+        if (!o->file_state->transport)
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                                 "H5Fget_stream_schema() needs the transport -- set VOL_STREAM_NA or the "
+                                 "FAPL's na",
+                                 -1);
 
+        /* No schema yet (the writer has committed nothing, or did not answer
+         * in time) is a timeout, and callers poll: no frame. */
         if (0 != vs_tr_reader_get_schema(o->file_state->transport, sargs->timeout_ms, &step, &blob,
                                           &blob_len))
             return -1;
@@ -12877,13 +12947,14 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
         ret = H5VL__stream_decode_schema(blob, (size_t)blob_len, sargs->n_vars, sargs->vars);
         free(blob);
         if (ret < 0)
-            return -1;
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_manifest_g, "the writer's schema could not be decoded", -1);
 
         if (sargs->physical_step)
             *sargs->physical_step = step;
         return 0;
 #else
-        return -1;
+        H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                             "this connector was built without the Mercury transport", -1);
 #endif
     }
 
