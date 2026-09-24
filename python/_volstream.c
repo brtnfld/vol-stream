@@ -553,7 +553,8 @@ typedef struct {
     int         rank;
     int         has_sel;
     int         deflate; /* -1: no re-filtering */
-    hsize_t     dims[H5S_MAX_RANK], start[H5S_MAX_RANK], count[H5S_MAX_RANK];
+    int         has_chunk;
+    hsize_t     dims[H5S_MAX_RANK], start[H5S_MAX_RANK], count[H5S_MAX_RANK], chunk[H5S_MAX_RANK];
 } sub_entry_t;
 
 static int
@@ -584,17 +585,19 @@ parse_dims(PyObject *seq, const char *what, hsize_t *out, int *rank)
     return 0;
 }
 
-/* (path, dims, start, count[, deflate]); start and count None for the whole
- * extent, deflate a level 0-9 or -1 for none. e->path borrows from the
- * entry, which the caller keeps alive. */
+/* (path, dims, start, count[, deflate[, chunk]]); start and count None for
+ * the whole extent, deflate a level 0-9 or -1 for none, chunk the chunk shape
+ * for deflate (default: the selection, or the extent). e->path borrows from
+ * the entry, which the caller keeps alive. */
 static int
 parse_entry(PyObject *entry, sub_entry_t *e)
 {
-    PyObject *path, *dims_o, *start_o, *count_o;
+    PyObject *path, *dims_o, *start_o, *count_o, *chunk_o = Py_None;
     int       srank, crank, i;
 
     e->deflate = -1;
-    if (!PyArg_ParseTuple(entry, "UOOO|i:subscribe entry", &path, &dims_o, &start_o, &count_o, &e->deflate))
+    if (!PyArg_ParseTuple(entry, "UOOO|iO:subscribe entry", &path, &dims_o, &start_o, &count_o, &e->deflate,
+                          &chunk_o))
         return -1;
     if (NULL == (e->path = PyUnicode_AsUTF8(path)) || parse_dims(dims_o, "dims", e->dims, &e->rank) < 0)
         return -1;
@@ -622,9 +625,24 @@ parse_entry(PyObject *entry, sub_entry_t *e)
             PyErr_Format(PyExc_ValueError, "%R is a scalar; it cannot be delivered deflated", path);
             return -1;
         }
+        e->has_chunk = chunk_o != Py_None;
+        if (e->has_chunk) {
+            int chrank;
+
+            if (parse_dims(chunk_o, "chunk", e->chunk, &chrank) < 0)
+                return -1;
+            if (chrank != e->rank) {
+                PyErr_Format(PyExc_ValueError, "chunk for %R has rank %d, but the dataset has rank %d", path,
+                             chrank, e->rank);
+                return -1;
+            }
+        }
+        else
+            for (i = 0; i < e->rank; i++)
+                e->chunk[i] = e->has_sel ? e->count[i] : e->dims[i];
         for (i = 0; i < e->rank; i++)
-            if ((e->has_sel ? e->count[i] : e->dims[i]) == 0) {
-                PyErr_Format(PyExc_ValueError, "the selection of %R is empty; nothing to deflate", path);
+            if (e->chunk[i] == 0) {
+                PyErr_Format(PyExc_ValueError, "the chunk for %R is empty; nothing to deflate", path);
                 return -1;
             }
     }
@@ -686,7 +704,7 @@ RawFile_subscribe(RawFileObject *self, PyObject *args)
         if (e[i].deflate < 0)
             continue;
         if ((plists[i] = H5Pcreate(H5P_DATASET_CREATE)) < 0 ||
-            H5Pset_chunk(plists[i], e[i].rank, e[i].has_sel ? e[i].count : e[i].dims) < 0 ||
+            H5Pset_chunk(plists[i], e[i].rank, e[i].chunk) < 0 ||
             H5Pset_deflate(plists[i], (unsigned)e[i].deflate) < 0)
             status = -1;
     }
@@ -965,7 +983,7 @@ static PyMethodDef RawFile_methods[] = {
     {"schema", (PyCFunction)RawFile_schema, METH_VARARGS,
      "schema(timeout_ms) -> (step, [(path, is_attr, dims, type_json)])"},
     {"subscribe", (PyCFunction)RawFile_subscribe, METH_VARARGS,
-     "subscribe([(path, dims, start, count[, deflate]), ...]); start/count None for the whole extent"},
+     "subscribe([(path, dims, start, count[, deflate[, chunk]]), ...]); start/count None for the whole extent"},
     {"subscribe_type", (PyCFunction)RawFile_subscribe_type, METH_VARARGS,
      "subscribe_type(path, kind, size); kind None clears the narrowing"},
     {"subscribe_predicate", (PyCFunction)RawFile_subscribe_predicate, METH_VARARGS,

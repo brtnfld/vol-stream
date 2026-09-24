@@ -178,6 +178,23 @@ def _close_all():
             pass
 
 
+def _growing_extent(shape):
+    """The extent a whole-dataset subscription is made against: the dataset's
+    own, with dimension 0 made as large as it can be.
+
+    The writer only sends elements inside a subscription's selection, and
+    dimension 0 of a subscription may differ from the dataset's (its routing
+    requires only the trailing dimensions to match). So subscribing against a
+    huge first dimension is what makes rows written after subscribe() --
+    a growing dataset -- arrive at all. Kept under 2**62 elements so the
+    writer's flat element arithmetic cannot overflow.
+    """
+    if not shape:
+        return shape
+    trailing = math.prod(shape[1:]) or 1
+    return (max(shape[0], 2**62 // trailing),) + tuple(shape[1:])
+
+
 class File:
     """A vol-stream file opened for reading. Create with volstream.open().
 
@@ -272,12 +289,15 @@ class File:
                 raise NotImplementedError(f"{path!r} does not have a simple dataspace")
             if sel is None:
                 start, count = (0,) * len(var.shape), var.shape
-                entry = (path, var.shape, None, None)
+                extent = var.shape if var.is_attr else _growing_extent(var.shape)
+                entry = (path, extent, None, None)
+                chunk = tuple(max(1, d) for d in var.shape)
             else:
                 start, count = (tuple(int(x) for x in s) for s in sel)
                 entry = (path, var.shape, start, count)
-            entries.append(entry if deflate is None else entry + (int(deflate),))
-            subs[path] = _Subscription(var, start, count, whole=sel is None)
+                chunk = None
+            entries.append(entry if deflate is None else entry + (int(deflate), chunk))
+            subs[path] = _Subscription(var, start, count, whole=sel is None and not var.is_attr)
 
         first = not self._subs
         self._raw.subscribe(entries)
