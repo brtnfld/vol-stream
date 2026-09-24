@@ -1,0 +1,35 @@
+docs/user-guide.md
+  s_3816fb7b7c4a27::t_53e263aca91cf7 2615-2619
+python/volstream/_file.py
+  s_3816fb7b7c4a27::t_f335287d096cc7 458-462,466
+  s_3816fb7b7c4a27::t_134083a1bed7f5 302-305,308-312
+python/tests/stream_writer.c
+  s_3816fb7b7c4a27::t_15c1d41357d39f 43-48
+  s_3816fb7b7c4a27::t_42a49b304f3d35 264-270
+  s_3816fb7b7c4a27::t_5b20da1c8a605a 236
+python/tests/test_stream.py
+  s_3816fb7b7c4a27::t_6836720fbc5989 10-11
+  s_3816fb7b7c4a27::t_fa924beb2a678d 126-127
+  s_3816fb7b7c4a27::t_ff1456cd529cf1 145-146
+python/tests/test_lifecycle.py
+  s_3816fb7b7c4a27::t_45a2ae240d10d6 181-182
+  s_3816fb7b7c4a27::t_ba50b9f1d841eb 61
+docs/python-plan.md
+  s_3816fb7b7c4a27::t_4cabfa09961fd2 369-380
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ef7e03c9e96ba706e96ea067f0700c9137c8a75e",
+  "prompts": {},
+  "sessions": {
+    "s_3816fb7b7c4a27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b5b5c72-aca3-496b-8412-0fb9ae85948c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
