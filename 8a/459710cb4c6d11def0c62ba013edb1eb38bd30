@@ -1,0 +1,19 @@
+test/t_backfill.c
+  s_3816fb7b7c4a27::t_55ea2806f725f4 113-122,144-154,156,182-186
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8a459710cb4c6d11def0c62ba013edb1eb38bd30",
+  "prompts": {},
+  "sessions": {
+    "s_3816fb7b7c4a27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b5b5c72-aca3-496b-8412-0fb9ae85948c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
