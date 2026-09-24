@@ -1,0 +1,45 @@
+# Builds the volstream Python package against the HDF5 (and, if found, the
+# Mochi stack) on this machine -- the connector and the binding must share
+# one libhdf5, which is why this is a source build and not a portable wheel.
+# See docs/python-plan.md.
+#
+#   CMAKE_PREFIX_PATH=/path/to/hdf5 PKG_CONFIG_PATH=/path/to/mochi/lib/pkgconfig \
+#     python -m pip install .
+#
+# The transport is detected automatically (VOL_STREAM_ENABLE_MERCURY=AUTO);
+# pass -Ccmake.define.VOL_STREAM_ENABLE_MERCURY=ON to make its absence an
+# error instead.
+
+[build-system]
+requires = ["scikit-build-core>=0.10"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "volstream"
+dynamic = ["version"]
+description = "Python subscriber for the vol-stream HDF5 streaming connector"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+torch = ["torch"]
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+cmake.build-type = "Release"
+# Everything in the wheel comes from CMake's "python" install component, so
+# the connector's own install rules and the vendored flatcc's stay out of it.
+install.components = ["python"]
+wheel.packages = []
+
+[tool.scikit-build.cmake.define]
+VOL_STREAM_BUILD_PYTHON = "ON"
+VOL_STREAM_BUILD_TESTS = "OFF"
+VOL_STREAM_BUILD_EXAMPLES = "OFF"
+
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "CMakeLists.txt"
+regex = 'set\(VOL_STREAM_VERSION (?P<value>[0-9.]+)\)'

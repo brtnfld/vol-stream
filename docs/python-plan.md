@@ -364,6 +364,17 @@ made the standalone design necessary in the first place.
 
 **Exit gate:** CI runs the P4 gate on every push.
 
+As built: `pyproject.toml` at the repository root, using scikit-build-core.
+`pip install .` configures the whole project with the Python binding on and
+tests and examples off, then installs only CMake's `python` component.
+`libvol_stream` goes inside the package next to the extension, which finds it
+through `$ORIGIN`; the library keeps RPATHs to the HDF5 and Mochi it was
+built against. It is a source build by design, since the whole point is to
+share the machine's libhdf5, so there is no portable wheel. CI installs it
+with pip in the na+sm job and tests the installed copy from outside the
+source tree. The import check runs without `LD_LIBRARY_PATH`, so a wrong RPATH
+fails there.
+
 ## Known gaps
 
 What P0–P4 do not cover, in one place. Each item is either untested, not
@@ -381,6 +392,9 @@ supported, or depends on something outside this binding.
   two transports coexist in one process has not been checked.
 - **`volstream.torch` outside CI.** It is tested only where torch is
   installed (the CI job installs the CPU wheel). Elsewhere the test is skipped.
+- **Anything but Linux.** CI builds and tests on Ubuntu only. The binding
+  assumes a POSIX system (`fork()`, `getpid()`, `clock_gettime()`). It has
+  not been built on macOS, and Windows is out of scope.
 
 ### Not supported
 

@@ -430,7 +430,7 @@ CI covers these axes:
 | MPI | Any implementation | Parallel writers only |
 | Mercury, Argobots, mochi-margo, mochi-flock | found via `pkg-config` (flock also needs mochi-thallium to build) | The transport: subscriptions, `H5Fwait_step_ready()`, `h5stream tail`, queue policy |
 | bake-client, bake-server, abt-io, PMDK | found via `pkg-config` | `H5VL_STREAM_QUEUE_SPILL` only |
-| Python 3.10+ headers; NumPy at run time | `-DVOL_STREAM_BUILD_PYTHON=ON` | The `volstream` Python subscriber (see `docs/python-plan.md`); torch only for `volstream.torch` |
+| Python 3.10+ headers; NumPy at run time | `-DVOL_STREAM_BUILD_PYTHON=ON`, or `pip install .` from the repository root with `CMAKE_PREFIX_PATH` (and `PKG_CONFIG_PATH` for Mochi) pointing at the same HDF5 the connector uses | The `volstream` Python subscriber (see `docs/python-plan.md`); torch only for `volstream.torch`. Linux only so far |
 
 Without the Mochi stack the connector still builds and works — you get step
 capture, replay, the reader cursor, and the tools' offline subcommands. You do

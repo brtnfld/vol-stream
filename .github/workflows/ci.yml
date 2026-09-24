@@ -381,6 +381,23 @@ jobs:
           LD_LIBRARY_PATH=$HOME/mochi-install/lib:$HOME/mochi-install/lib64:$LD_LIBRARY_PATH \
             ctest --test-dir build --output-on-failure
 
+      # P5 (docs/python-plan.md): the package as a user installs it, with pip,
+      # built against this job's HDF5 and Mochi. Tested from outside the
+      # source tree. The import check runs without LD_LIBRARY_PATH so a wrong
+      # RPATH in the wheel fails here rather than being masked.
+      - name: pip install the Python package and test the installed copy
+        run: |
+          export PKG_CONFIG_PATH=$HOME/mochi-install/lib/pkgconfig:$HOME/mochi-install/lib64/pkgconfig:$PKG_CONFIG_PATH
+          CMAKE_PREFIX_PATH="$PWD/hdf5-install;$HOME/mochi-install" \
+            python3 -m pip install --break-system-packages --quiet . \
+              -Ccmake.define.VOL_STREAM_ENABLE_MERCURY=ON
+          ROOT=$PWD
+          cd "$RUNNER_TEMP"
+          python3 -c "import volstream, sys; assert '$ROOT' not in volstream.__file__, volstream.__file__; print('installed at', volstream.__file__)"
+          python3 "$ROOT/python/tests/test_open.py" "$ROOT/build/python/py_stream_fixture"
+          LD_LIBRARY_PATH=$HOME/mochi-install/lib:$HOME/mochi-install/lib64:$LD_LIBRARY_PATH \
+            python3 "$ROOT/python/tests/test_stream.py" "$ROOT/build/python/py_stream_writer" column
+
       # Second pass over the same build with a real network transport instead
       # of shared memory -- dev-plan.md's CI matrix calls for both, and na+sm
       # never exercises libfabric at all, so a whole transport's worth of

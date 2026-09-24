@@ -12,9 +12,28 @@ target_link_libraries(_volstream PRIVATE vol_stream)
 set_target_properties(_volstream PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/volstream
 )
-foreach(py __init__.py _file.py torch.py)
+set(_volstream_py __init__.py _file.py torch.py)
+foreach(py ${_volstream_py})
   configure_file(volstream/${py} ${CMAKE_CURRENT_BINARY_DIR}/volstream/${py} COPYONLY)
 endforeach()
+
+# Installed by `pip install .` (pyproject.toml builds only this component).
+# libvol_stream goes inside the package and the extension finds it there; the
+# library keeps RPATHs to the HDF5 and Mochi it was built against, since the
+# point of a source build is to use exactly those.
+if(SKBUILD)
+  if(APPLE)
+    set(_origin "@loader_path")
+  else()
+    set(_origin "$ORIGIN")
+  endif()
+  set_target_properties(_volstream PROPERTIES INSTALL_RPATH "${_origin}" INSTALL_RPATH_USE_LINK_PATH TRUE)
+  set_target_properties(vol_stream PROPERTIES INSTALL_RPATH "${VOL_STREAM_DEP_LIBDIRS}"
+                                              INSTALL_RPATH_USE_LINK_PATH TRUE)
+  install(TARGETS _volstream vol_stream LIBRARY DESTINATION volstream COMPONENT python)
+  list(TRANSFORM _volstream_py PREPEND volstream/)
+  install(FILES ${_volstream_py} DESTINATION volstream COMPONENT python)
+endif()
 
 if(VOL_STREAM_BUILD_TESTS)
   set(_py_env "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR};HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>")
