@@ -153,7 +153,8 @@ jobs:
   # source -- the exact versions verified locally: argobots 1.2, mercury
   # 2.4.1 (+sm +ofi), mochi-margo 0.24.2 (CMake as of this release, not
   # autotools -- see below), mochi-thallium 0.17.1 (flock's C++ dependency;
-  # needs only cereal, apt-installed as libcereal-dev), mochi-flock 0.8.0,
+  # needs only cereal, apt-installed as libcereal-dev), mochi-flock 0.8.0
+  # (built from upstream commit 7b484c5 for a group-file race fix; see its step),
   # mochi-abt-io 0.9.0, mochi-bake 0.6.4. margo and flock floors are
   # enforced again at vol-stream's own configure time
   # (CMakeLists.txt: margo >= 0.24.2, flock >= 0.8.0) because older
@@ -292,14 +293,25 @@ jobs:
           cmake --build thallium-build --parallel
           cmake --install thallium-build
 
-      - name: Build mochi-flock 0.8.0
+      - name: Build mochi-flock 0.8.0 + 7b484c5
         # SSG's replacement (src/tr_mercury.c, migrated behind the vs_tr_*
         # seam). Needs margo, json-c (apt, above) and thallium, all already
         # in place; bedrock/MPI/Python/tests/examples stay off by default.
+        #
+        # Pinned to upstream commit 7b484c5 ("better access to group files"),
+        # the only commit after v0.8.0, until a release includes it. v0.8.0
+        # serializes the group file through one fixed "<file>.swp" with no
+        # locking, and reads the view's member array without the view lock,
+        # so concurrent joins race: "Could not rename ... .swp" errors, torn
+        # group files, and a SIGSEGV in libflock-server that failed
+        # push_fanout_benchmark and detector_narrowing_benchmark here (see
+        # issue #1). Move back to a release tag once one ships after 0.8.0.
+        env:
+          FLOCK_SHA: 7b484c51f37ea3407e5b9b5769cd001dc11c351c
         run: |
-          curl -sSL https://github.com/mochi-hpc/mochi-flock/archive/refs/tags/v0.8.0.tar.gz | tar xz
+          curl -sSL https://github.com/mochi-hpc/mochi-flock/archive/$FLOCK_SHA.tar.gz | tar xz
           PKG_CONFIG_PATH=$HOME/mochi-install/lib/pkgconfig:$HOME/mochi-install/lib64/pkgconfig:$PKG_CONFIG_PATH \
-            cmake -S mochi-flock-0.8.0 -B flock-build -G Ninja \
+            cmake -S mochi-flock-$FLOCK_SHA -B flock-build -G Ninja \
               -DCMAKE_INSTALL_PREFIX=$HOME/mochi-install \
               -DCMAKE_PREFIX_PATH=$HOME/mochi-install \
               -DCMAKE_BUILD_TYPE=Release
