@@ -1,5 +1,6 @@
 # The volstream Python package: a subscriber-only CPython extension over the
-# connector's C API. See docs/python-plan.md.
+# connector's C API, plus a pure-Python layer that reassembles steps. Needs
+# NumPy at run time only. See docs/python-plan.md.
 #
 # The package is assembled in ${CMAKE_CURRENT_BINARY_DIR}/volstream, so
 # PYTHONPATH=<build>/python makes `import volstream` work from the build tree.
@@ -11,9 +12,13 @@ target_link_libraries(_volstream PRIVATE vol_stream)
 set_target_properties(_volstream PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/volstream
 )
-configure_file(volstream/__init__.py ${CMAKE_CURRENT_BINARY_DIR}/volstream/__init__.py COPYONLY)
+foreach(py __init__.py _file.py)
+  configure_file(volstream/${py} ${CMAKE_CURRENT_BINARY_DIR}/volstream/${py} COPYONLY)
+endforeach()
 
 if(VOL_STREAM_BUILD_TESTS)
+  set(_py_env "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR};HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>")
+
   add_executable(py_stream_fixture tests/stream_fixture.c)
   target_link_libraries(py_stream_fixture PRIVATE vol_stream)
 
@@ -21,8 +26,20 @@ if(VOL_STREAM_BUILD_TESTS)
   add_test(NAME python_open
     COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_open.py
             $<TARGET_FILE:py_stream_fixture>)
-  set_tests_properties(python_open PROPERTIES
-    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR};HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
-    TIMEOUT 60
-  )
+  set_tests_properties(python_open PROPERTIES ENVIRONMENT "${_py_env}" TIMEOUT 60)
+
+  # P2 exit gate: whole steps from a live C writer, over na+sm.
+  if(VOL_STREAM_HAVE_MERCURY)
+    add_executable(py_stream_writer tests/stream_writer.c)
+    target_link_libraries(py_stream_writer PRIVATE vol_stream)
+    foreach(mode column narrowing)
+      add_test(NAME python_stream_${mode}
+        COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_stream.py
+                $<TARGET_FILE:py_stream_writer> ${mode})
+      set_tests_properties(python_stream_${mode} PROPERTIES
+        ENVIRONMENT "${_py_env};VOL_STREAM_NA=na+sm"
+        TIMEOUT 120
+      )
+    endforeach()
+  endif()
 endif()

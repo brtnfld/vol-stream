@@ -251,14 +251,19 @@ Three rules the reassembly layer follows, each traceable to risk 2:
 
 - **Carry-over:** a drain that pops a push for a later step holds it for
   that step instead of discarding it.
-- **Late join:** the first step after attaching may drain to nothing. That
-  is skipped silently — it is neither yielded as an empty array nor
-  reported as "no matching data." Only steps after the first are held to
-  the completeness check.
-- **Short steps:** received elements are compared against the selection;
-  a short step raises (or is flagged, per a caller option) rather than
-  being handed back as a partly filled array. *Untested until P0's
-  fault-injection hook exists* — see P0.
+- **Late join:** the first `subscribe()` discards every step notification
+  already queued, and any pushes for those steps. That covers more than the
+  one seeded step: every step the writer commits between `open()` and
+  `subscribe()` is also announced with nothing in it. Later `subscribe()`
+  calls discard nothing.
+- **Short steps:** each path's array has the selection's shape. If every
+  selected element arrived it is a plain `ndarray`; otherwise it is a
+  `numpy.ma.MaskedArray` whose mask marks what did not arrive. It does not
+  raise, because a dropped push cannot be told apart from a writer that
+  wrote only part of the object this step (`b_push_fanout`'s tail-only
+  writes), and a predicate subscription is partial by design. The mask is
+  the flag. *The dropped-push case is untested until P0's fault-injection
+  hook exists* — see P0.
 
 **Exit gate:** a Python consumer receives *N* steps of a fragmented
 (multi-run) subscription as correctly-shaped NumPy arrays whose values

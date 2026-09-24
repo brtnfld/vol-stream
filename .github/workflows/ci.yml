@@ -219,7 +219,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build zlib1g-dev \
             libfabric-dev libjson-c-dev libboost-dev libcereal-dev pkg-config autoconf automake libtool \
-            uuid-dev pandoc python3-dev
+            uuid-dev pandoc python3-dev python3-numpy
 
       # HDF5_ENABLE_ZLIB_SUPPORT=ON is required, not cosmetic: HDF5 defaults
       # it OFF, and t_precision/t_precision_dual (M8.5 per-subscriber
