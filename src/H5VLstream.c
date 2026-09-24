@@ -326,6 +326,12 @@ struct H5VL_stream_file_state_t {
     H5VL_stream_queue_policy_t   queue_policy;
     uint64_t                     reserve_slots;
     int                          warned_parallel_spill; /* H5VL__stream_warn_once() latch */
+    /* A non-fatal diagnostic for the caller of H5Fend_step(), pushed as the
+     * op's last action (H5VL__stream_note_flush()). Every public H5VL*() call
+     * the connector makes clears the error stack on entry, so a frame pushed
+     * mid-step would be erased before the caller could see it. */
+    char                         step_note[256];
+    hid_t                        step_note_minor;
 
     /* Step retention, opt-in via H5Fset_stream_retention_policy(). Writer
      * only, and a no-op unless set (retention_set == 0), so the default is
@@ -8144,12 +8150,36 @@ H5VL__stream_has_comm(H5VL_stream_file_state_t *fs)
  *-------------------------------------------------------------------------
  */
 static void
-H5VL__stream_warn_once(int *flag, hid_t minor, const char *msg)
+H5VL__stream_note(H5VL_stream_file_state_t *fs, hid_t minor, const char *msg)
+{
+    size_t len = strlen(fs->step_note);
+
+    if (len == 0) {
+        fs->step_note_minor = minor;
+        snprintf(fs->step_note, sizeof(fs->step_note), "%s", msg);
+    }
+    else if (len + 2 < sizeof(fs->step_note))
+        snprintf(fs->step_note + len, sizeof(fs->step_note) - len, "; %s", msg);
+} /* end H5VL__stream_note() */
+
+/* Push the step's note, if any, and clear it. Call only as the very last
+ * thing an op does -- see step_note's comment. */
+static void
+H5VL__stream_note_flush(H5VL_stream_file_state_t *fs)
+{
+    if (!fs || fs->step_note[0] == '\0')
+        return;
+    H5VL_STREAM_ERR(fs->step_note_minor, fs->step_note);
+    fs->step_note[0] = '\0';
+} /* end H5VL__stream_note_flush() */
+
+static void
+H5VL__stream_warn_once(H5VL_stream_file_state_t *fs, int *flag, hid_t minor, const char *msg)
 {
     if (*flag)
         return;
     *flag = 1;
-    H5VL_STREAM_ERR(minor, msg);
+    H5VL__stream_note(fs, minor, msg);
 } /* end H5VL__stream_warn_once() */
 
 /*-------------------------------------------------------------------------
@@ -8519,7 +8549,7 @@ H5VL__stream_apply_queue_policy(H5VL_stream_t *file_obj)
                              "queue policy Discard dropped step %llu: a tracked reader is more than %llu "
                              "step(s) behind",
                              (unsigned long long)fs->physical_step, (unsigned long long)fs->reserve_slots);
-                    H5VL_STREAM_ERR(H5VL_stream_err_step_g, msg);
+                    H5VL__stream_note(fs, H5VL_stream_err_step_g, msg);
                     return H5VL__stream_discard_step(file_obj);
                 }
 
@@ -8549,7 +8579,7 @@ H5VL__stream_apply_queue_policy(H5VL_stream_t *file_obj)
                      * lose the step. */
                 }
                 else if (fs->queue_policy == H5VL_STREAM_QUEUE_SPILL)
-                    H5VL__stream_warn_once(&fs->warned_parallel_spill,
+                    H5VL__stream_warn_once(fs, &fs->warned_parallel_spill,
                                            H5VL_stream_err_transport_g,
                                            "Spill queue policy is not supported for a parallel writer "
                                            "(draining a spilled step cannot redo the cross-rank "
@@ -11190,6 +11220,7 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
                                  "no step is open on this file -- H5Fend_step() must be preceded by a "
                                  "matching H5Fbegin_step()",
                                  -1);
+        o->file_state->step_note[0] = '\0';
 
         o->file_state->step_state = H5F_STEP_COMMITTING;
 
@@ -11302,6 +11333,7 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
             MPI_Barrier(o->file_state->comm);
 #endif
 
+        H5VL__stream_note_flush(o->file_state);
         return 0;
     }
     else if (args->op_type == H5VL_stream_op_step_status) {

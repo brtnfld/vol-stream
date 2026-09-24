@@ -1224,10 +1224,14 @@ matches the code. Each item is documented for users in
   returns, which keeps that function's contract for every replay path; owned
   refilter output is freed on completion. `bulk_push` moves 256 MiB and
   checks it; ten C and three Python tests rerun with every push by bulk.
-- **Error-stack frames from step calls reach the caller.** The API wrapper
-  closed a connector id after the optional op, and that HDF5 call cleared the
-  stack, erasing every frame the op had pushed. A `Discard` drop is now
-  reported that way (`t_queue_policy`).
+- **Non-fatal diagnostics from `H5Fend_step()` reach the caller.** Every
+  public HDF5 call clears the error stack on entry, and that includes the
+  `H5VL*()` calls the connector makes to do its own I/O. So a frame pushed
+  mid-step was erased by the connector's next call, and the API wrapper's own
+  `H5VLclose()` after the op erased whatever was left. The wrapper now closes
+  first, and end_step collects its notes and pushes them as its last action.
+  A `Discard` drop is reported that way (`t_queue_policy`), and so is the
+  parallel Spill-as-Block warning, which had never been visible.
 - **Variable-length objects are no longer pushed.** The push read the rebuilt
   pointer buffer after it had been freed. `t_vl_push`.
 - **Archival step-count scaling, measured.** `test/b_step_scale.c` writes N
@@ -1281,7 +1285,11 @@ the one list. ★ marks what is being worked on next.
   not recognised as the end of the stream.
 - An attribute written in a step that does not write its dataset replays onto
   a group of that name, which can shadow the dataset (user guide §2.3).
-- Error-stack coverage is incomplete (a `Discard` drop is now reported).
+- Error-stack coverage is incomplete. A frame the connector pushes before it
+  makes another public `H5VL*()` call in the same operation is erased by that
+  call, so a failure's detail often does not survive to the caller either.
+  Only end_step's collected notes are pushed late enough. A general fix would
+  route every diagnostic through such a note, per operation.
 - No fault tolerance for a rank failure inside a collective commit.
 - Objects from a failed replay are never reclaimed.
 - Writer and reader cannot cross an HDF5 major.minor boundary.
