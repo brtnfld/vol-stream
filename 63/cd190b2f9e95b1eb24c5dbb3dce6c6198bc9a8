@@ -1,0 +1,36 @@
+src/tr_diaspora.cpp
+  s_3816fb7b7c4a27::t_632fc09e83e7d8 1371-1381
+src/H5VLstream.c
+  s_3816fb7b7c4a27::t_ca3bd02cb04aa5 6856-6862,6908-6913,11686
+test/CMakeLists.txt
+  s_3816fb7b7c4a27::t_81ddc37a12a76c 162-168
+  s_3816fb7b7c4a27::t_8419d8bdfad744 159-161
+test/t_bulk_regions.c
+  s_3816fb7b7c4a27::t_81ddc37a12a76c 1-260
+src/tr_mercury.c
+  s_3816fb7b7c4a27::t_461cac3f5d1f9a 109,257-259,265,320-332,587-590,1636-1637,1827,1831-1832,3103-3160,3164-3174,3187-3209,3211-3214,3218-3219,3256-3257,3300,3302-3321,3324,3326,3328,3357,3360,3425-3427,3870-3872
+  s_3816fb7b7c4a27::t_2184aaa5d8a3f6 3161-3163
+  s_3816fb7b7c4a27::t_731edc42e72f62 3175-3186
+  s_3816fb7b7c4a27::t_c733c247b1577d 3685
+  s_3816fb7b7c4a27::t_632fc09e83e7d8 1816-1820,3210,3215-3217
+src/tr_mercury.h
+  s_3816fb7b7c4a27::t_632fc09e83e7d8 271-285
+docs/dev-plan.md
+  s_3816fb7b7c4a27::t_c514e66639f522 1235-1244,1326
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "63cd190b2f9e95b1eb24c5dbb3dce6c6198bc9a8",
+  "prompts": {},
+  "sessions": {
+    "s_3816fb7b7c4a27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b5b5c72-aca3-496b-8412-0fb9ae85948c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
