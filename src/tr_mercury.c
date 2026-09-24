@@ -56,9 +56,6 @@
  * public API and its implementation is not expected to change. */
 typedef uint64_t vs_member_id_t;
 
-/* Writer members a reader tracks for end of stream: one per writer rank. */
-#define VS_EOS_MAX_WRITERS 1024
-
 #define VS_MEMBER_ID_INVALID ((vs_member_id_t)0)
 
 /* Every process in a vol-stream group registers its Flock provider at this
@@ -401,12 +398,13 @@ struct vs_tr_t {
     /* End of stream, reader side, under pending_lock: every member that has
      * announced a step or answered as the writer when this reader joined, and
      * whether each has since left the group. A parallel writer has one member
-     * per rank, so the stream ends only when all of them are gone. See
-     * vs_tr_reader_end_of_stream(). */
-    vs_member_id_t eos_writers[VS_EOS_MAX_WRITERS];
-    unsigned char  eos_writer_gone[VS_EOS_MAX_WRITERS];
-    size_t         n_eos_writers;
-    int            eos_overflow; /* more writers than the table holds */
+     * per rank, so the stream ends only when all of them are gone. Grows the
+     * same way pending/lag_table do -- see vs_tr_reader_end_of_stream(). */
+    vs_member_id_t *eos_writers;
+    unsigned char  *eos_writer_gone;
+    size_t          n_eos_writers;
+    size_t          cap_eos_writers;
+    int             eos_untracked; /* a writer could not be recorded */
 
     /* M7, reader side: the group member that answered a get_current_step
      * query, cached the first time vs_tr_reader_get_current_step() finds it
@@ -784,7 +782,10 @@ vs_tr_snapshot_members(vs_tr_t *tr, vs_member_id_t self_id, vs_member_id_t **out
  * Small helpers
  *-------------------------------------------------------------------------
  */
-/* Caller holds pending_lock. */
+/* Caller holds pending_lock. Same doubling-realloc growth as lag_table and
+ * pending. If a writer cannot be recorded (allocation failure), end of stream
+ * is never reported afterwards: an untracked writer could still be writing,
+ * and never ending the stream is the safe direction. */
 static void
 vs_note_writer(vs_tr_t *tr, vs_member_id_t id)
 {
@@ -793,24 +794,36 @@ vs_note_writer(vs_tr_t *tr, vs_member_id_t id)
     for (i = 0; i < tr->n_eos_writers; i++)
         if (tr->eos_writers[i] == id)
             return;
-    if (tr->n_eos_writers < VS_EOS_MAX_WRITERS) {
+    if (tr->n_eos_writers == tr->cap_eos_writers) {
+        size_t          new_cap = tr->cap_eos_writers ? tr->cap_eos_writers * 2 : 8;
+        vs_member_id_t *grown_ids;
+        unsigned char  *grown_gone;
+
+        if (NULL != (grown_ids = (vs_member_id_t *)realloc(tr->eos_writers, new_cap * sizeof(*grown_ids))))
+            tr->eos_writers = grown_ids;
+        if (NULL != (grown_gone = (unsigned char *)realloc(tr->eos_writer_gone,
+                                                            new_cap * sizeof(*grown_gone))))
+            tr->eos_writer_gone = grown_gone;
+        if (grown_ids && grown_gone)
+            tr->cap_eos_writers = new_cap;
+    }
+    if (tr->n_eos_writers < tr->cap_eos_writers) {
         tr->eos_writers[tr->n_eos_writers]     = id;
         tr->eos_writer_gone[tr->n_eos_writers] = 0;
         tr->n_eos_writers++;
     }
     else
-        tr->eos_overflow = 1;
+        tr->eos_untracked = 1;
 }
 
 /* Caller holds pending_lock. False until at least one writer is known, and
- * always false once more writers were seen than the table holds: an untracked
- * rank could still be writing, so ending the stream would be premature. */
+ * always false once a writer could not be recorded (see vs_note_writer()). */
 static int
 vs_all_writers_gone(vs_tr_t *tr)
 {
     size_t i;
 
-    if (tr->n_eos_writers == 0 || tr->eos_overflow)
+    if (tr->n_eos_writers == 0 || tr->eos_untracked)
         return 0;
     for (i = 0; i < tr->n_eos_writers; i++)
         if (!tr->eos_writer_gone[i])
@@ -1724,6 +1737,8 @@ vs_tr_stop(vs_tr_t *tr)
     free(tr->self_addr_str);
     free(tr->schema_blob);
     free(tr->pending);
+    free(tr->eos_writers);
+    free(tr->eos_writer_gone);
     free(tr->lag_table);
     {
         size_t i;

@@ -440,11 +440,6 @@ supported, or depends on something outside this binding.
 
 - **Backpressure is opt in** (`backpressure=True`; see P3). Without it a
   writer's queue policy does not see a Python subscriber.
-- **End of stream for a parallel writer with more than 1,024 ranks** is
-  never reported: the reader stops tracking beyond that, and never reporting
-  it is safer than reporting it early. (A writer that leaves before
-  announcing any step is now recognised from its answer to `subscribe()`,
-  which every Python reader makes; `t_eos` covers that case.)
 - **An attribute written in a step where its dataset is not** replays onto
   a group of the dataset's name in that step (user guide §2.3). A Python
   subscriber still receives the attribute; the caveat is in the file the
