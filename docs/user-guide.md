@@ -2612,8 +2612,11 @@ block. Conventions worth following, all visible in the existing tests:
   way to know whether a failure matters.
 - **Two-process tests fork and coordinate with sentinel files**, because a
   subscription is not retroactive and the reader must be ready before the
-  writer's first step. Use the `run_*.sh` wrappers for anything needing a
-  special environment or `mpirun`.
+  writer's first step. Where the point is that no shared filesystem is needed,
+  the writer waits in `H5Fwait_subscribers()` instead (`t_rendezvous_barrier`;
+  `python_stream_column` and `python_lifecycle_break` via
+  `STREAM_WRITER_SUBSCRIBERS`). Use the `run_*.sh` wrappers for anything
+  needing a special environment or `mpirun`.
 - **Check what actually landed, through the native connector**, not what the
   connector believes. `t_vl_roundtrip.c` reads `.payload` back directly;
   `t_step_rewrite.c` verifies through native.

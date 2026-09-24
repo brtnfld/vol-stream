@@ -7,7 +7,8 @@ ctest entry per mode) so every scenario gets a fresh transport.
              as one push per row. Steps are checked one at a time while the
              writer waits after each, then after the writer has run several
              steps ahead. The reader joins after step 0 is committed, so that
-             step must never be returned.
+             step must never be returned. The writer waits for the reader in
+             H5Fwait_subscribers(), with no sentinel file.
   narrowing  The whole grid, delivered as int16 and filtered by a predicate:
              one step where everything matches, one where some rows do, and
              one where nothing does.
@@ -122,6 +123,8 @@ class StreamTest(unittest.TestCase):
 
 class ColumnTest(StreamTest):
     mode = "column"
+    # The writer is released by the subscription reaching it, not by "ready".
+    writer_env = {"STREAM_WRITER_SUBSCRIBERS": "1"}
 
     def check_column(self, step, s):
         self.assertIsNotNone(step, f"step {s} never arrived")
@@ -139,8 +142,9 @@ class ColumnTest(StreamTest):
         self.assertEqual(schema["/grid"].shape, (ROWS, COLS))
         self.assertEqual(schema["/grid"].dtype, np.dtype("int32"))
 
+        # No "ready": the writer waits in H5Fwait_subscribers() instead, and
+        # steps 1.. begin the moment this subscription reaches it.
         self.file.subscribe({"/grid": ((0, COL), (ROWS, 1))})
-        self.touch("ready")
 
         phys = []
         # Lockstep: the writer waits for us after each step. Step 0 was

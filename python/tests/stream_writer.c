@@ -40,6 +40,12 @@
  * "committed" after step 0 and "writes_done" after its last step, and waits
  * for "ready" (the reader has subscribed) and "done" (the reader has closed).
  *
+ * With STREAM_WRITER_SUBSCRIBERS=<n> in the environment, the writer instead
+ * waits after step 0 in H5Fwait_subscribers() for n subscribers, and ignores
+ * "ready": the subscription itself, over the transport, is what releases it.
+ * Step 0 still comes first, since a Python subscriber needs the schema it
+ * publishes before it can subscribe.
+ *
  * usage: stream_writer <column|narrowing|lifecycle|idle|eos|block|grow|types> <file> <syncdir>
  */
 
@@ -227,7 +233,7 @@ main(int argc, char **argv)
 {
     hid_t   vol_id, fapl, fid, space, ds = H5I_INVALID_HID, attr = H5I_INVALID_HID;
     hsize_t dims[2] = {ROWS, COLS};
-    const char *mode;
+    const char *mode, *subs;
     int         s;
 
     if (argc != 4 || (strcmp(argv[1], "column") != 0 && strcmp(argv[1], "narrowing") != 0 &&
@@ -255,7 +261,13 @@ main(int argc, char **argv)
                                   : write_step(fid, space, &ds, 0)) < 0)
         return 1;
     touch("committed");
-    if (wait_for("ready", 60) < 0)
+    if ((subs = getenv("STREAM_WRITER_SUBSCRIBERS")) != NULL) {
+        if (H5Fwait_subscribers(fid, strtoull(subs, NULL, 10), 60000) < 0) {
+            fprintf(stderr, "stream_writer: gave up waiting for %s subscribers\n", subs);
+            return 1;
+        }
+    }
+    else if (wait_for("ready", 60) < 0)
         return 1;
 
     if (!strcmp(mode, "column")) {

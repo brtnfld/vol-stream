@@ -366,6 +366,18 @@ As built:
   every step. Its docstring says it applies no backpressure (see P3's open
   item).
 
+No shared filesystem between the two sides: `python_stream_column` and
+`python_lifecycle_break` run the writer with `STREAM_WRITER_SUBSCRIBERS=1`,
+so it waits in `H5Fwait_subscribers()` rather than for a "ready" file, and
+the subscription arriving over the transport is what releases it. The other
+modes still use the file. The writer commits step 0 before it waits, because
+a Python `subscribe()` checks its paths against the schema that step 0
+publishes. A C subscriber can subscribe before any step exists
+(`t_rendezvous_barrier`); a Python one cannot yet. Because the writer is
+released before `subscribe()` returns, the notifications queued before the
+subscription are drained before subscribing, not after. Otherwise the
+writer's first step could be announced in time to be thrown away with them.
+
 End of stream: a subscriber treats the writer leaving the group (closing
 the file, or its process dying) as the end of the stream. Steps the writer
 announced before leaving are still delivered. After the last one,

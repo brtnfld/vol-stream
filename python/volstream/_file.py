@@ -299,11 +299,17 @@ class File:
             entries.append(entry if deflate is None else entry + (int(deflate), chunk))
             subs[path] = _Subscription(var, start, count, whole=sel is None and not var.is_attr)
 
-        first = not self._subs
+        # The backlog is drained before subscribing, not after: a writer
+        # released by H5Fwait_subscribers() can announce its next step as
+        # soon as the subscription reaches it, before this call returns.
+        last = self._discard_backlog() if not self._subs else None
         self._raw.subscribe(entries)
         self._subs.update(subs)
-        if first:
-            self._discard_backlog()
+        if last is not None and self.backpressure:
+            # Those steps are done with as far as this reader is concerned;
+            # acking them makes it a tracked reader from subscribe() on,
+            # rather than only after its first step.
+            self._raw.ack(last)
 
     def subscribe_type(self, path, dtype):
         """Have the writer convert path's data to dtype before sending it.
@@ -449,20 +455,15 @@ class File:
         return Push(phys, path, start, data)
 
     def _discard_backlog(self):
+        """Drop the step notifications queued before the first subscription.
+
+        Those steps were committed before the writer knew of this reader, so
+        they carry nothing for it. Nothing can have been pushed yet either.
+        Returns the last step dropped, or None."""
         last = None
         while (ready := self._raw.wait_step_ready(0)) is not None:
             last = ready[0]
-        if last is None:
-            return
-        if self.backpressure:
-            # Those steps are done with as far as this reader is concerned;
-            # acking them makes it a tracked reader from subscribe() on,
-            # rather than only after its first step.
-            self._raw.ack(last)
-        while (item := self._raw.get(0)) is not None:
-            if item[0] > last:
-                self._held = self._push(item)
-                return
+        return last
 
 
 def open(path, backpressure=False):

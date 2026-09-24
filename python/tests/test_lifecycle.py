@@ -58,8 +58,7 @@ def consumer_break(path, sync):
     import volstream
 
     f = volstream.open(path)
-    f.subscribe("/grid")
-    touch(sync, "ready")
+    f.subscribe("/grid")  # the writer waits for this in H5Fwait_subscribers()
     n = 0
     for _ in f.steps(timeout=30):
         n += 1
@@ -179,7 +178,8 @@ def run(writer_exe, mode):
     env = dict(os.environ)
     env.setdefault("VOL_STREAM_NA", "na+sm")
     writer_mode = {"break": "lifecycle", "interrupt": "idle", "fork": "idle"}[mode]
-    writer = subprocess.Popen([writer_exe, writer_mode, path, sync], env=env, stdout=subprocess.PIPE, text=True)
+    writer_env = dict(env, STREAM_WRITER_SUBSCRIBERS="1") if mode == "break" else env
+    writer = subprocess.Popen([writer_exe, writer_mode, path, sync], env=writer_env, stdout=subprocess.PIPE, text=True)
     consumer = None
     try:
         wait_for(sync, "committed", proc=writer)
