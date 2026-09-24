@@ -320,9 +320,11 @@ Stated plainly so you can plan around them:
   reopening the file. The subscription path
   (`H5Fsubscribe`/`H5Fget_subscribed_data`) is the live data channel; the
   reader-cursor path is for finished or reopened streams.
-- **Per-subscriber re-filtering ignores a requested chunk *shape*.** It always
-  builds a single chunk spanning the pushed run. This affects how a re-filtered
-  push is stored in transit, not which elements are chosen.
+- **Per-subscriber re-filtering honors a requested chunk shape only in 1-D.**
+  A 1-D DCPL's chunk is read as elements per push: each run is split into
+  slices of that size, each filtered and pushed separately. A DCPL of rank 2 or
+  more is not split; its run is re-filtered as one chunk. This affects how a
+  re-filtered push is stored in transit, not which elements are chosen.
 - **`h5py` cannot open a step.** The step API is optional operations; `h5py` has
   no binding for `H5VLfile_optional_op()`. Python reaches the stream through
   the separate `volstream` package instead, as a subscriber only; see

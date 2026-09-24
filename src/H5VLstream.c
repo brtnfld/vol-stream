@@ -2933,13 +2933,13 @@ done:
  *              out directly via H5Dread_chunk2() (bypasses the chunk cache
  *              and decompression -- the whole point).
  *
- *              Always forces a single chunk spanning the whole extent,
- *              overriding whatever chunk shape the subscriber's own DCPL
- *              requested, so exactly one H5Dget_chunk_info_by_coord()/
- *              H5Dread_chunk2() pair always suffices -- a real limitation
- *              (the subscriber's own chunk-size preference is not
- *              honored), acceptable for this first increment given the
- *              alternative is iterating an arbitrary number of chunks.
+ *              Always forces a single chunk spanning the whole extent it is
+ *              handed, so exactly one H5Dget_chunk_info_by_coord()/
+ *              H5Dread_chunk2() pair always suffices. A subscriber's
+ *              chunk-size preference is honored one level up, and only for
+ *              a 1-D DCPL: the caller first splits the run into slices of
+ *              that size (H5VL__stream_refilter_shape_for_subscriber()) and
+ *              calls this once per slice.
  *              H5VL__stream_unfilter_pushed_data() undoes this on the
  *              receiving end.
  *

@@ -427,7 +427,9 @@ supported, or depends on something outside this binding.
 - **Per-subscriber precision beyond deflate.** `subscribe(deflate=level)`
   exposes the C API's `plists` argument for deflate, the one filter every
   HDF5 build has, with one chunk spanning the selection. Other filters
-  (bslz4, zstd, zfp) and a requested chunk shape are not exposed.
+  (bslz4, zstd, zfp) are not exposed. Neither is a chunk shape: the writer
+  honors one only for a 1-D DCPL (as elements per push), which would make it
+  a 1-D-only option here.
 - **A dataset resized in any dimension but the first.** A whole-dataset
   subscription follows growth along the first dimension: it is made against
   an unbounded first dimension so the writer sends new rows, and the returned

@@ -154,11 +154,13 @@
  *              non-contiguous subscription (a column of a 2-D dataset)
  *              receives exactly its own elements rather than a superset.
  *
- *              Still open, and narrower than it once looked: re-filtering
- *              builds a single chunk spanning the pushed run rather than
- *              honoring a chunk *shape* a subscriber's DCPL asks for. That
- *              is about how a re-filtered push is stored in transit, not
- *              about which elements are chosen.
+ *              A requested chunk shape is honored only for a 1-D DCPL,
+ *              read as elements per push: the writer splits each run
+ *              into slices of that size, each filtered and pushed on its
+ *              own (test/t_chunk_shape_split.c). A DCPL of rank 2 or more
+ *              is not split, and its run is re-filtered as one chunk.
+ *              That is about how a re-filtered push is stored in transit,
+ *              not about which elements are chosen.
  *
  *              M10 status: live schema discovery. H5Fget_stream_schema()
  *              asks a running writer what it is publishing -- every path,
@@ -453,9 +455,10 @@ H5VL_STREAM_API herr_t H5Fget_logical_steps(hid_t file_id, size_t *n_logical, ui
  *       over-sends rather than under-sends. Call H5Fget_subscribed_data()
  *       after H5Fwait_step_ready() to retrieve what was pushed.
  *
- * \note Still follow-up scope: re-filtering (\p plists) always uses a
- *       single chunk spanning the pushed run rather than honoring a chunk
- *       shape requested there.
+ * \note A chunk shape in \p plists is honored only for a 1-D DCPL, read as
+ *       elements per push: each run is split into slices of that size, each
+ *       filtered and pushed separately. For a DCPL of rank 2 or more the
+ *       whole run is re-filtered as one chunk.
  */
 H5VL_STREAM_API herr_t H5Fsubscribe(hid_t file_id, size_t count, const char *const *paths, const hid_t *spaces,
                     const hid_t *plists);
