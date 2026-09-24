@@ -206,6 +206,10 @@ class EarlyTest(ColumnTest):
         self.file.subscribe("/grid", expect={"/grid": ((ROWS, COLS), np.float64)})
         with self.assertRaisesRegex(volstream.Error, "expected as shape"):
             self.file.next_step(20000)
+        # Release the column writer's lockstep so it finishes rather than
+        # waiting out its 30 s per-step timeout.
+        for s in range(1, LOCKSTEP + 1):
+            self.touch(f"ack.{s}")
 
 
 class NarrowingTest(StreamTest):
