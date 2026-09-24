@@ -141,10 +141,16 @@ What this does **not** give, and the reassembly layer must handle:
   it, so it drains to nothing. The layer must treat the first step after
   joining as possibly empty, not as a step with no matching data.
 - **The two queues must be drained in pairs.** The step-ready queue is
-  FIFO and unbounded (`vs_push_pending()` doubles it). A consumer that only
-  calls `get()` never empties it. The iterator must always pair
-  `wait_step_ready()` with the drain, and the raw `get()` path should say
-  so in its docstring.
+  FIFO and unbounded, and the failure mode is worse than unbounded growth
+  alone. `vs_push_pending()` doubles `cap_pending` with no ceiling and no
+  back-pressure; if the `realloc` fails it takes the
+  `n_pending < cap_pending` branch and **silently drops the notification**
+  rather than erroring. So a consumer that only calls `get()` and never
+  `wait_step_ready()` grows that queue until allocation fails and then
+  begins quietly losing steps. The iterator must always pair the two, the
+  raw `get()` path must say so in its docstring, and a long-running
+  `get()`-only consumer needs a test that the queue does not grow. Owned by
+  P4, which is where the raw/iterator split is actually built.
 
 `examples/detector_pipeline`'s `monitor` mode is the C precedent for the
 pairing. Until commit `3fae80d` (2026-09-24) it read only one push per step
@@ -191,13 +197,33 @@ from risk 2, for a fragmented (one push per row) selection:
   one-item carry-over P2 needs.
 - **Every step is complete:** each step's pushes cover exactly the
   selection, with that step's values.
+- **Joining late:** a reader that attaches after the writer has already
+  committed steps gets a step-ready for the writer's *current* step, seeded
+  by the join itself (`H5Fwait_step_ready()`'s own documentation), and
+  that step drains to nothing — it was committed before this reader
+  subscribed, so nothing was ever pushed to it. The test asserts the empty
+  drain and that the *next* step arrives whole. This pins the empty first
+  step as normal behaviour P2 must accept, not a fault it should report.
 
 In C, not a Python spike, deliberately. It settles the P2 design before
 P2 starts, it runs in the existing CI, and it stays as a regression test.
 A throwaway ctypes probe would answer the question once and then rot.
 
-**Exit gate:** `t_step_grouping` passes in the na+sm CI job, and fails if
-step-ready is ever sent before that step's pushes are queued.
+**What this test cannot cover: short steps.** A short step (risk 2) is
+produced by a *writer-side* push that fails or times out, while the step is
+still announced. Nothing in a healthy two-process run produces one, so
+none of the assertions above can reach the short-step path — the
+"every step is complete" assertion would only notice one by accident. It
+needs fault injection: a way to make the writer drop or time out a chosen
+push. There is none today. The honest options are to add one (an
+environment-gated hook in the push path, test-only) as its own S-sized
+task, or to ship P2's short-step check untested and say so. This plan
+recommends the hook, and does not pretend the check is covered until it
+exists.
+
+**Exit gate:** `t_step_grouping` passes in the na+sm CI job, fails if
+step-ready is ever sent before that step's pushes are queued, and includes
+the late-join case.
 
 ### P1 — Extension skeleton and build · S
 
@@ -221,10 +247,24 @@ into one array per step, using P0's pinned semantics: `wait_step_ready()`,
 then a zero-timeout drain, with one item of carry-over and a short-step
 check (risk 2).
 
+Three rules the reassembly layer follows, each traceable to risk 2:
+
+- **Carry-over:** a drain that pops a push for a later step holds it for
+  that step instead of discarding it.
+- **Late join:** the first step after attaching may drain to nothing. That
+  is skipped silently — it is neither yielded as an empty array nor
+  reported as "no matching data." Only steps after the first are held to
+  the completeness check.
+- **Short steps:** received elements are compared against the selection;
+  a short step raises (or is flagged, per a caller option) rather than
+  being handed back as a partly filled array. *Untested until P0's
+  fault-injection hook exists* — see P0.
+
 **Exit gate:** a Python consumer receives *N* steps of a fragmented
 (multi-run) subscription as correctly-shaped NumPy arrays whose values
-match what the writer sent, both in lockstep and after deliberately
-falling several steps behind.
+match what the writer sent — in lockstep, after deliberately falling
+several steps behind, and after attaching mid-stream (where the first
+yielded step is the first *whole* one, not the empty seed).
 
 ### P3 — Lifecycle correctness · M
 
@@ -252,9 +292,23 @@ raise `StopIteration`; a caller-supplied step count or deadline does —
 schema-driven convenience path, and a PyTorch `IterableDataset` that
 subscribes in `__init__` and only drains in `__iter__`.
 
+This is also where the raw/iterator split gets built, so it owns the
+queue-pairing hazard from risk 2. The iterator always pairs
+`wait_step_ready()` with the drain, so it cannot leak. The raw `get()`
+stays available — some consumers genuinely want one push at a time — but
+its docstring states that `get()` alone never empties the step-ready
+queue, and that a long-running `get()`-only loop grows it until allocation
+fails and then silently loses step notifications. Whether raw `get()`
+should also drain the step-ready queue itself, removing the hazard rather
+than documenting it, is a decision for this milestone; documenting it is
+the floor, not the target.
+
 **Exit gate:** RFC `sec:pysub-gate`'s gate, in full — a consumer written
 entirely in Python, no user-written C glue, following a live C writer,
-exiting cleanly on both paths.
+exiting cleanly on both paths — plus a long-running `get()`-only consumer
+test showing the step-ready queue stays bounded (or, if the hazard is only
+documented, showing that it does grow, so the docstring is a claim with a
+test behind it rather than a warning nobody checked).
 
 ### P5 — CI and packaging · M
 
