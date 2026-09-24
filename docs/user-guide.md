@@ -349,11 +349,12 @@ Stated plainly so you can plan around them:
   any step to a reader.** A subscriber recognises the writer from its step
   announcements or from the join seed; with neither, it cannot tell the writer's
   departure from anyone else's.
-- **Subscribers are invisible to the queue policy unless they call
-  `H5Fbegin_step()`.** The Block policy waits on acks, and acks come only from a
-  reader's sequential `H5Fbegin_step()`. A subscriber that reads only through
-  `H5Fwait_step_ready()`/`H5Fget_subscribed_data()` -- which includes the Python
-  binding -- never acks, so the writer never waits for it.
+- **A subscriber is invisible to the queue policy unless it acks.** The
+  policies act on acks. A reader advancing with `H5Fbegin_step()` acks
+  automatically; a subscriber that reads through
+  `H5Fwait_step_ready()`/`H5Fget_subscribed_data()` must call
+  `H5Fack_stream_step()` after each step (in Python, `backpressure=True`), or the
+  writer never waits for it.
 
 ### 2.4 Wire-format compatibility
 

@@ -23,12 +23,15 @@
  *   idle       then nothing until "go" (write step 1) or "done".
  *   eos        then steps 1..3 back to back, and closes at once without
  *              waiting for "done": the reader sees the writer leave.
+ *   block      then sets the Block queue policy with one slot of slack and
+ *              commits steps 1..6 back to back, printing how long that took
+ *              as "writer_ms <ms>". A reader that acks makes it wait.
  *
  * Synchronization is by empty files in <syncdir>: the writer touches
  * "committed" after step 0 and "writes_done" after its last step, and waits
  * for "ready" (the reader has subscribed) and "done" (the reader has closed).
  *
- * usage: stream_writer <column|narrowing|lifecycle|idle|eos> <file> <syncdir>
+ * usage: stream_writer <column|narrowing|lifecycle|idle|eos|block> <file> <syncdir>
  */
 
 #include <stdio.h>
@@ -128,8 +131,8 @@ main(int argc, char **argv)
 
     if (argc != 4 || (strcmp(argv[1], "column") != 0 && strcmp(argv[1], "narrowing") != 0 &&
                       strcmp(argv[1], "lifecycle") != 0 && strcmp(argv[1], "idle") != 0 &&
-                      strcmp(argv[1], "eos") != 0)) {
-        fprintf(stderr, "usage: %s <column|narrowing|lifecycle|idle|eos> <file> <syncdir>\n", argv[0]);
+                      strcmp(argv[1], "eos") != 0 && strcmp(argv[1], "block") != 0)) {
+        fprintf(stderr, "usage: %s <column|narrowing|lifecycle|idle|eos|block> <file> <syncdir>\n", argv[0]);
         return 2;
     }
     mode = argv[1];
@@ -188,6 +191,20 @@ main(int argc, char **argv)
             usleep(50000);
         }
         printf("max_commit_ms %.1f\n", worst);
+        fflush(stdout);
+    }
+    else if (!strcmp(mode, "block")) {
+        double t0;
+
+        if (H5Fset_stream_queue_policy(fid, H5VL_STREAM_QUEUE_BLOCK, 1) < 0) {
+            fprintf(stderr, "stream_writer: FAIL set queue policy\n");
+            return 1;
+        }
+        t0 = now_ms();
+        for (s = 1; s <= 6; s++)
+            if (write_step(fid, space, &ds, s) < 0)
+                return 1;
+        printf("writer_ms %.1f\n", now_ms() - t0);
         fflush(stdout);
     }
     else { /* idle */

@@ -296,12 +296,15 @@ until the transport declares the reader dead, each commit pays a 1 s push
 timeout. The test requires the writer's commits after the consumer exits
 to stay under 500 ms.
 
-Open: a Python reader never sends the step acks that M7's queue policy
-tracks (those come from the reader's sequential `H5Fbegin_step()`, which
-this binding does not use). So a writer's Block policy cannot see a slow
-Python consumer and will not wait for it. That needs a reader-side ack call
-in the C API, and it should be decided before P4's `IterableDataset` is
-presented as backpressure-aware.
+Backpressure: a subscriber never sends the step acks M7's queue policy
+tracks on its own (a cursor reader acks from its sequential
+`H5Fbegin_step()`, which this binding does not use), so a Block policy
+could not see a Python consumer. The C API now has `H5Fack_stream_step()`,
+and `open()`, `follow()` and `StreamDataset` take `backpressure=True`, which
+acks each step `next_step()` returns (and the backlog discarded at
+subscribe, so the reader is tracked from then on). It is opt in: under
+Block, a consumer that stalls then stalls the writer. Tested both ways by
+`python_stream_ack` and `python_stream_noack`.
 
 ### P4 — The Pythonic layer · M
 
@@ -408,8 +411,8 @@ supported, or depends on something outside this binding.
 
 ### Depends on the connector or the Mochi stack
 
-- **Backpressure.** A Python subscriber never acks, so a writer's Block
-  queue policy cannot see it (see P3).
+- **Backpressure is opt in** (`backpressure=True`; see P3). Without it a
+  writer's queue policy does not see a Python subscriber.
 - **End of stream for a writer that leaves before announcing any step** to
   this reader is not detected (see P4). Neither is it for a parallel writer
   with more than 1,024 ranks: the reader stops tracking beyond that, and

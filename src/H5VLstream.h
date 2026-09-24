@@ -260,6 +260,7 @@ H5VL_STREAM_API extern hid_t H5VL_STREAM_g;
 #define H5VL_STREAM_OP_SUBSCRIBE_TYPE      "vol-stream:subscribe_type"
 #define H5VL_STREAM_OP_GET_STREAM_SCHEMA   "vol-stream:get_stream_schema"
 #define H5VL_STREAM_OP_GET_BYTES_PUSHED    "vol-stream:get_bytes_pushed"
+#define H5VL_STREAM_OP_ACK_STEP            "vol-stream:ack_step"
 
 /** Status of the current step */
 typedef enum H5F_step_status_t {
@@ -686,6 +687,34 @@ H5VL_STREAM_API herr_t H5Ffree_stream_schema(size_t n_vars, H5F_stream_var_t *va
  */
 H5VL_STREAM_API herr_t H5Fwait_step_ready(hid_t file_id, uint64_t timeout_ms, uint64_t *physical_step,
                     uint64_t *wall_time_ns);
+
+/**
+ * \brief M7: reader only. Tell the writer this reader has consumed
+ *        \p physical_step, so its queue policy counts this reader.
+ *
+ * A reader that advances with H5Fbegin_step() acks automatically. A
+ * subscriber that consumes steps through H5Fwait_step_ready() and
+ * H5Fget_subscribed_data() does not, and so is invisible to the writer's
+ * queue policy: a Block policy never waits for it. Calling this after
+ * finishing with each step makes it a tracked reader like any other -- the
+ * writer then applies its policy when this reader falls more than
+ * \p reserve_slots steps behind (see H5Fset_stream_queue_policy()).
+ *
+ * Opt in deliberately. Under a Block policy a subscriber that acks and then
+ * stalls stalls the writer (for up to the policy's bound), which is right for
+ * a consumer that must not lose steps and wrong for a live monitor. A reader
+ * stops being tracked when it leaves the group.
+ *
+ * \param file_id       File opened through the vol-stream connector for
+ *                      reading, with the transport enabled (see
+ *                      VOL_STREAM_NA)
+ * \param physical_step A step returned by H5Fwait_step_ready()
+ * \return \herr_t, -1 if the transport is unavailable, \p file_id is not a
+ *         reader, or the writer could not be reached (best-effort: a lost
+ *         ack only leaves the writer's view of this reader stale until the
+ *         next one)
+ */
+H5VL_STREAM_API herr_t H5Fack_stream_step(hid_t file_id, uint64_t physical_step);
 
 /**
  * \brief M7: writer only. Set the policy H5Fend_step() applies when a

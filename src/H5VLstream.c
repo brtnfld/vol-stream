@@ -966,6 +966,7 @@ static int H5VL_stream_op_set_retention       = -1;
 static int H5VL_stream_op_subscribe_type      = -1;
 static int H5VL_stream_op_get_stream_schema  = -1;
 static int H5VL_stream_op_get_bytes_pushed   = -1;
+static int H5VL_stream_op_ack_step           = -1;
 
 /* Argument structs for the step operations. */
 typedef struct H5VL_stream_args_begin_step_t {
@@ -1009,6 +1010,11 @@ typedef struct H5VL_stream_args_wait_step_ready_t {
     uint64_t *physical_step; /* OUT */
     uint64_t *wall_time_ns;  /* OUT; NULL if not wanted */
 } H5VL_stream_args_wait_step_ready_t;
+
+/* M7: a subscriber reporting progress explicitly. */
+typedef struct H5VL_stream_args_ack_step_t {
+    uint64_t physical_step;
+} H5VL_stream_args_ack_step_t;
 
 /* M7 */
 typedef struct H5VL_stream_args_set_queue_policy_t {
@@ -8675,6 +8681,8 @@ H5VL_stream_init(hid_t vipl_id)
         return -1;
     if (H5VL__stream_register_op(H5VL_STREAM_OP_GET_BYTES_PUSHED, &H5VL_stream_op_get_bytes_pushed) < 0)
         return -1;
+    if (H5VL__stream_register_op(H5VL_STREAM_OP_ACK_STEP, &H5VL_stream_op_ack_step) < 0)
+        return -1;
     if (H5VL__stream_register_op(H5VL_STREAM_OP_SET_RETENTION, &H5VL_stream_op_set_retention) < 0)
         return -1;
     if (H5VL__stream_register_op(H5VL_STREAM_OP_SUBSCRIBE_TYPE, &H5VL_stream_op_subscribe_type) < 0)
@@ -11334,6 +11342,20 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
         return -1;
 #endif
     }
+    else if (args->op_type == H5VL_stream_op_ack_step) {
+#ifdef VOL_STREAM_HAVE_MERCURY
+        /* The same ack a sequential H5Fbegin_step() sends, for a subscriber
+         * that consumes steps through H5Fwait_step_ready() instead. */
+        H5VL_stream_args_ack_step_t *sargs = (H5VL_stream_args_ack_step_t *)args->args;
+
+        if (!sargs || !o->file_state || !o->file_state->is_reader || !o->file_state->transport)
+            return -1;
+
+        return (herr_t)vs_tr_reader_ack_step(o->file_state->transport, sargs->physical_step);
+#else
+        return -1;
+#endif
+    }
     else if (args->op_type == H5VL_stream_op_set_queue_policy) {
         H5VL_stream_args_set_queue_policy_t *sargs = (H5VL_stream_args_set_queue_policy_t *)args->args;
 
@@ -12484,6 +12506,10 @@ H5VL_stream_introspect_opt_query(void *obj, H5VL_subclass_t cls, int opt_type, u
         *flags = H5VL_OPT_QUERY_SUPPORTED | H5VL_OPT_QUERY_QUERY_METADATA;
         return 0;
     }
+    else if (cls == H5VL_SUBCLS_FILE && opt_type == H5VL_stream_op_ack_step) {
+        *flags = H5VL_OPT_QUERY_SUPPORTED | H5VL_OPT_QUERY_QUERY_METADATA;
+        return 0;
+    }
     else if (cls == H5VL_SUBCLS_FILE && opt_type == H5VL_stream_op_subscribe_type) {
         *flags = H5VL_OPT_QUERY_SUPPORTED | H5VL_OPT_QUERY_MODIFY_METADATA;
         return 0;
@@ -13162,6 +13188,16 @@ H5Fwait_step_ready(hid_t file_id, uint64_t timeout_ms, uint64_t *physical_step, 
 
     return H5VL__stream_file_op(file_id, H5VL_stream_op_wait_step_ready, &op_args);
 } /* end H5Fwait_step_ready() */
+
+herr_t
+H5Fack_stream_step(hid_t file_id, uint64_t physical_step)
+{
+    H5VL_stream_args_ack_step_t op_args;
+
+    op_args.physical_step = physical_step;
+
+    return H5VL__stream_file_op(file_id, H5VL_stream_op_ack_step, &op_args);
+} /* end H5Fack_stream_step() */
 
 herr_t
 H5Fset_stream_queue_policy(hid_t file_id, H5VL_stream_queue_policy_t policy, uint64_t reserve_slots)

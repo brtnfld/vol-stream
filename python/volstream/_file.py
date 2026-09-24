@@ -154,10 +154,17 @@ class File:
 
     Close it with close() or by using it as a context manager. A File left
     open is closed when the interpreter exits.
+
+    With backpressure=True, next_step() tells the writer each step it hands
+    back has been consumed, so a writer with a queue policy (see
+    H5Fset_stream_queue_policy() in the C API) counts this reader, and under
+    Block waits for it. Off by default: under Block, a consumer that stalls
+    then stalls the writer.
     """
 
-    def __init__(self, raw):
+    def __init__(self, raw, backpressure=False):
         self._raw = raw
+        self.backpressure = backpressure
         self._subs = {}
         self._held = None  # a Push popped past the end of a step, for a later one
         _open_files.add(self)
@@ -330,6 +337,8 @@ class File:
             if p.path in self._subs:
                 by_path.setdefault(p.path, []).append(p)
         arrays = {path: self._subs[path].assemble(plist) for path, plist in by_path.items()}
+        if self.backpressure:
+            self._raw.ack(phys)
         return Step(phys, wall_ns, arrays)
 
     @property
@@ -389,18 +398,23 @@ class File:
             last = ready[0]
         if last is None:
             return
+        if self.backpressure:
+            # Those steps are done with as far as this reader is concerned;
+            # acking them makes it a tracked reader from subscribe() on,
+            # rather than only after its first step.
+            self._raw.ack(last)
         while (item := self._raw.get(0)) is not None:
             if item[0] > last:
                 self._held = self._push(item)
                 return
 
 
-def open(path):
-    """Open a vol-stream file for reading."""
-    return File(_volstream.open(path))
+def open(path, backpressure=False):
+    """Open a vol-stream file for reading. See File for backpressure."""
+    return File(_volstream.open(path), backpressure)
 
 
-def follow(path, selections=None, timeout_ms=10000):
+def follow(path, selections=None, timeout_ms=10000, backpressure=False):
     """Open a live stream and subscribe to it in one call.
 
     selections is anything File.subscribe() takes. By default every dataset
@@ -411,7 +425,7 @@ def follow(path, selections=None, timeout_ms=10000):
             for step in stream.steps(max_steps=100):
                 ...
     """
-    f = open(path)
+    f = open(path, backpressure)
     try:
         if selections is None:
             selections = [

@@ -19,11 +19,15 @@ ctest entry per mode) so every scenario gets a fresh transport.
              is not installed.
   eos        The writer commits three steps and closes. Unbounded iteration
              must yield all three and then end by itself.
+  ack        backpressure=True against a writer with the Block queue policy:
+             a consumer that takes 0.4 s per step must slow the writer down.
+  noack      The same without backpressure: the writer must not wait, which
+             is what a subscriber that never acks gets.
   drop       The column scenario with one push lost on the way (the writer's
              test-only VOL_STREAM_TEST_DROP_PUSH): that step must arrive as a
              masked array with exactly the lost row masked.
 
-usage: test_stream.py <stream_writer executable> <column|narrowing|iterate|getonly|torch|eos|drop>
+usage: test_stream.py <stream_writer executable> <column|narrowing|iterate|getonly|torch|eos|drop|ack|noack>
 """
 
 import os
@@ -49,6 +53,7 @@ def value(s, r, c):
 class StreamTest(unittest.TestCase):
     mode = None
     writer_env = {}
+    capture_writer = False
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -57,7 +62,8 @@ class StreamTest(unittest.TestCase):
         env = dict(os.environ)
         env.setdefault("VOL_STREAM_NA", "na+sm")
         env.update(self.writer_env)
-        self.writer = subprocess.Popen([WRITER, self.mode, self.path, self.sync], env=env)
+        self.writer = subprocess.Popen([WRITER, self.mode, self.path, self.sync], env=env,
+                                       stdout=subprocess.PIPE if self.capture_writer else None, text=True)
         self.file = None
 
     def tearDown(self):
@@ -208,6 +214,40 @@ class DropTest(StreamTest):
         self.assert_writer_ok()
 
 
+class BackpressureTest(StreamTest):
+    mode = "block"
+    capture_writer = True
+    backpressure = True
+    PER_STEP_S = 0.4
+
+    def run_consumer(self):
+        self.wait_for("committed")
+        with volstream.follow(self.path, "/grid", backpressure=self.backpressure) as f:
+            self.touch("ready")
+            for s, step in enumerate(f.steps(max_steps=6, timeout=60), start=1):
+                np.testing.assert_array_equal(step["/grid"], whole_grid(s))
+                time.sleep(self.PER_STEP_S)
+            self.assertEqual(s, 6, "not every step arrived")
+            self.touch("done")
+            out, _ = self.writer.communicate(timeout=60)
+        self.assertEqual(self.writer.returncode, 0)
+        return float(out.split("writer_ms")[1].split()[0])
+
+    def test_backpressure(self):
+        writer_ms = self.run_consumer()
+        # Steps 3..6 each wait for the consumer's ack of the step before last,
+        # about PER_STEP_S apiece; unthrottled, six steps take milliseconds.
+        self.assertGreater(writer_ms, 1000, f"the writer did not wait for an acking reader ({writer_ms:.0f} ms)")
+
+
+class NoBackpressureTest(BackpressureTest):
+    backpressure = False
+
+    def test_backpressure(self):
+        writer_ms = self.run_consumer()
+        self.assertLess(writer_ms, 1000, f"the writer waited for a reader that never acks ({writer_ms:.0f} ms)")
+
+
 def whole_grid(s):
     return np.array([[value(s, r, c) for c in range(COLS)] for r in range(ROWS)], dtype=np.int32)
 
@@ -307,7 +347,8 @@ if __name__ == "__main__":
     WRITER = sys.argv.pop(1)
     mode = sys.argv.pop(1)
     cases = {"column": ColumnTest, "narrowing": NarrowingTest, "iterate": IterateTest,
-             "getonly": GetOnlyTest, "torch": TorchTest, "eos": EndOfStreamTest, "drop": DropTest}
+             "getonly": GetOnlyTest, "torch": TorchTest, "eos": EndOfStreamTest, "drop": DropTest,
+             "ack": BackpressureTest, "noack": NoBackpressureTest}
     if mode not in cases:
         sys.exit(__doc__)
     if mode == "torch":

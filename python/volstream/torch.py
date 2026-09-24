@@ -27,17 +27,18 @@ class StreamDataset(IterableDataset):
     DataLoader worker or to be copied into one. Put parallel work in the
     training loop or the transform instead.
 
-    This does not apply backpressure: the writer does not wait for a slow
-    consumer.
+    With backpressure=True the dataset acks each step it yields, so a writer
+    with a Block queue policy waits for it (see volstream.File). Off by
+    default.
 
     Iteration ends when the writer closes the file, or on max_steps, timeout
     or idle_timeout, as in volstream.File.steps().
     """
 
     def __init__(self, path, selections=None, *, transform=None, max_steps=None, timeout=None,
-                 idle_timeout=None, timeout_ms=10000):
+                 idle_timeout=None, timeout_ms=10000, backpressure=False):
         super().__init__()
-        self._file = follow(path, selections, timeout_ms)
+        self._file = follow(path, selections, timeout_ms, backpressure)
         self._transform = transform
         self._bounds = dict(max_steps=max_steps, timeout=timeout, idle_timeout=idle_timeout)
 

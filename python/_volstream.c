@@ -717,6 +717,22 @@ RawFile_get(RawFileObject *self, PyObject *args)
     return result;
 }
 
+/* Best-effort ack of a consumed step; True if the writer received it. */
+static PyObject *
+RawFile_ack(RawFileObject *self, PyObject *args)
+{
+    unsigned long long phys;
+    herr_t             status;
+
+    if (!PyArg_ParseTuple(args, "K:ack", &phys) || check_usable(self) < 0)
+        return NULL;
+    HDF5_BEGIN
+    status = H5Fack_stream_step(self->fid, (uint64_t)phys);
+    H5Eclear2(H5E_DEFAULT);
+    HDF5_END
+    return PyBool_FromLong(status >= 0);
+}
+
 /* True once every writer has left and every step it announced was consumed. */
 static PyObject *
 RawFile_end_of_stream(RawFileObject *self, PyObject *Py_UNUSED(ignored))
@@ -759,6 +775,8 @@ static PyMethodDef RawFile_methods[] = {
      "wait_step_ready(timeout_ms) -> (physical_step, wall_time_ns) or None on timeout"},
     {"get", (PyCFunction)RawFile_get, METH_VARARGS,
      "get(timeout_ms) -> (physical_step, path, elem_start, elem_count, Buffer) or None on timeout"},
+    {"ack", (PyCFunction)RawFile_ack, METH_VARARGS,
+     "ack(physical_step) -> bool; tell the writer this step was consumed (best-effort)"},
     {"end_of_stream", (PyCFunction)RawFile_end_of_stream, METH_NOARGS,
      "True once every writer has left and every step it announced was consumed"},
     {NULL, NULL, 0, NULL}};
