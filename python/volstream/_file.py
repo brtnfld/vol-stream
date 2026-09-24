@@ -1,6 +1,8 @@
 """The File API over the raw extension, and per-step reassembly."""
 
+import atexit
 import math
+import weakref
 from typing import NamedTuple, Optional
 
 import numpy as np
@@ -130,13 +132,34 @@ class _Subscription:
         return np.ma.MaskedArray(out, mask=~got)
 
 
+# Every File still open, so they can be closed before the interpreter shuts
+# down. A reader that is closed leaves the writer's group at once; one that is
+# not costs the writer a push timeout on every step until the transport
+# notices it is gone.
+_open_files = weakref.WeakSet()
+
+
+@atexit.register
+def _close_all():
+    for f in list(_open_files):
+        try:
+            f.close()
+        except Exception:
+            pass
+
+
 class File:
-    """A vol-stream file opened for reading. Create with volstream.open()."""
+    """A vol-stream file opened for reading. Create with volstream.open().
+
+    Close it with close() or by using it as a context manager. A File left
+    open is closed when the interpreter exits.
+    """
 
     def __init__(self, raw):
         self._raw = raw
         self._subs = {}
         self._held = None  # a Push popped past the end of a step, for a later one
+        _open_files.add(self)
 
     @property
     def path(self):
@@ -147,9 +170,16 @@ class File:
         return self._raw.closed
 
     def close(self):
-        """Close the file. Safe to call more than once."""
+        """Close the file. Safe to call more than once, and in a forked child."""
         self._held = None
+        _open_files.discard(self)
         self._raw.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
     def __repr__(self):
         return f"<volstream.File {self.path!r} ({'closed' if self.closed else 'open'})>"

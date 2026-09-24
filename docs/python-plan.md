@@ -289,6 +289,20 @@ surface as someone else's bug:
 **Exit gate:** the early-`break` case, tested rather than assumed — the
 writer proceeds to completion after the consumer breaks out mid-stream.
 
+As built: the PID is recorded at `open()`, and `open()` itself refuses to
+run in a child of the process that first registered the connector. The
+early-break test measures what an unclean exit actually costs the writer:
+until the transport declares the reader dead, each commit pays a 1 s push
+timeout. The test requires the writer's commits after the consumer exits
+to stay under 500 ms.
+
+Open: a Python reader never sends the step acks that M7's queue policy
+tracks (those come from the reader's sequential `H5Fbegin_step()`, which
+this binding does not use). So a writer's Block policy cannot see a slow
+Python consumer and will not wait for it. That needs a reader-side ack call
+in the C API, and it should be decided before P4's `IterableDataset` is
+presented as backpressure-aware.
+
 ### P4 — The Pythonic layer · M
 
 Iteration with a defined termination policy (a bare timeout does *not*

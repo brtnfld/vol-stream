@@ -41,5 +41,17 @@ if(VOL_STREAM_BUILD_TESTS)
         TIMEOUT 120
       )
     endforeach()
+
+    # P3 exit gate: early exit without close(), Ctrl-C and other threads
+    # during a wait, and fork().
+    foreach(mode break interrupt fork)
+      add_test(NAME python_lifecycle_${mode}
+        COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_lifecycle.py
+                $<TARGET_FILE:py_stream_writer> ${mode})
+      set_tests_properties(python_lifecycle_${mode} PROPERTIES
+        ENVIRONMENT "${_py_env};VOL_STREAM_NA=na+sm"
+        TIMEOUT 120
+      )
+    endforeach()
   endif()
 endif()
