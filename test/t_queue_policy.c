@@ -116,6 +116,16 @@ write_one_step(hid_t fid, hid_t sp, int step_no)
     return H5Fend_step(fid);
 }
 
+/* H5Ewalk2() callback: count frames that report a Discard drop. */
+static herr_t
+count_discard_frames(unsigned n, const H5E_error2_t *err, void *udata)
+{
+    (void)n;
+    if (err && err->desc && strstr(err->desc, "Discard dropped step"))
+        (*(int *)udata)++;
+    return 0;
+}
+
 static int
 run_reader(const char *fname)
 {
@@ -238,6 +248,27 @@ run_writer(hid_t vol_id, const char *fname, H5VL_stream_queue_policy_t policy, c
         return 1;
     }
     *out_step2_secs = elapsed_seconds(&t0);
+
+    /* A dropped step is reported, not silent: H5Fend_step() succeeded, and
+     * left a non-fatal frame naming the drop for the caller to find. Checked
+     * before any other HDF5 call, since every API call clears the stack. */
+    {
+        int frames = 0;
+
+        H5Ewalk2(H5E_DEFAULT, H5E_WALK_DOWNWARD, count_discard_frames, &frames);
+        if (policy == H5VL_STREAM_QUEUE_DISCARD && frames == 0) {
+            printf("writer(%s): FAIL step 2 was dropped with no report on the error stack\n", policy_name);
+            return 1;
+        }
+        if (policy != H5VL_STREAM_QUEUE_DISCARD && frames > 0) {
+            printf("writer(%s): FAIL a Discard drop was reported under another policy\n", policy_name);
+            return 1;
+        }
+        if (policy == H5VL_STREAM_QUEUE_DISCARD)
+            printf("  ok    the drop was reported: a non-fatal frame on the error stack after a successful "
+                   "H5Fend_step()\n");
+        H5Eclear2(H5E_DEFAULT);
+    }
 
     if (policy == H5VL_STREAM_QUEUE_SPILL) {
         /* Give the drain something to work with: wait for the reader's

@@ -6256,8 +6256,14 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                      * nothing on the ordinary M0-M7 path. Best-effort, same
                      * as vs_tr_writer_broadcast_step_ready(): a failed push
                      * must not fail the replay that already durably
-                     * committed this data to the real file. */
-                    if (file_obj->file_state && file_obj->file_state->transport) {
+                     * committed this data to the real file.
+                     *
+                     * Not for a variable-length type: its in-memory form is
+                     * hvl_t/char* pointers, meaningless in another process,
+                     * and the rebuilt vl_buf holding them is already freed
+                     * above. Such an object is read from the file instead. */
+                    if (vl_kind == H5VL_STREAM_VL_NONE && file_obj->file_state &&
+                        file_obj->file_state->transport) {
                         uint64_t w_start, w_count;
 
                         if (H5VL__stream_space_1d_bounds(dspace, &w_start, &w_count) >= 0) {
@@ -6533,7 +6539,10 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                      * yet, since M8/M8.5 never claimed attribute
                      * subscriptions as in scope; this closes the silent gap
                      * without promising more than that. */
-                    if (file_obj->file_state && file_obj->file_state->transport) {
+                    /* Not a variable-length attribute, for the reason the
+                     * dataset push above gives. */
+                    if (vl_kind == H5VL_STREAM_VL_NONE && file_obj->file_state &&
+                        file_obj->file_state->transport) {
                         uint64_t a_start, a_count;
 
                         if (H5VL__stream_space_1d_bounds(dspace, &a_start, &a_count) >= 0) {
@@ -8498,8 +8507,21 @@ H5VL__stream_apply_queue_policy(H5VL_stream_t *file_obj)
             has_open_placeholder = H5VL__stream_queue_agree_or(fs, has_open_placeholder);
 
             if (!has_open_placeholder) {
-                if (fs->queue_policy == H5VL_STREAM_QUEUE_DISCARD)
+                if (fs->queue_policy == H5VL_STREAM_QUEUE_DISCARD) {
+                    /* H5Fend_step() still succeeds -- dropping is the policy
+                     * working -- but the application is told, through a
+                     * non-fatal frame on the error stack. The async request
+                     * status enumeration has no "succeeded, but dropped"
+                     * value to carry it instead. */
+                    char msg[160];
+
+                    snprintf(msg, sizeof(msg),
+                             "queue policy Discard dropped step %llu: a tracked reader is more than %llu "
+                             "step(s) behind",
+                             (unsigned long long)fs->physical_step, (unsigned long long)fs->reserve_slots);
+                    H5VL_STREAM_ERR(H5VL_stream_err_step_g, msg);
                     return H5VL__stream_discard_step(file_obj);
+                }
 
 #ifdef VOL_STREAM_HAVE_BAKE
                 /* Spill stays serial-only, deliberately. A spilled step is
@@ -13189,13 +13211,16 @@ H5VL__stream_file_op(hid_t file_id, int op_type, void *op_args)
      */
     if ((connector_id = H5VLget_connector_id(file_id)) < 0)
         return -1;
+    /* Closed before the op, not after: every HDF5 API call clears the error
+     * stack on entry, so an H5VLclose() here would erase whatever the op
+     * pushed -- a failure's frames, and the non-fatal diagnostics a
+     * successful call leaves for the caller (a Discard drop, for one). */
+    H5VLclose(connector_id);
 
     args.op_type = op_type;
     args.args    = op_args;
 
     ret_value = H5VLfile_optional_op(file_id, &args, H5P_DEFAULT, H5ES_NONE);
-
-    H5VLclose(connector_id);
 
     return ret_value;
 } /* end H5VL__stream_file_op() */

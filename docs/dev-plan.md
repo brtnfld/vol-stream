@@ -1217,6 +1217,35 @@ matches the code. Each item is documented for users in
   selection sent as its bounding span, a predicate not evaluated, matches
   coalesced to their span, or a type conversion declined. `t_predicate` and
   `t_subvolume_strided` pin exact pushes at 0 and each fallback's bit.
+- **Phase 1: large push payloads go by Mercury bulk.** A payload of at least
+  `VOL_STREAM_BULK_THRESHOLD` bytes (64 KiB default, provisional) is
+  registered and pulled by the subscriber; smaller ones stay inline. A push
+  from the caller's memory completes before `vs_tr_writer_push_data()`
+  returns, which keeps that function's contract for every replay path; owned
+  refilter output is freed on completion. `bulk_push` moves 256 MiB and
+  checks it; ten C and three Python tests rerun with every push by bulk.
+- **Error-stack frames from step calls reach the caller.** The API wrapper
+  closed a connector id after the optional op, and that HDF5 call cleared the
+  stack, erasing every frame the op had pushed. A `Discard` drop is now
+  reported that way (`t_queue_policy`).
+- **Variable-length objects are no longer pushed.** The push read the rebuilt
+  pointer buffer after it had been freed. `t_vl_push`.
+- **Archival step-count scaling, measured.** `test/b_step_scale.c` writes N
+  retained steps of two 64-double datasets and a scalar attribute, rewritten
+  through open handles. On an M-series Mac, local SSD, HDF5 2.3.0:
+
+  | steps | `H5Fend_step()` first 100 / last 100 | file bytes per step | reader `H5Fopen()` | last-step seek + read |
+  |---|---|---|---|---|
+  | 100 | 0.37 / 0.37 ms | 3162 | 9.0 ms | 0.04 ms |
+  | 1,000 | 0.35 / 0.41 ms | 3148 | 18.1 ms | 0.04 ms |
+  | 10,000 | 0.41 / 0.40 ms | 3148 | 21.9 ms | 0.05 ms |
+  | 100,000 | 0.35 / 0.37 ms | 3148 | 8.9 ms | 0.13 ms |
+
+  With `VOL_STREAM_STAGE_PAYLOAD=0`; with staging on, about 4.5 KB per step
+  and the same times. Nothing grows with step count: a step costs the same at
+  100,000 as at 100, and the flat `/step/<n>` namespace (dense group storage)
+  is not a bottleneck at this scale. About 2 KB of each step is metadata
+  around its 1 KiB of data -- the per-step overhead to budget for.
 - **A chunk shape of any rank is honored** as its element count per push,
   where rank 2 or more used to be ignored. `t_chunk_shape_split` covers a
   (2, 8) chunk on an 8x8 dataset.
@@ -1229,11 +1258,12 @@ the one list. ★ marks what is being worked on next.
 
 **Transport**
 
-- ★ **Bulk transfer for the push payload (RFC Phase 1).** A push carries its
-  bytes inline in the RPC record, which caps large-message throughput and
-  keeps device memory out of reach. Move payloads above a size threshold to
-  `margo_bulk_create()`/`margo_bulk_transfer()` (pull), keep small ones
-  inline, and keep a step's payload alive until its pushes drain.
+- **Bulk transfer (RFC Phase 1) is built** (see *After M10*). Still open
+  from its gate: the throughput comparison against a Phase 0 baseline (needs
+  an RDMA fabric), the 1 GiB run (`T_BULK_MIB=1024 t_bulk_push`, by hand),
+  and an ASan build with the transport. Follow-ups: one registration per
+  step instead of per push, and overlapping a borrowed-buffer pull with the
+  rest of the step instead of waiting for it in `vs_tr_writer_push_data()`.
 - HMEM provider and device-direct delivery (RFC Phases 2 and 3), after Phase 1.
 - The payload-size sweep on a real RDMA fabric (RFC Phase 0), which needs
   multi-node hardware. It sets Phase 1's priority and threshold, not whether
@@ -1241,13 +1271,9 @@ the one list. ★ marks what is being worked on next.
 
 **Protocol and semantics**
 
-- **Bug, unverified by a test:** pushing a variable-length dataset to a
-  subscriber appears to read freed memory. In `H5VL__stream_replay_manifest()`
-  the push source `payload_ptr` is the rebuilt `vl_buf`, which is freed right
-  after the dataset write and before the push. Even unfreed it would carry
-  `hvl_t` pointers, which mean nothing in another process. Either push the
-  serialized form (and teach the reader to decode it) or refuse VL
-  subscriptions.
+- Variable-length objects are not pushed to subscribers (they are read from
+  the file). Pushing their serialized form, with a reader-side decode, would
+  close this.
 - Subscriptions are not retroactive: a reader that joins at step 500 cannot
   get the steps it missed (subscribe-with-start-step).
 - A reader that vanishes costs the writer push timeouts until SWIM declares
@@ -1255,8 +1281,7 @@ the one list. ★ marks what is being worked on next.
   not recognised as the end of the stream.
 - An attribute written in a step that does not write its dataset replays onto
   a group of that name, which can shadow the dataset (user guide §2.3).
-- Error-stack coverage is incomplete, and a `Discard` drop is not reported to
-  the application.
+- Error-stack coverage is incomplete (a `Discard` drop is now reported).
 - No fault tolerance for a rank failure inside a collective commit.
 - Objects from a failed replay are never reclaimed.
 - Writer and reader cannot cross an HDF5 major.minor boundary.
@@ -1269,7 +1294,8 @@ the one list. ★ marks what is being worked on next.
 
 **Measurement**
 
-- Metadata growth is unmeasured beyond 50 steps.
+- Archival scaling is measured to 100,000 steps on one laptop-class machine
+  (`test/b_step_scale.c`, see *After M10*), not on a parallel file system.
 - The ADIOS2 SST comparison is single-node, single-rank and statistically
   informal.
 - `precision_dual` (the literal M8 exit gate) is still `DISABLED`.

@@ -328,6 +328,10 @@ Stated plainly so you can plan around them:
   dimensions equal the dataset's (whole rows); otherwise it is a flat slice of
   the same size. This affects how a re-filtered push is stored in transit, not
   which elements are chosen.
+- **Variable-length datasets and attributes are not pushed.** Their in-memory
+  form is pointers, which mean nothing in another process, so a subscription
+  to one receives nothing; read it from the file. (It used to push the pointer
+  bytes, from a buffer already freed.) `test/t_vl_push.c`.
 - **`h5py` cannot open a step.** The step API is optional operations; `h5py` has
   no binding for `H5VLfile_optional_op()`. Python reaches the stream through
   the separate `volstream` package instead, as a subscriber only; see
@@ -816,7 +820,7 @@ herr_t H5Fset_stream_queue_policy(hid_t file_id,
 |---|---|---|---|
 | *(none — the default)* | Unconditional synchronous durable replay. Lag is not even measured | None | — |
 | `H5VL_STREAM_QUEUE_BLOCK` | Waits for the consumer to catch up | None — the replay invariant holds for every step | Strict: the network throttles the application |
-| `H5VL_STREAM_QUEUE_DISCARD` | Returns immediately; **the step's data is dropped entirely**. The physical step still exists so later steps stay reachable, but it carries nothing | Yes, deliberately | Fail-soft with bounded memory |
+| `H5VL_STREAM_QUEUE_DISCARD` | Returns immediately; **the step's data is dropped entirely**. The physical step still exists so later steps stay reachable, but it carries nothing. `H5Fend_step()` still succeeds, and leaves a non-fatal frame on the error stack naming the dropped step (check `H5Eget_num()` right after the call) | Yes, deliberately | Fail-soft with bounded memory |
 | `H5VL_STREAM_QUEUE_SPILL` | Returns immediately; writes the step's manifest and payload to node-local storage instead of the (congested) shared file. A later `H5Fend_step()` drains the spill once the consumer recovers | None, deferred | Fail-soft with no loss |
 
 `reserve_slots` is how many steps a consumer may lag before the policy applies;

@@ -5,6 +5,11 @@ foreach(t t_smoke t_step t_replay t_reader t_deferred t_vl_reject t_manifest_cac
   target_link_libraries(${t} PRIVATE vol_stream)
 endforeach()
 
+# Archival step-count scaling: measures, does not gate. Not registered with
+# ctest -- 10k steps is too slow for every push; run it by hand.
+add_executable(b_step_scale b_step_scale.c)
+target_link_libraries(b_step_scale PRIVATE vol_stream)
+
 add_test(NAME smoke COMMAND t_smoke)
 add_test(NAME step COMMAND t_step)
 add_test(NAME replay COMMAND t_replay)
@@ -114,6 +119,16 @@ if(VOL_STREAM_HAVE_MERCURY)
       TIMEOUT 60
     )
   endforeach()
+
+  # A variable-length dataset is not pushed: its pointers mean nothing in
+  # another process, and the buffer holding them was already freed.
+  add_executable(t_vl_push t_vl_push.c)
+  target_link_libraries(t_vl_push PRIVATE vol_stream)
+  add_test(NAME vl_push COMMAND t_vl_push)
+  set_tests_properties(vl_push PROPERTIES
+    ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
+    TIMEOUT 60
+  )
 
   # Phase 1's gate: one large push (256 MiB by default; T_BULK_MIB overrides,
   # e.g. 1024 for the RFC's 1 GiB) goes by bulk and arrives intact, while a
