@@ -215,11 +215,11 @@ still announced. Nothing in a healthy two-process run produces one, so
 none of the assertions above can reach the short-step path — the
 "every step is complete" assertion would only notice one by accident. It
 needs fault injection: a way to make the writer drop or time out a chosen
-push. There is none today. The honest options are to add one (an
-environment-gated hook in the push path, test-only) as its own S-sized
-task, or to ship P2's short-step check untested and say so. This plan
-recommends the hook, and does not pretend the check is covered until it
-exists.
+push. There was none, so the recommended option was built: an
+environment-gated, test-only hook in the push path,
+`VOL_STREAM_TEST_DROP_PUSH=<k>`, which makes the writer skip its k-th push
+while still announcing the step. `python_stream_drop` uses it to check that
+the step with the lost push arrives masked on exactly that row.
 
 **Exit gate:** `t_step_grouping` passes in the na+sm CI job, fails if
 step-ready is ever sent before that step's pushes are queued, and includes
@@ -262,8 +262,8 @@ Three rules the reassembly layer follows, each traceable to risk 2:
   raise, because a dropped push cannot be told apart from a writer that
   wrote only part of the object this step (`b_push_fanout`'s tail-only
   writes), and a predicate subscription is partial by design. The mask is
-  the flag. *The dropped-push case is untested until P0's fault-injection
-  hook exists* — see P0.
+  the flag. The dropped-push case is tested with P0's fault-injection hook
+  (`python_stream_drop`).
 
 **Exit gate:** a Python consumer receives *N* steps of a fragmented
 (multi-run) subscription as correctly-shaped NumPy arrays whose values
@@ -382,9 +382,6 @@ supported, or depends on something outside this binding.
 
 ### Untested
 
-- **A dropped push.** P2 masks the missing elements, but nothing makes the
-  writer drop a push, so that path has never run. Needs the fault-injection
-  hook described under P0.
 - **`ofi+tcp`.** Every Python test runs over `na+sm`. The C suite's `ofi+tcp`
   pass is a subset and non-gating.
 - **Two Files open at once in one process**, including two on the same file.
@@ -428,6 +425,14 @@ supported, or depends on something outside this binding.
 - **Reassembly copies.** A step that arrives as one push covering the whole
   selection is returned as a view with no copy. Anything else (several
   pushes, or a strided selection) is copied into a new array.
+
+### Packaging
+
+- **Stale RPATH entries on macOS.** Installed with Homebrew GCC, the
+  extension's RPATH still lists pip's temporary build directory (deleted
+  after the install) and GCC's library directories. The package imports and
+  its tests pass from outside the source tree, so this is cosmetic. Not
+  investigated further; on Linux CI it has not been checked either way.
 
 ## What this does not fix
 

@@ -732,6 +732,7 @@ connector layout:
 | `VOL_STREAM_PUSH_STATS` | any non-`0` value | off | Report per-push timing from the transport |
 | `VOL_STREAM_DEBUG_REFILTER` | any value | off | Trace per-subscriber re-filtering |
 | `VOL_STREAM_DEBUG_PREDICATE` | any value | off | Trace predicate evaluation |
+| `VOL_STREAM_TEST_DROP_PUSH` | push index `k` | unset | **Test only.** The writer silently skips the k-th data push it issues (counting from 0), while still announcing the step, so tests can reach a subscriber's lost-push handling. Never set it in production |
 
 > [!TIP]
 > `na+sm` (shared memory) is the fastest local option but its zero-copy path

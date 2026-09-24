@@ -82,7 +82,7 @@ if(VOL_STREAM_BUILD_TESTS)
     target_link_libraries(py_stream_writer PRIVATE vol_stream)
     # P2 and P4: whole steps, iteration, get()-only, and the torch dataset
     # (skipped when torch is not installed).
-    foreach(mode column narrowing iterate getonly torch eos)
+    foreach(mode column narrowing iterate getonly torch eos drop)
       add_test(NAME python_stream_${mode}
         COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_stream.py
                 $<TARGET_FILE:py_stream_writer> ${mode})

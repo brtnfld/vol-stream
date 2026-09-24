@@ -19,8 +19,11 @@ ctest entry per mode) so every scenario gets a fresh transport.
              is not installed.
   eos        The writer commits three steps and closes. Unbounded iteration
              must yield all three and then end by itself.
+  drop       The column scenario with one push lost on the way (the writer's
+             test-only VOL_STREAM_TEST_DROP_PUSH): that step must arrive as a
+             masked array with exactly the lost row masked.
 
-usage: test_stream.py <stream_writer executable> <column|narrowing|iterate|getonly|torch|eos>
+usage: test_stream.py <stream_writer executable> <column|narrowing|iterate|getonly|torch|eos|drop>
 """
 
 import os
@@ -45,6 +48,7 @@ def value(s, r, c):
 
 class StreamTest(unittest.TestCase):
     mode = None
+    writer_env = {}
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -52,6 +56,7 @@ class StreamTest(unittest.TestCase):
         self.path = os.path.join(self.tmp.name, "stream.h5")
         env = dict(os.environ)
         env.setdefault("VOL_STREAM_NA", "na+sm")
+        env.update(self.writer_env)
         self.writer = subprocess.Popen([WRITER, self.mode, self.path, self.sync], env=env)
         self.file = None
 
@@ -172,6 +177,37 @@ class NarrowingTest(StreamTest):
         self.assert_writer_ok()
 
 
+class DropTest(StreamTest):
+    mode = "column"
+    # Step 0 is committed before the reader subscribes, so it sends nothing;
+    # steps 1 and 2 send one push per row. Push 9 is step 2, row 3.
+    DROPPED_STEP, DROPPED_ROW = 2, 3
+    writer_env = {"VOL_STREAM_TEST_DROP_PUSH": str(ROWS * (DROPPED_STEP - 1) + DROPPED_ROW)}
+
+    def test_lost_push_is_masked(self):
+        self.attach()
+        self.file.subscribe({"/grid": ((0, COL), (ROWS, 1))})
+        self.touch("ready")
+        for s in range(1, LAST + 1):
+            if s > LOCKSTEP:
+                self.wait_for("writes_done")
+            step = self.file.next_step(20000)
+            self.assertIsNotNone(step, f"step {s} never arrived")
+            a = step["/grid"]
+            expected = np.array([[value(s, r, COL)] for r in range(ROWS)], dtype=np.int32)
+            if s == self.DROPPED_STEP:
+                self.assertIsInstance(a, np.ma.MaskedArray, "a step with a lost push came back as complete")
+                self.assertEqual(a.mask[:, 0].tolist(), [r == self.DROPPED_ROW for r in range(ROWS)])
+                keep = [r for r in range(ROWS) if r != self.DROPPED_ROW]
+                np.testing.assert_array_equal(a.data[keep], expected[keep])
+            else:
+                self.assertNotIsInstance(a, np.ma.MaskedArray, f"step {s} arrived incomplete")
+                np.testing.assert_array_equal(a, expected, err_msg=f"step {s}")
+            if s <= LOCKSTEP:
+                self.touch(f"ack.{s}")
+        self.assert_writer_ok()
+
+
 def whole_grid(s):
     return np.array([[value(s, r, c) for c in range(COLS)] for r in range(ROWS)], dtype=np.int32)
 
@@ -271,7 +307,7 @@ if __name__ == "__main__":
     WRITER = sys.argv.pop(1)
     mode = sys.argv.pop(1)
     cases = {"column": ColumnTest, "narrowing": NarrowingTest, "iterate": IterateTest,
-             "getonly": GetOnlyTest, "torch": TorchTest, "eos": EndOfStreamTest}
+             "getonly": GetOnlyTest, "torch": TorchTest, "eos": EndOfStreamTest, "drop": DropTest}
     if mode not in cases:
         sys.exit(__doc__)
     if mode == "torch":

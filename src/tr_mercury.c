@@ -483,6 +483,12 @@ struct vs_tr_t {
      * it needs no lock. */
     uint64_t bytes_pushed;
 
+    /* Test-only fault injection, same thread as bytes_pushed: pushes issued so
+     * far, and the one to drop (VOL_STREAM_TEST_DROP_PUSH), or -1 for none.
+     * See vs_tr_push_one_item(). */
+    uint64_t n_pushes_issued;
+    int64_t  test_drop_push;
+
     /* Writer side: data pushes forwarded but not yet completed (see
      * vs_tr_inflight_t and vs_tr_push_one_item()). Touched only by the
      * application's own step thread -- the thread that runs replay, and so
@@ -1499,6 +1505,16 @@ vs_tr_start(const char *na_str)
 
     if (NULL == (tr = (vs_tr_t *)calloc(1, sizeof(*tr))))
         return NULL;
+
+    /* Test-only: VOL_STREAM_TEST_DROP_PUSH=<k> makes this writer silently skip
+     * the k-th data push it issues (counting from 0, across all subscribers
+     * and steps). Unset, which is the only sane production setting, drops
+     * nothing. */
+    {
+        const char *e = getenv("VOL_STREAM_TEST_DROP_PUSH");
+
+        tr->test_drop_push = (e && *e) ? (int64_t)strtoll(e, NULL, 10) : -1;
+    }
 
     /* Both roles receive RPCs, so both need MARGO_SERVER_MODE and a real
      * listening address, not the lighter client-only path. */
@@ -2754,6 +2770,19 @@ vs_tr_push_one_item(vs_tr_t *tr, hg_addr_t addr, vs_member_id_t member_id, uint6
     hg_handle_t         handle;
     int                  unreachable = 0;
     uint64_t             t0          = 0;
+
+    /* Test-only: a push lost on the way. The step is still announced as
+     * usual, which is exactly what a subscriber sees when a real push fails,
+     * and the only way to reach its short-step handling in a healthy run. */
+    if (tr) {
+        int drop = tr->test_drop_push >= 0 && tr->n_pushes_issued == (uint64_t)tr->test_drop_push;
+
+        tr->n_pushes_issued++;
+        if (drop) {
+            free(payload_owned);
+            return 0;
+        }
+    }
 
     in.physical_step  = physical_step;
     in.path            = (hg_string_t)(uintptr_t)path;
