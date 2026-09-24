@@ -218,6 +218,38 @@ void vs_tr_set_convert_cb(vs_tr_t *tr, vs_tr_convert_fn fn);
 int vs_tr_reader_subscribe_type(vs_tr_t *tr, const char *path, const uint8_t *type_enc,
                                   uint64_t type_enc_len);
 
+/* Reader side, backfill: vs_tr_reader_subscribe() creating the subscription
+ * STAGED, to be served from committed step start_step. From the first staged
+ * subscription until the backfill is served, the writer sends this reader
+ * neither pushes nor step announcements. */
+int vs_tr_reader_subscribe_staged(vs_tr_t *tr, const char *path, uint64_t sel_start, uint64_t sel_count,
+                                  const uint8_t *dcpl_enc, uint64_t dcpl_enc_len, const uint8_t *space_enc,
+                                  uint64_t space_enc_len, uint64_t start_step);
+
+/* Release every staged subscription of this reader for backfill: the writer
+ * then sends each committed step from the earliest start_step, in order,
+ * before live delivery resumes. Returns 0 only if the writer had any staged. */
+int vs_tr_reader_release_backfill(vs_tr_t *tr);
+
+/* Writer side, on the application's own thread: take the pending backfill
+ * requests of one subscriber. On 1, *member_id is that subscriber, *paths
+ * (n_paths entries, each and the array malloc'd -- caller frees) its paths,
+ * and *start_step the earliest step any of them asked for; the requests are
+ * no longer pending. 0 when nothing is pending. */
+int vs_tr_writer_take_backfill(vs_tr_t *tr, uint64_t *member_id, char ***paths, size_t *n_paths,
+                               uint64_t *start_step);
+
+/* vs_tr_writer_push_data() to one subscriber only, with no native chunk
+ * context (a backfill reads the data back rather than capturing it). */
+int vs_tr_writer_push_data_to(vs_tr_t *tr, uint64_t member_id, uint64_t physical_step, const char *path,
+                              const void *buf, uint64_t elem_size, uint64_t write_start,
+                              uint64_t write_count, const uint8_t *type_enc, uint64_t type_enc_len,
+                              const uint8_t *space_enc, uint64_t space_enc_len);
+
+/* Announce physical_step to one subscriber only, after completing every push
+ * in flight -- the backfill's counterpart of the step-ready broadcast. */
+int vs_tr_writer_announce_to(vs_tr_t *tr, uint64_t member_id, uint64_t physical_step, uint64_t wall_time_ns);
+
 /* M9 predicate pushdown: one maximal contiguous run of matching elements,
  * counted in elements relative to the overlap slice handed to
  * vs_tr_predicate_fn -- start == 0 is that slice's first element, not the

@@ -662,9 +662,16 @@ RawFile_subscribe(RawFileObject *self, PyObject *args)
     herr_t       status = -1;
     hdf5_err_t   err    = {{0}, 0};
     PyObject    *result = NULL;
+    PyObject    *from_obj = Py_None;
+    unsigned long long from_step = 0;
 
-    if (!PyArg_ParseTuple(args, "O:subscribe", &entries) || check_usable(self) < 0)
+    if (!PyArg_ParseTuple(args, "O|O:subscribe", &entries, &from_obj) || check_usable(self) < 0)
         return NULL;
+    if (from_obj != Py_None) {
+        from_step = PyLong_AsUnsignedLongLong(from_obj);
+        if (PyErr_Occurred())
+            return NULL;
+    }
     if (NULL == (fast = PySequence_Fast(entries, "subscribe() takes a sequence of entries")))
         return NULL;
     if ((n = PySequence_Fast_GET_SIZE(fast)) == 0) {
@@ -709,7 +716,10 @@ RawFile_subscribe(RawFileObject *self, PyObject *args)
             status = -1;
     }
     if (status >= 0)
-        status = H5Fsubscribe(self->fid, (size_t)n, paths, spaces, any_deflate ? plists : NULL);
+        status = from_obj != Py_None
+                     ? H5Fsubscribe_from(self->fid, (uint64_t)from_step, (size_t)n, paths, spaces,
+                                         any_deflate ? plists : NULL)
+                     : H5Fsubscribe(self->fid, (size_t)n, paths, spaces, any_deflate ? plists : NULL);
     if (status < 0)
         capture_error(&err);
     for (i = 0; i < n; i++) {
@@ -985,7 +995,8 @@ static PyMethodDef RawFile_methods[] = {
     {"schema", (PyCFunction)RawFile_schema, METH_VARARGS,
      "schema(timeout_ms) -> (step, [(path, is_attr, dims, type_json)])"},
     {"subscribe", (PyCFunction)RawFile_subscribe, METH_VARARGS,
-     "subscribe([(path, dims, start, count[, deflate[, chunk]]), ...]); start/count None for the whole extent"},
+     "subscribe([(path, dims, start, count[, deflate[, chunk]]), ...][, from_step]); start/count None for "
+     "the whole extent; from_step backfills the steps missed from that one (H5Fsubscribe_from)"},
     {"subscribe_type", (PyCFunction)RawFile_subscribe_type, METH_VARARGS,
      "subscribe_type(path, kind, size); kind None clears the narrowing"},
     {"subscribe_predicate", (PyCFunction)RawFile_subscribe_predicate, METH_VARARGS,

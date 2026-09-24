@@ -312,7 +312,7 @@ class File:
             for path, is_attr, dims, type_json in entries
         }
 
-    def subscribe(self, selections, timeout_ms=10000, deflate=None, expect=None):
+    def subscribe(self, selections, timeout_ms=10000, deflate=None, expect=None, from_step=None):
         """Subscribe to one or more datasets.
 
         selections is a path, a list of paths, or a dict mapping each path to
@@ -327,6 +327,12 @@ class File:
         the schema once it exists (when the first step arrives), and a type,
         rank, or trailing dimension that does not match raises Error rather
         than misplacing data.
+
+        from_step=k backfills: the writer also sends every step it committed
+        from k on (the steps this reader missed by joining late), each with
+        its data, before the live ones -- every step once, in order. It must
+        be the file's first subscribe(), and the writer serves it at its
+        next step boundary. See H5Fsubscribe_from() in the C API.
 
         The first subscribe() on a file also discards every step committed
         before it: those steps carry nothing for this reader, including the
@@ -381,7 +387,10 @@ class File:
         # released by H5Fwait_subscribers() can announce its next step as
         # soon as the subscription reaches it, before this call returns.
         last = self._discard_backlog() if not self._subs else None
-        self._raw.subscribe(entries)
+        if from_step is None:
+            self._raw.subscribe(entries)
+        else:
+            self._raw.subscribe(entries, int(from_step))
         self._subs.update(subs)
         self._unverified.update((p, declared[p]) for p in subs if p in declared and p not in schema)
         if last is not None and self.backpressure:

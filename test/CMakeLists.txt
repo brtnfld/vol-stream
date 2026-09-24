@@ -123,6 +123,16 @@ if(VOL_STREAM_HAVE_MERCURY)
     )
   endforeach()
 
+  # Backfill for a late joiner: H5Fsubscribe_from() delivers the missed steps
+  # from the writer's file, then the live ones, each once and in order.
+  add_executable(t_backfill t_backfill.c)
+  target_link_libraries(t_backfill PRIVATE vol_stream)
+  add_test(NAME backfill COMMAND t_backfill)
+  set_tests_properties(backfill PROPERTIES
+    ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
+    TIMEOUT 90
+  )
+
   # The transport turned on per file through H5Pset_fapl_stream(), with
   # VOL_STREAM_NA unset.
   add_executable(t_config_na t_config_na.c)

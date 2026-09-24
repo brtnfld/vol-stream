@@ -1334,6 +1334,40 @@ vs_tr_set_refilter_shape_cb(vs_tr_t *tr, vs_tr_refilter_shape_fn fn)
         tr->unsupported |= VS_DSA_UNSUP_SHAPE;
 }
 
+/* Backfill is not supported on this backend: the writer cannot push to one
+ * consumer alone through a Diaspora topic. */
+int
+vs_tr_reader_subscribe_staged(vs_tr_t *, const char *, uint64_t, uint64_t, const uint8_t *, uint64_t,
+                              const uint8_t *, uint64_t, uint64_t)
+{
+    return -1;
+}
+
+int
+vs_tr_reader_release_backfill(vs_tr_t *)
+{
+    return -1;
+}
+
+int
+vs_tr_writer_take_backfill(vs_tr_t *, uint64_t *, char ***, size_t *, uint64_t *)
+{
+    return 0;
+}
+
+int
+vs_tr_writer_push_data_to(vs_tr_t *, uint64_t, uint64_t, const char *, const void *, uint64_t, uint64_t,
+                          uint64_t, const uint8_t *, uint64_t, const uint8_t *, uint64_t)
+{
+    return -1;
+}
+
+int
+vs_tr_writer_announce_to(vs_tr_t *, uint64_t, uint64_t, uint64_t)
+{
+    return -1;
+}
+
 void
 vs_tr_set_bulk_threshold(vs_tr_t *, int64_t)
 {

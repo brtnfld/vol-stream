@@ -1232,6 +1232,17 @@ matches the code. Each item is documented for users in
   first, and end_step collects its notes and pushes them as its last action.
   A `Discard` drop is reported that way (`t_queue_policy`), and so is the
   parallel Spill-as-Block warning, which had never been visible.
+- **Backfill for late joiners: `H5Fsubscribe_from()`.** A reader that joins
+  at step 500 can get steps from any earlier one. The writer reads each
+  missed step back from its own file on its own thread (HDF5 is not
+  thread-safe, so the subscribe handler only records the request) and sends
+  it to that reader alone before the next live step. The subscriptions are
+  created staged and released together, and the reader gets nothing live
+  until it is served, so every step arrives once and in order. Reading the
+  history reader-side was rejected: the file is not consistent on disk while
+  the writer runs (no per-step flush, and HDF5 does not support reading a
+  file another process writes, outside SWMR). `t_backfill`,
+  `python_stream_backfill`.
 - **The connector's error frames reach the caller.** Frames are buffered
   while a connector callback runs and pushed as its last action, so the
   connector's own HDF5 calls after a failure -- cleanup, closes -- no longer
@@ -1299,8 +1310,9 @@ the one list. ★ marks what is being worked on next.
 - Variable-length objects are not pushed to subscribers (they are read from
   the file). Pushing their serialized form, with a reader-side decode, would
   close this.
-- Subscriptions are not retroactive: a reader that joins at step 500 cannot
-  get the steps it missed (subscribe-with-start-step).
+- Backfill (`H5Fsubscribe_from()`) must be a reader's first subscription,
+  waits for the writer's next step boundary, and is not on the diaspora
+  backend.
 - A reader that vanishes without closing costs the writer up to one push
   timeout (1 s) per step until SWIM declares it dead -- about 5 s in CI, after
   which its subscriptions are dropped. Accepted as the bound: skipping a

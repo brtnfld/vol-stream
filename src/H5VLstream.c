@@ -342,6 +342,7 @@ struct H5VL_stream_file_state_t {
     /* Per-file settings from the FAPL (H5Pset_fapl_stream()); an environment
      * variable that is set overrides each -- see the H5VL__stream_cfg_*()
      * helpers. */
+    int                          has_subscribed;     /* a reader's first subscribe has been made */
     char                        *cfg_na;             /* NULL: no transport */
     int                          cfg_stage_payload;  /* -1 default (on) */
     uint64_t                     cfg_max_pending;    /* 0: no limit */
@@ -1054,6 +1055,7 @@ typedef struct H5VL_stream_args_subscribe_t {
     const char *const  *paths;
     const hid_t        *spaces;
     const hid_t        *plists;
+    uint64_t            start_step; /* H5Fsubscribe_from(); UINT64_MAX for H5Fsubscribe() */
 } H5VL_stream_args_subscribe_t;
 
 /* M9 */
@@ -11443,6 +11445,159 @@ H5VL_stream_file_specific(void *file, H5VL_file_specific_args_t *args, hid_t dxp
     return ret_value;
 } /* end H5VL_stream_file_specific() */
 
+#ifdef VOL_STREAM_HAVE_MERCURY
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_backfill_one
+ *
+ * Purpose:     Push one path's value at committed step k to one subscriber,
+ *              read back from this writer's own /step/<k>/ copy. A dataset
+ *              goes whole; an attribute ("/T@scale") likewise. A
+ *              variable-length object is skipped, as the live push skips it.
+ *              Best-effort: a failure leaves that step without this path,
+ *              which the subscriber sees exactly as a lost push.
+ *-------------------------------------------------------------------------
+ */
+static void
+H5VL__stream_backfill_one(H5VL_stream_file_state_t *fs, uint64_t member, const char *path, uint64_t k)
+{
+    const char       *at = strchr(path, '@');
+    char              full[1024];
+    H5VL_loc_params_t loc;
+    void             *obj = NULL;
+    hid_t             ftype = H5I_INVALID_HID, mtype = H5I_INVALID_HID, space = H5I_INVALID_HID;
+    hssize_t          n     = 0;
+    size_t            esize = 0;
+    void             *buf   = NULL;
+    uint8_t          *tenc = NULL, *senc = NULL;
+    size_t            tlen = 0, slen = 0;
+    int               ok = 0;
+
+    memset(&loc, 0, sizeof(loc));
+    loc.obj_type = H5I_FILE;
+    if (at) {
+        snprintf(full, sizeof(full), "/step/%llu%.*s", (unsigned long long)k, (int)(at - path), path);
+        loc.type                         = H5VL_OBJECT_BY_NAME;
+        loc.loc_data.loc_by_name.name    = full;
+        loc.loc_data.loc_by_name.lapl_id = H5P_LINK_ACCESS_DEFAULT;
+        obj = H5VLattr_open(H5VL__stream_file_under(fs), &loc, fs->file_under_vol_id, at + 1,
+                            H5P_ATTRIBUTE_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL);
+    }
+    else {
+        snprintf(full, sizeof(full), "/step/%llu%s", (unsigned long long)k, path);
+        loc.type = H5VL_OBJECT_BY_SELF;
+        obj      = H5VLdataset_open(H5VL__stream_file_under(fs), &loc, fs->file_under_vol_id, full,
+                                    H5P_DATASET_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL);
+    }
+    if (!obj)
+        return;
+
+    if (at) {
+        H5VL_attr_get_args_t g;
+
+        g.op_type = H5VL_ATTR_GET_TYPE;
+        if (H5VLattr_get(obj, fs->file_under_vol_id, &g, H5P_DATASET_XFER_DEFAULT, NULL) < 0)
+            goto done;
+        ftype     = g.args.get_type.type_id;
+        g.op_type = H5VL_ATTR_GET_SPACE;
+        if (H5VLattr_get(obj, fs->file_under_vol_id, &g, H5P_DATASET_XFER_DEFAULT, NULL) < 0)
+            goto done;
+        space = g.args.get_space.space_id;
+    }
+    else {
+        H5VL_dataset_get_args_t g;
+
+        g.op_type = H5VL_DATASET_GET_TYPE;
+        if (H5VLdataset_get(obj, fs->file_under_vol_id, &g, H5P_DATASET_XFER_DEFAULT, NULL) < 0)
+            goto done;
+        ftype     = g.args.get_type.type_id;
+        g.op_type = H5VL_DATASET_GET_SPACE;
+        if (H5VLdataset_get(obj, fs->file_under_vol_id, &g, H5P_DATASET_XFER_DEFAULT, NULL) < 0)
+            goto done;
+        space = g.args.get_space.space_id;
+    }
+
+    if ((mtype = H5Tget_native_type(ftype, H5T_DIR_DEFAULT)) < 0 ||
+        H5VL__stream_type_vl_kind(mtype) != H5VL_STREAM_VL_NONE || (esize = H5Tget_size(mtype)) == 0 ||
+        (n = H5Sget_simple_extent_npoints(space)) <= 0 || NULL == (buf = malloc((size_t)n * esize)))
+        goto done;
+
+    if (at) {
+        if (H5VLattr_read(obj, fs->file_under_vol_id, mtype, buf, H5P_DATASET_XFER_DEFAULT, NULL) < 0)
+            goto done;
+    }
+    else {
+        hid_t all = H5S_ALL;
+
+        if (H5VLdataset_read(1, &obj, fs->file_under_vol_id, &mtype, &all, &all, H5P_DATASET_XFER_DEFAULT,
+                             &buf, NULL) < 0)
+            goto done;
+    }
+
+    H5VL__stream_encode_type(mtype, &tenc, &tlen);
+    H5VL__stream_encode_space(space, &senc, &slen);
+    vs_tr_writer_push_data_to(fs->transport, member, k, path, buf, (uint64_t)esize, 0, (uint64_t)n, tenc,
+                              (uint64_t)tlen, senc, (uint64_t)slen);
+    ok = 1;
+
+done:
+    (void)ok;
+    free(tenc);
+    free(senc);
+    free(buf);
+    if (mtype >= 0)
+        H5Tclose(mtype);
+    if (ftype >= 0)
+        H5Tclose(ftype);
+    if (space >= 0)
+        H5Sclose(space);
+    if (at)
+        H5VLattr_close(obj, fs->file_under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+    else
+        H5VLdataset_close(obj, fs->file_under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+} /* end H5VL__stream_backfill_one() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_serve_backfill
+ *
+ * Purpose:     Serve every pending H5Fsubscribe_from() request, on the
+ *              writer's own thread -- the subscribe handler only records
+ *              them, since serving one reads the file. For each subscriber,
+ *              each committed step from the one it asked for: push every
+ *              requested path that step wrote, then announce the step to
+ *              that subscriber alone (after its pushes complete, the order
+ *              the live broadcast keeps). Called before a step's own pushes
+ *              begin, so a backfill never interleaves with a live step.
+ *-------------------------------------------------------------------------
+ */
+static void
+H5VL__stream_serve_backfill(H5VL_stream_file_state_t *fs)
+{
+    uint64_t member, from, k;
+    char   **paths;
+    size_t   n, i;
+
+    if (!fs || fs->is_reader || !fs->transport)
+        return;
+
+    while (vs_tr_writer_take_backfill(fs->transport, &member, &paths, &n, &from)) {
+        /* Committed steps are 0 .. physical_step-1, both at H5Fbegin_step()
+         * and inside an open step. */
+        for (k = from; k < fs->physical_step; k++) {
+            for (i = 0; i < n; i++) {
+                uint64_t resolved;
+
+                if (H5VL__stream_path_index_resolve(fs, paths[i], k, &resolved) >= 0 && resolved == k)
+                    H5VL__stream_backfill_one(fs, member, paths[i], k);
+            }
+            vs_tr_writer_announce_to(fs->transport, member, k, 0);
+        }
+        for (i = 0; i < n; i++)
+            free(paths[i]);
+        free(paths);
+    }
+} /* end H5VL__stream_serve_backfill() */
+#endif /* VOL_STREAM_HAVE_MERCURY */
+
 /*-------------------------------------------------------------------------
  * Function:    H5VL_stream_file_optional
  *
@@ -11518,6 +11673,12 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
                                  "H5Fend_step() before opening another",
                                  -1);
 
+#ifdef VOL_STREAM_HAVE_MERCURY
+        /* A late joiner's H5Fsubscribe_from(), served before this step can
+         * push anything. */
+        H5VL__stream_serve_backfill(o->file_state);
+#endif
+
         /* Take our own copy of the logical ids -- the caller's array is only
          * required to live for the duration of the call. */
         free(o->file_state->logical_ids);
@@ -11545,6 +11706,12 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
                                  "no step is open on this file -- H5Fend_step() must be preceded by a "
                                  "matching H5Fbegin_step()",
                                  -1);
+
+#ifdef VOL_STREAM_HAVE_MERCURY
+        /* A backfill requested while this step was open, served before the
+         * step's own pushes go out in replay below. */
+        H5VL__stream_serve_backfill(o->file_state);
+#endif
 
         o->file_state->step_state = H5F_STEP_COMMITTING;
 
@@ -11706,6 +11873,27 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
             }
         }
 
+        /* H5Fsubscribe_from(): the reader's first subscription, staged and
+         * then released for backfill in one go -- see its doc comment. A
+         * later one would leave earlier live subscriptions interleaving with
+         * the backfilled steps. */
+        if (sargs->start_step != UINT64_MAX) {
+            if (!o->file_state || !o->file_state->is_reader)
+                H5VL_STREAM_GOTO_ERR(H5VL_stream_err_step_g, "H5Fsubscribe_from() is a reader-only call",
+                                     -1);
+#ifdef VOL_STREAM_HAVE_MERCURY
+            if (!o->file_state->transport)
+                H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                                     "H5Fsubscribe_from() needs the transport -- set VOL_STREAM_NA", -1);
+#else
+            H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                                 "this connector was built without the Mercury transport", -1);
+#endif
+            if (o->file_state->has_subscribed)
+                H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                                     "H5Fsubscribe_from() must be this reader's first subscription", -1);
+        }
+
 #ifdef VOL_STREAM_HAVE_MERCURY
         if (o->file_state && o->file_state->transport) {
             for (size_t i = 0; i < sargs->count; i++) {
@@ -11727,12 +11915,23 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
                  * can honor a non-contiguous one exactly. Best-effort: a
                  * failed encode simply leaves routing on the span. */
                 H5VL__stream_encode_space(sargs->spaces[i], &space_enc, &space_enc_len);
-                vs_tr_reader_subscribe(o->file_state->transport, sargs->paths[i], sel_start, sel_count,
-                                         dcpl_enc, (uint64_t)dcpl_enc_len, space_enc,
-                                         (uint64_t)space_enc_len);
+                if (sargs->start_step != UINT64_MAX)
+                    vs_tr_reader_subscribe_staged(o->file_state->transport, sargs->paths[i], sel_start,
+                                                  sel_count, dcpl_enc, (uint64_t)dcpl_enc_len, space_enc,
+                                                  (uint64_t)space_enc_len, sargs->start_step);
+                else
+                    vs_tr_reader_subscribe(o->file_state->transport, sargs->paths[i], sel_start, sel_count,
+                                           dcpl_enc, (uint64_t)dcpl_enc_len, space_enc,
+                                           (uint64_t)space_enc_len);
                 free(dcpl_enc);
                 free(space_enc);
             }
+            o->file_state->has_subscribed = 1;
+            if (sargs->start_step != UINT64_MAX && vs_tr_reader_release_backfill(o->file_state->transport) < 0)
+                H5VL_STREAM_GOTO_ERR(H5VL_stream_err_transport_g,
+                                     "the writer holds no staged subscription to backfill -- did the "
+                                     "subscribe reach it?",
+                                     -1);
         }
 #endif
         return 0;
@@ -13038,6 +13237,7 @@ H5VL_stream_introspect_opt_query(void *obj, H5VL_subclass_t cls, int opt_type, u
         *flags = H5VL_OPT_QUERY_SUPPORTED | H5VL_OPT_QUERY_MODIFY_METADATA;
         return 0;
     }
+
     else if (cls == H5VL_SUBCLS_FILE && opt_type == H5VL_stream_op_wait_subscribers) {
         *flags = H5VL_OPT_QUERY_SUPPORTED | H5VL_OPT_QUERY_QUERY_METADATA;
         return 0;
@@ -13717,13 +13917,32 @@ H5Fsubscribe(hid_t file_id, size_t count, const char *const *paths, const hid_t 
     if (count > 0 && (!paths || !spaces))
         return -1;
 
-    op_args.count  = count;
-    op_args.paths  = paths;
-    op_args.spaces = spaces;
-    op_args.plists = plists;
+    op_args.count      = count;
+    op_args.paths      = paths;
+    op_args.spaces     = spaces;
+    op_args.plists     = plists;
+    op_args.start_step = UINT64_MAX;
 
     return H5VL__stream_file_op(file_id, H5VL_stream_op_subscribe, &op_args);
 } /* end H5Fsubscribe() */
+
+herr_t
+H5Fsubscribe_from(hid_t file_id, uint64_t start_step, size_t count, const char *const *paths,
+                  const hid_t *spaces, const hid_t *plists)
+{
+    H5VL_stream_args_subscribe_t op_args;
+
+    if (count == 0 || !paths || !spaces)
+        return -1;
+
+    op_args.count      = count;
+    op_args.paths      = paths;
+    op_args.spaces     = spaces;
+    op_args.plists     = plists;
+    op_args.start_step = start_step == UINT64_MAX ? UINT64_MAX - 1 : start_step;
+
+    return H5VL__stream_file_op(file_id, H5VL_stream_op_subscribe, &op_args);
+} /* end H5Fsubscribe_from() */
 
 herr_t
 H5Fsubscribe_predicate(hid_t file_id, const char *path, H5VL_stream_pred_op_t op, hid_t type_id,
@@ -13788,6 +14007,7 @@ H5Fsubscribe_type(hid_t file_id, const char *path, hid_t type_id)
 
     return H5VL__stream_file_op(file_id, H5VL_stream_op_subscribe_type, &op_args);
 } /* end H5Fsubscribe_type() */
+
 
 herr_t
 H5Fwait_subscribers(hid_t file_id, uint64_t n_expected, uint64_t timeout_ms)

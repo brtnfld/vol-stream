@@ -229,10 +229,19 @@ hg_proc_vs_blob_t(hg_proc_t proc, void *data)
  * narrow-an-existing-subscription shape as PRED_ONLY above. A 0-length
  * type_enc clears the narrowing and restores the dataset's own type. */
 #define VS_SUB_FLAG_TYPE_ONLY 0x2u
+/* Backfill, in two parts. A plain subscribe carrying a start_step (not
+ * UINT64_MAX) creates the subscription STAGED: inactive, and from then on
+ * its member gets neither pushes nor step announcements. A FROM_ONLY request
+ * then releases every staged subscription of the member together, and the
+ * writer serves them on its own thread (vs_tr_writer_take_backfill()): every
+ * committed step from the earliest start_step, in order, before live
+ * delivery resumes. Every step the member missed while staged falls inside
+ * that range, so it sees each step once and in order. */
+#define VS_SUB_FLAG_FROM_ONLY 0x4u
 MERCURY_GEN_PROC(vs_subscribe_in_t, ((uint64_t)(member_id))((hg_string_t)(path))((uint64_t)(sel_start))(
                                           (uint64_t)(sel_count))((vs_blob_t)(dcpl_enc))((uint32_t)(flags))(
                                           (vs_blob_t)(pred_enc))((vs_blob_t)(space_enc))(
-                                          (vs_blob_t)(type_enc)))
+                                          (vs_blob_t)(type_enc))((uint64_t)(start_step)))
 MERCURY_GEN_PROC(vs_subscribe_out_t, ((int32_t)(status))((int32_t)(matched)))
 /* M8: writer -> reader, one entry's actual bytes. M8.5: elem_start/
  * elem_count identify which element range of the subscribed object payload
@@ -359,6 +368,11 @@ typedef struct vs_tr_sub_entry_t {
      * it. */
     uint8_t          *want_type_enc;
     uint64_t          want_type_enc_len;
+    /* Backfill (VS_SUB_FLAG_FROM_ONLY): 0 live, 1 staged, 2 released and
+     * waiting to be served from committed step backfill_from. Anything but 0
+     * holds back pushes and announcements to this member. */
+    int               backfill_state;
+    uint64_t          backfill_from;
 } vs_tr_sub_entry_t;
 
 /* M8, reader side: one pushed data item queued for vs_tr_reader_wait_data().
@@ -553,6 +567,8 @@ struct vs_tr_t {
     vs_tr_inflight_t *inflight;
     size_t             n_inflight;
     size_t             n_borrowed_bulk; /* in-flight pushes pulling from caller memory */
+    int                push_only_set;    /* vs_tr_writer_push_data_to(): one member only */
+    vs_member_id_t     push_only_member;
     int64_t            bulk_threshold;  /* this file's setting, -1 = default */
     size_t             cap_inflight;
 
@@ -1407,10 +1423,23 @@ vs_subscribe_ult(hg_handle_t handle)
         int    found     = 0;
         int    pred_only = (in.flags & VS_SUB_FLAG_PRED_ONLY) != 0;
         int    type_only = (in.flags & VS_SUB_FLAG_TYPE_ONLY) != 0;
+        int    from_only = (in.flags & VS_SUB_FLAG_FROM_ONLY) != 0;
 
         pthread_mutex_lock(&tr->sub_lock);
 
-        for (i = 0; i < tr->n_sub; i++)
+        /* Release the member's staged subscriptions for backfill. Only
+         * recorded here: the writer's own thread serves them, since that
+         * reads the file (HDF5 is not thread-safe, and this runs on a Margo
+         * handler). */
+        if (from_only)
+            for (i = 0; i < tr->n_sub; i++)
+                if (tr->sub_table[i].member_id == (vs_member_id_t)in.member_id &&
+                    tr->sub_table[i].backfill_state == 1) {
+                    tr->sub_table[i].backfill_state = 2;
+                    found                           = 1;
+                }
+
+        for (i = 0; i < tr->n_sub && !from_only; i++)
             if (tr->sub_table[i].member_id == (vs_member_id_t)in.member_id &&
                 strcmp(tr->sub_table[i].path, in.path) == 0) {
                 uint8_t *blob_copy;
@@ -1467,6 +1496,10 @@ vs_subscribe_ult(hg_handle_t handle)
                 free(tr->sub_table[i].want_type_enc);
                 tr->sub_table[i].want_type_enc     = NULL;
                 tr->sub_table[i].want_type_enc_len = 0;
+                if (in.start_step != UINT64_MAX) {
+                    tr->sub_table[i].backfill_state = 1;
+                    tr->sub_table[i].backfill_from  = in.start_step;
+                }
                 found = 1;
                 break;
             }
@@ -1474,7 +1507,7 @@ vs_subscribe_ult(hg_handle_t handle)
         /* PRED_ONLY never creates a subscription: a predicate narrows one
          * that already exists. Reporting !matched lets the caller fail
          * loudly instead of quietly over-sending forever. */
-        if (!found && !pred_only && !type_only) {
+        if (!found && !pred_only && !type_only && !from_only) {
             if (tr->n_sub == tr->cap_sub) {
                 size_t               new_cap = tr->cap_sub ? tr->cap_sub * 2 : 8;
                 vs_tr_sub_entry_t *grown   = (vs_tr_sub_entry_t *)realloc(tr->sub_table,
@@ -1517,6 +1550,10 @@ vs_subscribe_ult(hg_handle_t handle)
                     tr->sub_table[tr->n_sub].pred_enc_len  = 0;
                     tr->sub_table[tr->n_sub].space_enc     = space_copy;
                     tr->sub_table[tr->n_sub].space_enc_len = space_copy_len;
+                    if (in.start_step != UINT64_MAX) {
+                        tr->sub_table[tr->n_sub].backfill_state = 1;
+                        tr->sub_table[tr->n_sub].backfill_from  = in.start_step;
+                    }
                     tr->n_sub++;
                     found = 1;
                 }
@@ -2294,6 +2331,22 @@ vs_tr_reader_get_schema(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *out_physical
     return -1;
 }
 
+/* Has this member a subscription staged or waiting for its backfill? Such a
+ * member is sent no step announcements until it is served -- see
+ * VS_SUB_FLAG_FROM_ONLY. */
+static int
+vs_tr_member_backfilling(vs_tr_t *tr, vs_member_id_t member_id)
+{
+    size_t i;
+    int    yes = 0;
+
+    pthread_mutex_lock(&tr->sub_lock);
+    for (i = 0; i < tr->n_sub && !yes; i++)
+        yes = tr->sub_table[i].member_id == member_id && tr->sub_table[i].backfill_state != 0;
+    pthread_mutex_unlock(&tr->sub_lock);
+    return yes;
+} /* end vs_tr_member_backfilling() */
+
 int
 vs_tr_writer_broadcast_step_ready(vs_tr_t *tr, uint64_t physical_step, uint64_t wall_time_ns)
 {
@@ -2349,6 +2402,8 @@ vs_tr_writer_broadcast_step_ready(vs_tr_t *tr, uint64_t physical_step, uint64_t 
         hg_addr_t        addr;
         hg_handle_t       handle;
 
+        if (vs_tr_member_backfilling(tr, member_id))
+            continue; /* this step reaches it through its backfill instead */
         if (0 != vs_tr_member_addr(tr, member_id, &addr))
             continue;
 
@@ -2655,10 +2710,34 @@ vs_send_subscribe(vs_tr_t *tr, vs_member_id_t self_id, vs_subscribe_in_t *in, in
     return ret;
 }
 
+static int vs_tr_reader_subscribe_at(vs_tr_t *tr, const char *path, uint64_t sel_start, uint64_t sel_count,
+                                     const uint8_t *dcpl_enc, uint64_t dcpl_enc_len, const uint8_t *space_enc,
+                                     uint64_t space_enc_len, uint64_t start_step);
+
 int
 vs_tr_reader_subscribe(vs_tr_t *tr, const char *path, uint64_t sel_start, uint64_t sel_count,
                         const uint8_t *dcpl_enc, uint64_t dcpl_enc_len, const uint8_t *space_enc,
                         uint64_t space_enc_len)
+{
+    return vs_tr_reader_subscribe_at(tr, path, sel_start, sel_count, dcpl_enc, dcpl_enc_len, space_enc,
+                                     space_enc_len, UINT64_MAX);
+}
+
+int
+vs_tr_reader_subscribe_staged(vs_tr_t *tr, const char *path, uint64_t sel_start, uint64_t sel_count,
+                              const uint8_t *dcpl_enc, uint64_t dcpl_enc_len, const uint8_t *space_enc,
+                              uint64_t space_enc_len, uint64_t start_step)
+{
+    if (start_step == UINT64_MAX)
+        start_step = UINT64_MAX - 1; /* UINT64_MAX means "not staged" on the wire */
+    return vs_tr_reader_subscribe_at(tr, path, sel_start, sel_count, dcpl_enc, dcpl_enc_len, space_enc,
+                                     space_enc_len, start_step);
+}
+
+static int
+vs_tr_reader_subscribe_at(vs_tr_t *tr, const char *path, uint64_t sel_start, uint64_t sel_count,
+                          const uint8_t *dcpl_enc, uint64_t dcpl_enc_len, const uint8_t *space_enc,
+                          uint64_t space_enc_len, uint64_t start_step)
 {
     vs_member_id_t     self_id;
     vs_subscribe_in_t in;
@@ -2684,6 +2763,7 @@ vs_tr_reader_subscribe(vs_tr_t *tr, const char *path, uint64_t sel_start, uint64
     in.pred_enc.size = 0;
     in.space_enc.buf  = (void *)(uintptr_t)space_enc;
     in.space_enc.size = space_enc_len;
+    in.start_step     = start_step;
 
     return vs_send_subscribe(tr, self_id, &in, NULL);
 }
@@ -2709,6 +2789,7 @@ vs_tr_reader_subscribe_predicate(vs_tr_t *tr, const char *path, const uint8_t *p
     in.dcpl_enc.buf  = NULL;
     in.dcpl_enc.size = 0;
     in.flags         = VS_SUB_FLAG_PRED_ONLY;
+    in.start_step    = UINT64_MAX;
     in.pred_enc.buf  = (void *)(uintptr_t)pred_enc;
     in.pred_enc.size = pred_enc_len;
     /* Ignored under PRED_ONLY, like sel_start/sel_count above -- the stored
@@ -2747,6 +2828,7 @@ vs_tr_reader_subscribe_type(vs_tr_t *tr, const char *path, const uint8_t *type_e
     in.space_enc.buf  = NULL;
     in.space_enc.size = 0;
     in.flags          = VS_SUB_FLAG_TYPE_ONLY;
+    in.start_step     = UINT64_MAX;
     in.type_enc.buf   = (void *)(uintptr_t)type_enc;
     in.type_enc.size  = type_enc_len;
 
@@ -2754,6 +2836,124 @@ vs_tr_reader_subscribe_type(vs_tr_t *tr, const char *path, const uint8_t *type_e
         return -1;
     return matched ? 0 : -1;
 } /* end vs_tr_reader_subscribe_type() */
+
+int
+vs_tr_reader_release_backfill(vs_tr_t *tr)
+{
+    vs_member_id_t    self_id;
+    vs_subscribe_in_t in;
+    int               matched = 0;
+
+    if (!tr || !tr->in_group)
+        return -1;
+    self_id = tr->self_id;
+
+    memset(&in, 0, sizeof(in));
+    in.member_id  = (uint64_t)self_id;
+    in.path       = (hg_string_t)""; /* every staged subscription of this member */
+    in.sel_count  = UINT64_MAX;
+    in.flags      = VS_SUB_FLAG_FROM_ONLY;
+    in.start_step = UINT64_MAX;
+
+    if (vs_send_subscribe(tr, self_id, &in, &matched) != 0)
+        return -1;
+    return matched ? 0 : -1;
+} /* end vs_tr_reader_release_backfill() */
+
+int
+vs_tr_writer_take_backfill(vs_tr_t *tr, uint64_t *member_id, char ***paths, size_t *n_paths,
+                           uint64_t *start_step)
+{
+    size_t i, n = 0;
+    char **list = NULL;
+    int    found = 0;
+
+    if (!tr || !member_id || !paths || !n_paths || !start_step)
+        return 0;
+
+    pthread_mutex_lock(&tr->sub_lock);
+    for (i = 0; i < tr->n_sub; i++) {
+        vs_tr_sub_entry_t *e = &tr->sub_table[i];
+        char             **grown;
+
+        if (e->backfill_state != 2 || (found && e->member_id != (vs_member_id_t)*member_id))
+            continue;
+        if (!found) {
+            found       = 1;
+            *member_id  = (uint64_t)e->member_id;
+            *start_step = e->backfill_from;
+        }
+        else if (e->backfill_from < *start_step)
+            *start_step = e->backfill_from;
+        if (NULL == (grown = (char **)realloc(list, (n + 1) * sizeof(*list))) ||
+            NULL == (grown[n] = strdup(e->path))) {
+            if (grown)
+                list = grown;
+            break; /* serve what was gathered; the rest stays pending */
+        }
+        list              = grown;
+        n++;
+        e->backfill_state = 0;
+    }
+    pthread_mutex_unlock(&tr->sub_lock);
+
+    *paths   = list;
+    *n_paths = n;
+    return n > 0;
+} /* end vs_tr_writer_take_backfill() */
+
+int
+vs_tr_writer_push_data_to(vs_tr_t *tr, uint64_t member_id, uint64_t physical_step, const char *path,
+                          const void *buf, uint64_t elem_size, uint64_t write_start, uint64_t write_count,
+                          const uint8_t *type_enc, uint64_t type_enc_len, const uint8_t *space_enc,
+                          uint64_t space_enc_len)
+{
+    int ret;
+
+    if (!tr)
+        return -1;
+    tr->push_only_set    = 1;
+    tr->push_only_member = (vs_member_id_t)member_id;
+    ret = vs_tr_writer_push_data(tr, physical_step, path, buf, elem_size, write_start, write_count, type_enc,
+                                 type_enc_len, NULL, 0, NULL, space_enc, space_enc_len);
+    tr->push_only_set = 0;
+    return ret;
+} /* end vs_tr_writer_push_data_to() */
+
+int
+vs_tr_writer_announce_to(vs_tr_t *tr, uint64_t member_id, uint64_t physical_step, uint64_t wall_time_ns)
+{
+    vs_step_ready_in_t in;
+    hg_addr_t          addr;
+    hg_handle_t        handle;
+    int                ret = -1;
+
+    if (!tr || !tr->in_group)
+        return -1;
+
+    /* The same ordering the broadcast keeps: every push of this step is
+     * complete before the step is announced. */
+    vs_tr_drain_pushes(tr);
+
+    if (0 != vs_tr_member_addr(tr, (vs_member_id_t)member_id, &addr))
+        return -1;
+    in.physical_step    = physical_step;
+    in.wall_time_ns     = wall_time_ns;
+    in.writer_member_id = (uint64_t)tr->self_id;
+    if (HG_SUCCESS == margo_create(tr->mid, addr, tr->step_ready_rpc_id, &handle)) {
+        if (HG_SUCCESS == margo_forward_timed(handle, &in, 1000.0)) {
+            vs_step_ready_out_t out;
+
+            if (HG_SUCCESS == margo_get_output(handle, &out)) {
+                margo_free_output(handle, &out);
+                ret = 0;
+            }
+        }
+        margo_destroy(handle);
+    }
+    margo_addr_free(tr->mid, addr);
+    return ret;
+} /* end vs_tr_writer_announce_to() */
 
 /*-------------------------------------------------------------------------
  * Writer-side in-flight push bookkeeping (see vs_tr_inflight_t)
@@ -3099,6 +3299,10 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
 
             if (strcmp(tr->sub_table[si].path, path) != 0)
                 continue;
+            if (tr->push_only_set && tr->sub_table[si].member_id != tr->push_only_member)
+                continue;
+            if (tr->sub_table[si].backfill_state != 0)
+                continue; /* staged or awaiting backfill: nothing live yet */
 
             if (n_snapshot == cap_snapshot) {
                 size_t new_cap = cap_snapshot ? cap_snapshot * 2 : 8;

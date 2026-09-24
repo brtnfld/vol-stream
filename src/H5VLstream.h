@@ -847,6 +847,44 @@ H5VL_STREAM_API herr_t H5Fset_stream_queue_policy(hid_t file_id, H5VL_stream_que
 H5VL_STREAM_API herr_t H5Fsubscribe_type(hid_t file_id, const char *path, hid_t type_id);
 
 /**
+ * \brief Reader only. H5Fsubscribe(), plus the steps this reader missed by
+ *        joining late: the writer sends every committed step from
+ *        \p start_step before the live ones.
+ *
+ * A subscription is not retroactive: it only affects writes after it reaches
+ * the writer. This one is backfilled. For each committed step from
+ * \p start_step to its current one, in order, the writer reads each path's
+ * value at that step back from its own file, pushes it to this reader alone
+ * (if the step wrote that path), and announces the step to this reader.
+ * H5Fwait_step_ready() then returns those steps, each with its data, and
+ * then the live steps -- every step once, in order.
+ *
+ * To keep that order, the writer sends this reader nothing live from the
+ * moment the subscription reaches it until the backfill is served, which
+ * it does on its own thread at its next H5Fbegin_step() or H5Fend_step(),
+ * before that step's data. Steps committed in between are part of the
+ * backfill. A writer idle between steps serves it when it next starts or
+ * ends one.
+ *
+ * Must be this reader's first subscription (-1 otherwise): an earlier live
+ * one would interleave with the backfilled steps. Step announcements that
+ * arrived before this call (the join seed) are not repeated in order with
+ * the backfill -- discard them first. Selection, datatype narrowing
+ * (H5Fsubscribe_type()) and predicates apply to the backfill as to live
+ * pushes, but narrowings set after this call may miss steps already served.
+ * Variable-length objects are not pushed, backfilled or live.
+ *
+ * \param file_id    File opened through the vol-stream connector for
+ *                   reading, with the transport enabled
+ * \param start_step First physical step wanted; 0 for the whole history
+ * \param count, paths, spaces, plists As for H5Fsubscribe()
+ * \return \herr_t
+ */
+H5VL_STREAM_API herr_t H5Fsubscribe_from(hid_t file_id, uint64_t start_step, size_t count,
+                                           const char *const *paths, const hid_t *spaces,
+                                           const hid_t *plists);
+
+/**
  * \brief Writer only. Block until \p n_expected distinct subscribers have
  *        registered, or \p timeout_ms elapses.
  *

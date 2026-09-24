@@ -13,6 +13,8 @@ ctest entry per mode) so every scenario gets a fresh transport.
              step 0 and the reader subscribes with expect= before any schema
              exists, so step 0 is delivered too. A wrong expect= must raise
              once the schema is seen.
+  backfill   subscribe(from_step=0) after step 0 was committed: step 0 must
+             arrive with its data (read back by the writer), then 1..3.
   narrowing  The whole grid, delivered as int16 and filtered by a predicate:
              one step where everything matches, one where some rows do, and
              one where nothing does.
@@ -210,6 +212,26 @@ class EarlyTest(ColumnTest):
         # waiting out its 30 s per-step timeout.
         for s in range(1, LOCKSTEP + 1):
             self.touch(f"ack.{s}")
+
+
+class BackfillTest(StreamTest):
+    """subscribe(from_step=0) after joining late: step 0, committed before the
+    reader existed, arrives with its data, then steps 1..3 live."""
+
+    mode = "narrowing"
+
+    def test_backfill(self):
+        self.attach()
+        self.file.subscribe("/grid", from_step=0)
+        self.touch("ready")
+        for s in range(0, 4):
+            step = self.file.next_step(20000)
+            self.assertIsNotNone(step, f"step {s} never arrived")
+            self.assertEqual(step.phys, s, "steps out of order")
+            full = np.array([[value(s, r, c) for c in range(COLS)] for r in range(ROWS)])
+            np.testing.assert_array_equal(step["/grid"], full, err_msg=f"step {s}")
+        self.assertIsNone(self.file.next_step(500), "a step arrived after the last one")
+        self.assert_writer_ok()
 
 
 class NarrowingTest(StreamTest):
@@ -544,7 +566,7 @@ if __name__ == "__main__":
         sys.exit(__doc__)
     WRITER = sys.argv.pop(1)
     mode = sys.argv.pop(1)
-    cases = {"column": ColumnTest, "early": EarlyTest, "narrowing": NarrowingTest, "iterate": IterateTest,
+    cases = {"column": ColumnTest, "early": EarlyTest, "backfill": BackfillTest, "narrowing": NarrowingTest, "iterate": IterateTest,
              "getonly": GetOnlyTest, "torch": TorchTest, "eos": EndOfStreamTest, "drop": DropTest,
              "ack": BackpressureTest, "noack": NoBackpressureTest,
              "twostreams": MultiFileTest, "samestream": MultiFileTest, "reopen": MultiFileTest,

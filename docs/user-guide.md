@@ -2069,11 +2069,18 @@ Yes — see [§3.6](#36-chaining-other-pass-through-connectors).
 
 **Does a consumer see steps that committed before it subscribed?**
 
-No. A subscription is not retroactive. A consumer that subscribes after step 1
-commits never receives step 1's data. Have the writer wait for a
-ready-handshake, as both examples do. (`H5Fwait_step_ready()` is different: a
-consumer joining mid-stream is seeded with the writer's current step, so the
-first call returns immediately.)
+Not with `H5Fsubscribe()`: a subscription is not retroactive, so a consumer
+that subscribes after step 1 commits never receives step 1's data. Either have
+the writer wait for it (`H5Fwait_subscribers()`), or subscribe with
+`H5Fsubscribe_from(fid, start_step, ...)`, which asks the writer to *backfill*:
+it reads each committed step from `start_step` back from its own file and
+sends it, then the live steps, each step once and in order. It must be the
+reader's first subscription, and the writer serves it at its next
+`H5Fbegin_step()` or `H5Fend_step()`, holding that reader's live delivery back
+until then. In Python, `subscribe(..., from_step=k)`. (`H5Fwait_step_ready()`
+is different again: a consumer joining mid-stream is seeded with the writer's
+current step, so the first call returns immediately. Discard that before a
+backfilled subscription, whose steps come in order after it.)
 
 **Why is my data at `/step/0/foo` instead of `/foo`?**
 
@@ -2137,6 +2144,7 @@ connector, because a step is a file-scoped transaction.
 | `H5Fbegin_logical_step(fid, id)` | Reader: jump to a logical id | Resolves to the largest physical step carrying it, so a restart's rewrite wins |
 | `H5Fget_logical_steps(fid, &n, ids)` | Reader: list logical ids | Two-call size-then-fill idiom; deduped, ascending, authoritative only |
 | `H5Fsubscribe(fid, n, paths, spaces, plists)` | Reader: declare interest | Needs the transport. `plists` entries must be real DCPLs; `H5P_DEFAULT` means no re-filtering |
+| `H5Fsubscribe_from(fid, start, n, paths, spaces, plists)` | Reader: declare interest, with the steps missed since `start` backfilled | Must be the first subscription. The writer serves it at its next step boundary; see the FAQ on late joiners |
 | `H5Fsubscribe_predicate(fid, path, op, type, val)` | Reader: narrow by value | Requires a prior `H5Fsubscribe()` on that path. `type_id` travels as `H5Tencode()` bytes, so a writer of different endianness converts correctly |
 | `H5Fget_subscribed_data(fid, ms, &step, &path, &buf, &sz, &start, &cnt, &flags)` | Reader: drain one push, oldest first | Caller frees `path` and `buf`. `ms = 0` polls without blocking. `flags` (may be NULL) gets `H5VL_STREAM_DELIVERY_*` bits: which narrowing fell back to over-sending, 0 if none |
 | `H5Fwait_step_ready(fid, ms, &step, &wall_ns)` | Reader: block for a commit notification | Does not move the cursor or grow the index |
