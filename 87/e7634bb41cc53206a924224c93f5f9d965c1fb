@@ -1,0 +1,21 @@
+test/CMakeLists.txt
+  s_3816fb7b7c4a27::t_29983ee875bf0e 59,90-94
+test/t_step_grouping.c
+  s_3816fb7b7c4a27::t_2c1f526369dcc9 1-460
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "87e7634bb41cc53206a924224c93f5f9d965c1fb",
+  "prompts": {},
+  "sessions": {
+    "s_3816fb7b7c4a27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b5b5c72-aca3-496b-8412-0fb9ae85948c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
