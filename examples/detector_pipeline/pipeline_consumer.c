@@ -359,10 +359,12 @@ main(int argc, char **argv)
          * H5Fwait_step_ready() first, which blocks on the writer's own
          * step-commit notification and is independent of any subscription
          * -- it fires whether or not this reader's predicate matched. Once
-         * that confirms a step actually committed, an H5Fget_subscribed_data()
-         * poll asks whether the predicate matched for it. A timeout there,
-         * immediately after a confirmed commit, is now a real "no signal
-         * this frame" -- not "still waiting."
+         * that confirms a step actually committed, a non-blocking
+         * H5Fget_subscribed_data() drain asks whether the predicate matched
+         * for it. The writer finishes delivering a step's pushes before it
+         * announces the step (vs_tr_writer_broadcast_step_ready() in
+         * src/tr_mercury.c), so an empty queue at that point is a real "no
+         * signal this frame" -- not "still waiting."
          *
          * NOT demonstrated here: vol-stream also documents a genuinely
          * latest-only reader that jumps by logical id via
@@ -384,6 +386,12 @@ main(int argc, char **argv)
         int idle_misses  = 0;
         int max_idle     = (DETECTOR_BARRIER_TIMEOUT_MS + 5000) / step_timeout + 1;
 
+        /* A push already popped for a later step than the one being scored.
+         * Only the scalars are kept; the monitor never looks at the bytes. */
+        int      have_held = 0;
+        uint64_t held_phys = 0, held_count = 0;
+        size_t   held_size = 0;
+
         printf("monitor: subscribed -- watching status for up to %d step(s)\n", max_pushes);
 
         for (;;) {
@@ -401,60 +409,58 @@ main(int argc, char **argv)
 
             {
                 int step_hit = 0;
-                int first    = 1;
+                int drain    = 1;
 
                 /*
                  * A predicate match is delivered as one push per maximal
                  * contiguous run (H5Fsubscribe_predicate()'s own doc
                  * comment), and detector_writer.c writes each frame as 4
-                 * separate module H5Dwrite() calls -- so a single hit step
-                 * can queue more than one item here, not just one. Drain
-                 * all of them before scoring the step, or a later poll
-                 * would pop this step's leftover backlog and compare it
-                 * against the wrong phys.
+                 * separate module H5Dwrite() calls -- so one hit step can
+                 * queue several items. Drain all of them before scoring the
+                 * step.
                  *
-                 * Only the first poll needs the full step_timeout -- it is
-                 * the one that tells "no signal this step" apart from
-                 * "writer hasn't gotten here yet" (which
-                 * H5Fwait_step_ready() has already ruled out). Any further
-                 * run was queued by this same already-committed step, so it
-                 * is either sitting in the queue already or never coming;
-                 * poll for it without blocking.
+                 * If this reader has fallen behind, later steps' pushes are
+                 * already queued behind this one's, and the drain pops the
+                 * first of them. There is no peek, so that item is held for
+                 * the step it belongs to rather than discarded.
                  */
-                for (;;) {
+                if (have_held) {
+                    if (held_phys == phys) {
+                        step_hit = 1;
+                        have_held = 0;
+                        printf("monitor: step %llu  SIGNAL  (%llu element(s) above threshold, %zu byte(s))\n",
+                               (unsigned long long)phys, (unsigned long long)held_count, held_size);
+                    }
+                    else if (held_phys > phys)
+                        drain = 0; /* everything queued behind it is later still */
+                    else
+                        have_held = 0; /* stale; cannot happen with FIFO queues */
+                }
+
+                while (drain) {
                     uint64_t data_phys = 0, elem_start = 0, elem_count = 0;
                     char    *path = NULL;
                     void    *buf  = NULL;
                     size_t   size = 0;
-                    int      got;
 
-                    /* "got" (the call succeeded) and "matched" (it was THIS
-                     * step) are tracked separately so a success on an
-                     * unexpected phys -- not expected in this sequential,
-                     * one-subscriber setup, but not ruled out either -- still
-                     * gets its allocation freed rather than leaked. */
-                    got = (H5Fget_subscribed_data(fid, first ? (uint64_t)step_timeout : 0, &data_phys,
-                                                   &path, &buf, &size, &elem_start, &elem_count) >= 0);
-                    first = 0;
-
-                    if (!got)
+                    if (H5Fget_subscribed_data(fid, 0, &data_phys, &path, &buf, &size, &elem_start,
+                                               &elem_count) < 0)
                         break;
-
-                    if (data_phys != phys) {
-                        /* Belongs to a step not yet confirmed via
-                         * H5Fwait_step_ready() -- free it and stop draining;
-                         * whatever comes after it belongs no earlier than
-                         * this one does either. */
-                        free(path);
-                        free(buf);
-                        break;
-                    }
-
-                    step_hit = 1;
-                    printf("monitor: step %llu  SIGNAL  (%llu element(s) above threshold, %zu byte(s))\n",
-                           (unsigned long long)phys, (unsigned long long)elem_count, size);
                     free(path);
                     free(buf);
+
+                    if (data_phys == phys) {
+                        step_hit = 1;
+                        printf("monitor: step %llu  SIGNAL  (%llu element(s) above threshold, %zu byte(s))\n",
+                               (unsigned long long)phys, (unsigned long long)elem_count, size);
+                    }
+                    else if (data_phys > phys) {
+                        have_held  = 1;
+                        held_phys  = data_phys;
+                        held_count = elem_count;
+                        held_size  = size;
+                        break;
+                    }
                 }
 
                 if (step_hit) {
