@@ -39,7 +39,12 @@ import unittest
 
 import numpy as np
 
-import volstream
+# The reader in this process needs the transport as much as the writer does;
+# default it here so the script works however it is launched, not only
+# under ctest (which sets it).
+os.environ.setdefault("VOL_STREAM_NA", "na+sm")
+
+import volstream  # noqa: E402
 
 WRITER = None
 ROWS, COLS, COL = 6, 8, 3
