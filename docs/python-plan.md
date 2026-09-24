@@ -465,10 +465,10 @@ supported, or depends on something outside this binding.
 
 - **Backpressure is opt in** (`backpressure=True`; see P3). Without it a
   writer's queue policy does not see a Python subscriber.
-- **An attribute written in a step where its dataset is not** replays onto
-  a group of the dataset's name in that step (user guide §2.3). A Python
-  subscriber still receives the attribute; the caveat is in the file the
-  writer leaves behind.
+- **An attribute written in a step where its dataset is not** is held on a
+  group of the dataset's name in that step's physical layout (user guide
+  §2.3). A Python subscriber still receives the attribute, and reads through
+  the connector are correct; only a native view of the file sees the group.
 - **mochi-flock 0.8.0** crashes when several readers join at once
   (mochi-hpc/mochi-flock#8). A Python consumer is exposed like any other
   reader. CI builds Flock `main` plus a local patch.

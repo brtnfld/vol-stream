@@ -1232,6 +1232,10 @@ matches the code. Each item is documented for users in
   first, and end_step collects its notes and pushes them as its last action.
   A `Discard` drop is reported that way (`t_queue_policy`), and so is the
   parallel Spill-as-Block warning, which had never been visible.
+- **An attribute written before its dataset in a step no longer loses the
+  step.** Its entry came first, replay made a group of the dataset's name, and
+  the dataset's create then failed. Replay now does a step's attributes after
+  its other entries. `t_step_rewrite` pins it, and fails four ways without it.
 - **Variable-length objects are no longer pushed.** The push read the rebuilt
   pointer buffer after it had been freed. `t_vl_push`.
 - **Archival step-count scaling, measured.** `test/b_step_scale.c` writes N
@@ -1283,8 +1287,11 @@ the one list. ★ marks what is being worked on next.
 - A reader that vanishes costs the writer push timeouts until SWIM declares
   it dead. A writer that leaves before any step or answer reaches a reader is
   not recognised as the end of the stream.
-- An attribute written in a step that does not write its dataset replays onto
-  a group of that name, which can shadow the dataset (user guide §2.3).
+- An attribute written in a step that does not write its dataset is held on a
+  group of that name under `/step/<n>/`. Reads through the connector are
+  correct; only a native view of the step sees a group (user guide §2.3). A
+  virtual dataset mapped onto the last real copy would make the native view
+  right too.
 - Error-stack coverage is incomplete. A frame the connector pushes before it
   makes another public `H5VL*()` call in the same operation is erased by that
   call, so a failure's detail often does not survive to the caller either.

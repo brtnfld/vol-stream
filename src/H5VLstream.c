@@ -5923,7 +5923,7 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
     char                      *step_root    = NULL;
     size_t                     payload_len  = 0;
     uint64_t                   physical_step = 0;
-    size_t                     i;
+    size_t                     i, k;
     herr_t                     ret_value = 0;
 
     /* Pass 2: decode the manifest and replay it entry by entry, using only
@@ -5997,7 +5997,17 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
             }
         }
 
-        for (i = 0; i < n_entries; i++) {
+        /* Two passes over the same entries: every non-attribute entry, then
+         * every attribute, each in manifest order. An attribute is attached
+         * to an object by path, and when it is written before its dataset in
+         * the same step (H5Awrite() then H5Dwrite() on handles kept open),
+         * its entry comes first -- replaying it in order made a group of the
+         * dataset's name, and the dataset's own create then failed on the
+         * clash, losing the step. No entry kind removes or renames an
+         * object, so moving attributes last cannot strand one. */
+        for (k = 0; k < 2 * n_entries; k++)
+            if (i = k % n_entries,
+                (vs_Entry_kind(vs_Entry_vec_at(entries, i)) == vs_Kind_Attr) == (k >= n_entries)) {
             vs_Entry_table_t        e     = vs_Entry_vec_at(entries, i);
             vs_Kind_enum_t           kind  = vs_Entry_kind(e);
             const char              *path  = vs_Entry_path(e);

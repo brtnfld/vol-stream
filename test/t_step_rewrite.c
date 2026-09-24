@@ -341,6 +341,91 @@ main(void)
     }
 
     H5Fclose(nfid);
+
+    /* The attribute written BEFORE its dataset in a step. Its manifest entry
+     * then comes first, and replaying entries in order made a group of the
+     * dataset's name, so the dataset's own create failed and the step was
+     * lost. Replay now does attributes last. Step 2 writes the attribute
+     * alone: it commits, and a reader through the connector gets step 1's
+     * data with step 2's attribute. */
+    {
+        hid_t   ofid, osp, osc, ods, oat, rfid, rds, rat;
+        H5O_info2_t oi;
+        int     d[NELEM], got[NELEM], a;
+
+        unlink("t_step_rewrite_order.h5");
+        if ((ofid = H5Fcreate("t_step_rewrite_order.h5", H5F_ACC_TRUNC, H5P_DEFAULT, fapl)) < 0 ||
+            (osp = H5Screate_simple(1, &dims, NULL)) < 0 || (osc = H5Screate(H5S_SCALAR)) < 0) {
+            printf("  FAIL  create (order case)\n");
+            return 1;
+        }
+        for (i = 0; i < NELEM; i++)
+            d[i] = val_for(0, i);
+        a = attr_for(0);
+        if (H5Fbegin_step(ofid, 0, NULL, 0) < 0 ||
+            (ods = H5Dcreate2(ofid, "/temp", H5T_NATIVE_INT, osp, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT)) < 0 ||
+            H5Dwrite(ods, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, d) < 0 ||
+            (oat = H5Acreate2(ods, "scale", H5T_NATIVE_INT, osc, H5P_DEFAULT, H5P_DEFAULT)) < 0 ||
+            H5Awrite(oat, H5T_NATIVE_INT, &a) < 0 || H5Fend_step(ofid) < 0) {
+            printf("  FAIL  step 0 (order case)\n");
+            return 1;
+        }
+        for (i = 0; i < NELEM; i++)
+            d[i] = val_for(1, i);
+        a = attr_for(1);
+        if (H5Fbegin_step(ofid, 0, NULL, 0) < 0 || H5Awrite(oat, H5T_NATIVE_INT, &a) < 0 ||
+            H5Dwrite(ods, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, d) < 0 || H5Fend_step(ofid) < 0) {
+            printf("  FAIL  a step writing the attribute before its dataset did not commit\n");
+            nerrors++;
+        }
+        else
+            printf("  ok    a step writing the attribute before its dataset commits\n");
+        a = attr_for(2);
+        if (H5Fbegin_step(ofid, 0, NULL, 0) < 0 || H5Awrite(oat, H5T_NATIVE_INT, &a) < 0 ||
+            H5Fend_step(ofid) < 0) {
+            printf("  FAIL  a step writing only the attribute did not commit\n");
+            nerrors++;
+        }
+        H5Aclose(oat);
+        H5Dclose(ods);
+        H5Sclose(osc);
+        H5Sclose(osp);
+        H5Fclose(ofid);
+
+        /* Natively: step 1 holds the dataset, not a group in its place. */
+        if ((nfid = H5Fopen("t_step_rewrite_order.h5", H5F_ACC_RDONLY, H5P_DEFAULT)) < 0 ||
+            H5Oget_info_by_name3(nfid, "/step/1/temp", &oi, H5O_INFO_BASIC, H5P_DEFAULT) < 0 ||
+            oi.type != H5O_TYPE_DATASET) {
+            printf("  FAIL  /step/1/temp is not a dataset\n");
+            nerrors++;
+        }
+        if (nfid >= 0)
+            H5Fclose(nfid);
+
+        /* Through the connector at step 2: step 1's data, step 2's attribute. */
+        if ((rfid = H5Fopen("t_step_rewrite_order.h5", H5F_ACC_RDONLY, fapl)) < 0 ||
+            H5Fbegin_step(rfid, 0, NULL, 0) < 0 || H5Fbegin_step(rfid, 0, NULL, 0) < 0 ||
+            H5Fbegin_step(rfid, 0, NULL, 0) < 0 || (rds = H5Dopen2(rfid, "/temp", H5P_DEFAULT)) < 0 ||
+            H5Dread(rds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, got) < 0 ||
+            (rat = H5Aopen(rds, "scale", H5P_DEFAULT)) < 0 || H5Aread(rat, H5T_NATIVE_INT, &a) < 0) {
+            printf("  FAIL  a reader could not read /temp and its attribute at step 2\n");
+            nerrors++;
+        }
+        else {
+            if (got[0] != val_for(1, 0) || a != attr_for(2)) {
+                printf("  FAIL  at step 2 a reader got /temp[0]=%d and scale=%d, expected %d and %d\n", got[0],
+                       a, val_for(1, 0), attr_for(2));
+                nerrors++;
+            }
+            else
+                printf("  ok    at an attribute-only step a reader gets the last data and the new attribute\n");
+            H5Aclose(rat);
+            H5Dclose(rds);
+        }
+        if (rfid >= 0)
+            H5Fclose(rfid);
+    }
+
     H5Pclose(fapl);
     H5VLclose(vol_id);
 
