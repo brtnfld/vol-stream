@@ -12,7 +12,8 @@ Publish the group only once fully built, and skip the group-file write in
 the dispatchers until it exists; flock_provider_register() writes the file
 itself right after init_group() returns, so nothing is lost.
 
-See https://github.com/brtnfld/vol-stream/issues/1. Drop this patch once
+See https://github.com/brtnfld/vol-stream/issues/1 and the upstream report
+at https://github.com/mochi-hpc/mochi-flock/issues/8. Drop this patch once
 upstream mochi-flock includes an equivalent fix.
 
 --- a/src/provider.c
@@ -26,10 +27,10 @@ upstream mochi-flock includes an equivalent fix.
 -    p->group->ctx = context;
 -    p->group->fn  = a.backend;
 +    /* set the provider's group, fully built before it is published */
-+    flock_group* group = calloc(1, sizeof(*group));
-+    group->ctx = context;
-+    group->fn  = a.backend;
-+    __atomic_store_n(&p->group, group, __ATOMIC_RELEASE);
++    flock_group* new_group = calloc(1, sizeof(*new_group));
++    new_group->ctx = context;
++    new_group->fn  = a.backend;
++    __atomic_store_n(&p->group, new_group, __ATOMIC_RELEASE);
  
      /* Set the teardown callback. We use a PRE-finalize callback rather than a
       * finalize callback: pre-finalize callbacks run while the Margo progress
