@@ -350,6 +350,14 @@ Stated plainly so you can plan around them:
   `H5Fget_stream_schema()` or `H5Fack_stream_step()`, and saw no step announced
   cannot recognise the writer, so it cannot tell the writer's departure from
   anyone else's. Any subscriber is covered.
+- **An attribute written in a step where its dataset is not.** A step's
+  replayed copy of an attribute is attached to that step's copy of its parent
+  under `/step/<n>/`. If the parent is a dataset from an earlier step that this
+  step does not write, replay has no copy of it and creates a *group* of that
+  name to hold the attribute, which can shadow the dataset for a reader
+  positioned at that step. This applies both to `H5Acreate()` on an older
+  dataset and to rewriting an attribute through a handle kept open across steps.
+  Write the dataset in the same step, before its attribute.
 - **A subscriber is invisible to the queue policy unless it acks.** The
   policies act on acks. A reader advancing with `H5Fbegin_step()` acks
   automatically; a subscriber that reads through
