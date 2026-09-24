@@ -1,0 +1,21 @@
+src/tr_mercury.c
+  s_3816fb7b7c4a27::t_8b6d0d3fccc111 1740-1741
+  s_3816fb7b7c4a27::t_463f33c3e6bb1c 407,785-788,816,820,826
+  s_3816fb7b7c4a27::t_88972410b3cf68 401-406,797-810
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2a0f4256f30df5506854f83aff2cd26c750e64f4",
+  "prompts": {},
+  "sessions": {
+    "s_3816fb7b7c4a27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b5b5c72-aca3-496b-8412-0fb9ae85948c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
