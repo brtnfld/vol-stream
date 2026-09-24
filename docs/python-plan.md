@@ -420,10 +420,11 @@ supported, or depends on something outside this binding.
 
 - **Backpressure is opt in** (`backpressure=True`; see P3). Without it a
   writer's queue policy does not see a Python subscriber.
-- **End of stream for a writer that leaves before announcing any step** to
-  this reader is not detected (see P4). Neither is it for a parallel writer
-  with more than 1,024 ranks: the reader stops tracking beyond that, and
-  then never reports end of stream rather than reporting it early.
+- **End of stream for a parallel writer with more than 1,024 ranks** is
+  never reported: the reader stops tracking beyond that, and never reporting
+  it is safer than reporting it early. (A writer that leaves before
+  announcing any step is now recognised from its answer to `subscribe()`,
+  which every Python reader makes; `t_eos` covers that case.)
 - **mochi-flock 0.8.0** crashes when several readers join at once
   (mochi-hpc/mochi-flock#8). A Python consumer is exposed like any other
   reader. CI builds Flock `main` plus a local patch.

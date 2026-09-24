@@ -345,10 +345,11 @@ Stated plainly so you can plan around them:
   but not released. CI builds Flock `main` with the patch in
   `.github/patches/`. Building against the 0.8.0 release, expect occasional
   crashes whenever several readers attach within the same moment.
-- **End of stream is not detected for a writer that leaves before announcing
-  any step to a reader.** A subscriber recognises the writer from its step
-  announcements or from the join seed; with neither, it cannot tell the writer's
-  departure from anyone else's.
+- **End of stream is not detected for a narrow case:** a reader that joined
+  before the writer's first commit, never called `H5Fsubscribe()`,
+  `H5Fget_stream_schema()` or `H5Fack_stream_step()`, and saw no step announced
+  cannot recognise the writer, so it cannot tell the writer's departure from
+  anyone else's. Any subscriber is covered.
 - **A subscriber is invisible to the queue policy unless it acks.** The
   policies act on acks. A reader advancing with `H5Fbegin_step()` acks
   automatically; a subscriber that reads through

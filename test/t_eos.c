@@ -19,9 +19,12 @@
  *   3. Once the last one is consumed, H5Fstep_status() reports H5F_STEP_EOS,
  *      and H5Fwait_step_ready() and H5Fget_subscribed_data() return at once
  *      rather than waiting out their timeouts.
+ *   4. A writer that leaves without ever committing a step is still
+ *      recognised, because the subscriber learned who the writer is when
+ *      its H5Fsubscribe() was answered. EOS is reported for it too.
  *
- * Two processes, na+sm. The writer is the one that leaves first here, the
- * opposite of every other two-process test.
+ * Two processes per scenario, na+sm. The writer is the one that leaves first
+ * here, the opposite of every other two-process test.
  */
 
 #include <stdio.h>
@@ -37,7 +40,10 @@
 #define N     8
 #define FNAME "t_eos.h5"
 
-#define READY_SENTINEL    "t_eos.reader_ready"
+#define FNAME_NOSTEP "t_eos_nostep.h5"
+
+#define READY_SENTINEL        "t_eos.reader_ready"
+#define NOSTEP_READY_SENTINEL "t_eos.nostep_ready"
 #define WROTE_SENTINEL    "t_eos.wrote"
 #define BLOCKING_SENTINEL "t_eos.blocking"
 
@@ -245,43 +251,109 @@ run_writer(void)
     return 0;
 }
 
-int
-main(void)
+/* Scenario 4: the writer never commits a step. */
+static int
+run_reader_nostep(void)
+{
+    hid_t    vol_id, fapl, fid, space;
+    hsize_t  dims = N;
+    uint64_t phys = 0, wall = 0;
+    double   t0;
+    int      i, rc = 0;
+
+    if ((vol_id = H5VL_stream_register()) < 0 || (fapl = H5Pcreate(H5P_FILE_ACCESS)) < 0 ||
+        H5Pset_vol(fapl, vol_id, NULL) < 0 || H5Pset_file_locking(fapl, false, true) < 0) {
+        printf("reader: FAIL setup\n");
+        return 1;
+    }
+    for (i = 0; i < 100 && access(FNAME_NOSTEP ".vsgroup", F_OK) != 0; i++)
+        usleep(100000);
+    if ((fid = H5Fopen(FNAME_NOSTEP, H5F_ACC_RDONLY, fapl)) < 0 ||
+        (space = H5Screate_simple(1, &dims, NULL)) < 0) {
+        printf("reader: FAIL open/join\n");
+        return 1;
+    }
+    {
+        const char *paths[1]  = {"/x"};
+        const hid_t spaces[1] = {space};
+
+        if (H5Fsubscribe(fid, 1, paths, spaces, NULL) < 0) {
+            printf("reader: FAIL subscribe\n");
+            return 1;
+        }
+    }
+    H5Sclose(space);
+    touch_sentinel(NOSTEP_READY_SENTINEL);
+
+    t0 = now_s();
+    while (!is_eos(fid) && now_s() - t0 < 10)
+        usleep(50000);
+    if (is_eos(fid))
+        printf("  ok    a writer that never committed a step: EOS after it left (%.2f s)\n", now_s() - t0);
+    else {
+        printf("  FAIL  a writer that never committed a step left, but EOS was never reported\n");
+        rc = 1;
+    }
+    t0 = now_s();
+    if (H5Fwait_step_ready(fid, 10000, &phys, &wall) < 0 && now_s() - t0 < 1.0)
+        printf("  ok    and H5Fwait_step_ready() returns at once (%.3f s)\n", now_s() - t0);
+    else {
+        printf("  FAIL  H5Fwait_step_ready() did not return at once (%.3f s)\n", now_s() - t0);
+        rc = 1;
+    }
+
+    H5Fclose(fid);
+    H5Pclose(fapl);
+    H5VLclose(vol_id);
+    return rc;
+}
+
+static int
+run_writer_nostep(void)
+{
+    hid_t vol_id, fapl, fid;
+
+    if ((vol_id = H5VL_stream_register()) < 0 || (fapl = H5Pcreate(H5P_FILE_ACCESS)) < 0 ||
+        H5Pset_vol(fapl, vol_id, NULL) < 0 || H5Pset_file_locking(fapl, false, true) < 0 ||
+        (fid = H5Fcreate(FNAME_NOSTEP, H5F_ACC_TRUNC, H5P_DEFAULT, fapl)) < 0) {
+        printf("writer: FAIL setup\n");
+        return 1;
+    }
+    if (wait_for_sentinel(NOSTEP_READY_SENTINEL, 300) < 0) {
+        printf("writer: FAIL reader never subscribed\n");
+        return 1;
+    }
+    sleep(1);
+    H5Fclose(fid);
+    H5Pclose(fapl);
+    H5VLclose(vol_id);
+    return 0;
+}
+
+/* Fork the reader, run the writer here, and report. Returns failures. */
+static int
+run_pair(const char *name, int (*reader)(void), int (*writer)(void))
 {
     pid_t pid;
     int   reader_status = 0, writer_status, nerrors = 0;
 
-    printf("vol-stream: end of stream when the writer leaves (na+sm)\n");
-
-    setenv("VOL_STREAM_NA", "na+sm", 0);
-    unlink(READY_SENTINEL);
-    unlink(WROTE_SENTINEL);
-    unlink(BLOCKING_SENTINEL);
-    unlink(FNAME ".vsgroup");
-    unlink(FNAME);
-
+    printf("%s\n", name);
     fflush(NULL);
     if ((pid = fork()) < 0) {
         perror("fork");
         return 1;
     }
     if (pid == 0) {
-        int rc = run_reader();
+        int rc = reader();
 
         fflush(NULL);
         _exit(rc);
     }
-
-    writer_status = run_writer();
-
+    writer_status = writer();
     if (waitpid(pid, &reader_status, 0) < 0) {
         perror("waitpid");
         return 1;
     }
-    unlink(READY_SENTINEL);
-    unlink(WROTE_SENTINEL);
-    unlink(BLOCKING_SENTINEL);
-
     if (writer_status != 0) {
         printf("\nwriter process reported failure\n");
         nerrors++;
@@ -290,6 +362,35 @@ main(void)
         printf("\nreader process reported failure (status=%d)\n", reader_status);
         nerrors++;
     }
+    return nerrors;
+}
+
+static void
+clean(void)
+{
+    unlink(READY_SENTINEL);
+    unlink(WROTE_SENTINEL);
+    unlink(BLOCKING_SENTINEL);
+    unlink(NOSTEP_READY_SENTINEL);
+    unlink(FNAME ".vsgroup");
+    unlink(FNAME);
+    unlink(FNAME_NOSTEP ".vsgroup");
+    unlink(FNAME_NOSTEP);
+}
+
+int
+main(void)
+{
+    int nerrors = 0;
+
+    printf("vol-stream: end of stream when the writer leaves (na+sm)\n");
+
+    setenv("VOL_STREAM_NA", "na+sm", 0);
+    clean();
+    nerrors += run_pair("-- a writer that committed steps", run_reader, run_writer);
+    nerrors += run_pair("-- a writer that never committed a step", run_reader_nostep, run_writer_nostep);
+    clean();
+
     if (nerrors) {
         printf("\n%d failure(s)\n", nerrors);
         return 1;

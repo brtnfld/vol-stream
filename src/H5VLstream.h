@@ -671,8 +671,10 @@ H5VL_STREAM_API herr_t H5Ffree_stream_schema(size_t n_vars, H5F_stream_var_t *va
  * process dying -- steps it had already announced are still returned, and
  * after the last of them this returns -1 at once instead of waiting out
  * \p timeout_ms, and H5Fstep_status() reports H5F_STEP_EOS. A writer is
- * recognised from the step announcements it sends, or from the join seed; one
- * that leaves before announcing any step to this reader is not detected. A
+ * recognised from the step announcements it sends, the join seed, or its
+ * answer to this reader's H5Fsubscribe(), H5Fget_stream_schema() or
+ * H5Fack_stream_step(). Only a reader that did none of those, joined before
+ * the writer's first commit, and saw no step announced cannot tell. A
  * parallel writer's stream ends when every rank has left.
  *
  * \param file_id       File opened through the vol-stream connector for

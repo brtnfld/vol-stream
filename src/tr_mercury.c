@@ -818,6 +818,21 @@ vs_all_writers_gone(vs_tr_t *tr)
     return 1;
 }
 
+/* Record that member_id is the writer: only the writer answers the
+ * get_current_step, get_schema, ack and subscribe probes with status 0 (their
+ * handlers refuse on any other member). Cached for targeting later RPCs, and
+ * noted for end of stream, so a writer that leaves before announcing a step
+ * to this reader is still recognised. App thread only, like the fields. */
+static void
+vs_learn_writer(vs_tr_t *tr, vs_member_id_t member_id)
+{
+    tr->writer_member_id     = member_id;
+    tr->has_writer_member_id = 1;
+    pthread_mutex_lock(&tr->pending_lock);
+    vs_note_writer(tr, member_id);
+    pthread_mutex_unlock(&tr->pending_lock);
+}
+
 static void
 vs_push_pending(vs_tr_t *tr, uint64_t physical_step, uint64_t wall_time_ns)
 {
@@ -2016,11 +2031,7 @@ vs_tr_reader_get_current_step(vs_tr_t *tr, uint64_t *physical_step, uint64_t *wa
                         /* M7: this member just proved it is the writer (only
                          * the writer ever answers status == 0) -- cache it so
                          * vs_tr_reader_ack_step() can target it directly. */
-                        tr->writer_member_id     = member_id;
-                        tr->has_writer_member_id = 1;
-                        pthread_mutex_lock(&tr->pending_lock);
-                        vs_note_writer(tr, member_id);
-                        pthread_mutex_unlock(&tr->pending_lock);
+                        vs_learn_writer(tr, member_id);
                         ret = 0;
                     }
                     margo_free_output(handle, &out);
@@ -2088,8 +2099,7 @@ vs_forward_get_schema(vs_tr_t *tr, vs_member_id_t member_id, int *out_is_writer,
                     /* Only the writer ever answers status == 0, so cache it
                      * the same way vs_tr_reader_get_current_step() does --
                      * a second query then targets it directly. */
-                    tr->writer_member_id     = member_id;
-                    tr->has_writer_member_id = 1;
+                    vs_learn_writer(tr, member_id);
 
                     if (out.schema.size > 0 && out.schema.buf) {
                         uint8_t *copy = (uint8_t *)malloc((size_t)out.schema.size);
@@ -2398,9 +2408,8 @@ vs_tr_reader_ack_step(vs_tr_t *tr, uint64_t physical_step)
 
                     if (HG_SUCCESS == margo_get_output(handle, &out)) {
                         if (out.status == 0) {
-                            tr->writer_member_id     = member_id;
-                            tr->has_writer_member_id = 1;
-                            ret                       = 0;
+                            vs_learn_writer(tr, member_id);
+                            ret = 0;
                         }
                         margo_free_output(handle, &out);
                     }
@@ -2518,9 +2527,8 @@ vs_send_subscribe(vs_tr_t *tr, vs_member_id_t self_id, vs_subscribe_in_t *in, in
 
                     if (HG_SUCCESS == margo_get_output(handle, &out)) {
                         if (out.status == 0) {
-                            tr->writer_member_id     = member_id;
-                            tr->has_writer_member_id = 1;
-                            ret                       = 0;
+                            vs_learn_writer(tr, member_id);
+                            ret = 0;
                             if (out_matched)
                                 *out_matched = out.matched;
                         }
