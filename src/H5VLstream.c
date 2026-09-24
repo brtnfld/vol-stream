@@ -326,12 +326,6 @@ struct H5VL_stream_file_state_t {
     H5VL_stream_queue_policy_t   queue_policy;
     uint64_t                     reserve_slots;
     int                          warned_parallel_spill; /* H5VL__stream_warn_once() latch */
-    /* A non-fatal diagnostic for the caller of H5Fend_step(), pushed as the
-     * op's last action (H5VL__stream_note_flush()). Every public H5VL*() call
-     * the connector makes clears the error stack on entry, so a frame pushed
-     * mid-step would be erased before the caller could see it. */
-    char                         step_note[256];
-    hid_t                        step_note_minor;
 
     /* Step retention, opt-in via H5Fset_stream_retention_policy(). Writer
      * only, and a no-op unless set (retention_set == 0), so the default is
@@ -911,16 +905,77 @@ static hid_t H5VL_stream_err_capture_g  = H5I_INVALID_HID; /* write capture     
 static hid_t H5VL_stream_err_manifest_g = H5I_INVALID_HID; /* encode/decode/replay */
 static hid_t H5VL_stream_err_transport_g = H5I_INVALID_HID; /* Mercury/SSG          */
 
-/* Push one frame, if the class came up. Evaluates to the caller's own error
- * value so it can be used inline in a return, keeping the diagnostic beside
- * the failure it describes rather than in a separate statement that a later
- * edit can drift away from. */
+/* Error frames are buffered while a connector callback runs, and pushed as
+ * the callback's last action (H5VL__stream_err_end()). The connector does its
+ * work through public H5VL*()/H5S*()/H5T*() calls, and every public HDF5 call
+ * clears the error stack on entry -- so a frame pushed where a failure is
+ * found, and followed by any cleanup call, used to be erased before the
+ * caller could see it. Outside a wrapped callback (depth 0) a frame is pushed
+ * at once, as before. Not thread-safe, like the rest of the connector. */
+#define H5VL_STREAM_MAX_ERR_FRAMES 16
+
+typedef struct H5VL_stream_err_frame_t {
+    const char *file;
+    const char *func;
+    unsigned    line;
+    hid_t       minor;
+    char        msg[256];
+} H5VL_stream_err_frame_t;
+
+static H5VL_stream_err_frame_t H5VL_stream_err_frames_g[H5VL_STREAM_MAX_ERR_FRAMES];
+static unsigned                H5VL_stream_err_n_g     = 0;
+static unsigned                H5VL_stream_err_depth_g = 0;
+
+static void
+H5VL__stream_err_record(const char *file, const char *func, unsigned line, hid_t minor, const char *msg)
+{
+    H5VL_stream_err_frame_t *f;
+
+    if (H5VL_stream_err_class_g < 0)
+        return;
+    if (H5VL_stream_err_depth_g == 0) {
+        H5Epush2(H5E_DEFAULT, file, func, line, H5VL_stream_err_class_g, H5VL_stream_err_maj_g, minor, "%s",
+                 msg);
+        return;
+    }
+    if (H5VL_stream_err_n_g == H5VL_STREAM_MAX_ERR_FRAMES)
+        return; /* the first frames are the ones that name the cause */
+    f        = &H5VL_stream_err_frames_g[H5VL_stream_err_n_g++];
+    f->file  = file;
+    f->func  = func;
+    f->line  = line;
+    f->minor = minor;
+    snprintf(f->msg, sizeof(f->msg), "%s", msg);
+} /* end H5VL__stream_err_record() */
+
+/* Open a buffering scope; nested scopes share the outermost one's buffer. */
+static void
+H5VL__stream_err_begin(void)
+{
+    if (H5VL_stream_err_depth_g++ == 0)
+        H5VL_stream_err_n_g = 0;
+} /* end H5VL__stream_err_begin() */
+
+/* Close a scope; the outermost pushes everything recorded, in order. */
+static void
+H5VL__stream_err_end(void)
+{
+    unsigned i;
+
+    if (H5VL_stream_err_depth_g == 0 || --H5VL_stream_err_depth_g > 0)
+        return;
+    for (i = 0; i < H5VL_stream_err_n_g; i++) {
+        const H5VL_stream_err_frame_t *f = &H5VL_stream_err_frames_g[i];
+
+        H5Epush2(H5E_DEFAULT, f->file, f->func, f->line, H5VL_stream_err_class_g, H5VL_stream_err_maj_g,
+                 f->minor, "%s", f->msg);
+    }
+    H5VL_stream_err_n_g = 0;
+} /* end H5VL__stream_err_end() */
+
+/* Record one frame, if the class came up. */
 #define H5VL_STREAM_ERR(minor, msg)                                                                          \
-    do {                                                                                                     \
-        if (H5VL_stream_err_class_g >= 0)                                                                    \
-            H5Epush2(H5E_DEFAULT, __FILE__, __func__, __LINE__, H5VL_stream_err_class_g,                     \
-                     H5VL_stream_err_maj_g, (minor), msg);                                                   \
-    } while (0)
+    H5VL__stream_err_record(__FILE__, __func__, (unsigned)__LINE__, (minor), (msg))
 
 #define H5VL_STREAM_GOTO_ERR(minor, msg, ret)                                                                \
     do {                                                                                                     \
@@ -2101,8 +2156,8 @@ H5VL__stream_pending_append(H5VL_stream_file_state_t *fs, const H5VL_stream_pend
             char msg[224];
 
             snprintf(msg, sizeof(msg),
-                     "this step would buffer %llu bytes, over the %llu-byte "
-                     "VOL_STREAM_MAX_PENDING_BYTES limit -- refusing the capture. Raise the limit, or "
+                     "this step would buffer %llu bytes, over the %llu-byte pending limit "
+                     "(max_pending_bytes, or VOL_STREAM_MAX_PENDING_BYTES) -- refusing the capture. Raise the limit, or "
                      "call H5Fend_step() more often so the step's data reaches the file sooner",
                      (unsigned long long)fs->pending_bytes + (unsigned long long)entry->payload_len,
                      (unsigned long long)limit);
@@ -8224,29 +8279,15 @@ H5VL__stream_has_comm(H5VL_stream_file_state_t *fs)
  *              once is information and saying it a thousand times is noise.
  *-------------------------------------------------------------------------
  */
+/* A non-fatal diagnostic for the caller. Buffered and pushed as the
+ * callback's last action like any other frame (H5VL__stream_err_end()), so it
+ * survives the connector's own HDF5 calls that follow it. */
 static void
 H5VL__stream_note(H5VL_stream_file_state_t *fs, hid_t minor, const char *msg)
 {
-    size_t len = strlen(fs->step_note);
-
-    if (len == 0) {
-        fs->step_note_minor = minor;
-        snprintf(fs->step_note, sizeof(fs->step_note), "%s", msg);
-    }
-    else if (len + 2 < sizeof(fs->step_note))
-        snprintf(fs->step_note + len, sizeof(fs->step_note) - len, "; %s", msg);
+    (void)fs;
+    H5VL_STREAM_ERR(minor, msg);
 } /* end H5VL__stream_note() */
-
-/* Push the step's note, if any, and clear it. Call only as the very last
- * thing an op does -- see step_note's comment. */
-static void
-H5VL__stream_note_flush(H5VL_stream_file_state_t *fs)
-{
-    if (!fs || fs->step_note[0] == '\0')
-        return;
-    H5VL_STREAM_ERR(fs->step_note_minor, fs->step_note);
-    fs->step_note[0] = '\0';
-} /* end H5VL__stream_note_flush() */
 
 static void
 H5VL__stream_warn_once(H5VL_stream_file_state_t *fs, int *flag, hid_t minor, const char *msg)
@@ -9373,7 +9414,7 @@ H5VL_stream_free_wrap_ctx(void *_wrap_ctx)
  *-------------------------------------------------------------------------
  */
 static void *
-H5VL_stream_attr_create(void *obj, const H5VL_loc_params_t *loc_params, const char *name, hid_t type_id,
+H5VL__stream_attr_create_impl(void *obj, const H5VL_loc_params_t *loc_params, const char *name, hid_t type_id,
                               hid_t space_id, hid_t acpl_id, hid_t aapl_id, hid_t dxpl_id, void **req)
 {
     H5VL_stream_t *attr;
@@ -9449,6 +9490,21 @@ H5VL_stream_attr_create(void *obj, const H5VL_loc_params_t *loc_params, const ch
         attr = NULL;
 
     return (void *)attr;
+} /* end H5VL__stream_attr_create_impl() */
+
+/* See H5VL__stream_err_begin(): buffers this callback's error frames and
+ * pushes them as its last action. */
+static void *
+H5VL_stream_attr_create(void *obj, const H5VL_loc_params_t *loc_params, const char *name, hid_t type_id,
+                              hid_t space_id, hid_t acpl_id, hid_t aapl_id, hid_t dxpl_id, void **req)
+{
+    void * ret_value;
+
+    H5VL__stream_err_begin();
+    ret_value = H5VL__stream_attr_create_impl(obj, loc_params, name, type_id, space_id, acpl_id, aapl_id, dxpl_id, req);
+    H5VL__stream_err_end();
+
+    return ret_value;
 } /* end H5VL_stream_attr_create() */
 
 /*-------------------------------------------------------------------------
@@ -9462,7 +9518,7 @@ H5VL_stream_attr_create(void *obj, const H5VL_loc_params_t *loc_params, const ch
  *-------------------------------------------------------------------------
  */
 static void *
-H5VL_stream_attr_open(void *obj, const H5VL_loc_params_t *loc_params, const char *name, hid_t aapl_id,
+H5VL__stream_attr_open_impl(void *obj, const H5VL_loc_params_t *loc_params, const char *name, hid_t aapl_id,
                             hid_t dxpl_id, void **req)
 {
     H5VL_stream_t *attr;
@@ -9492,6 +9548,21 @@ H5VL_stream_attr_open(void *obj, const H5VL_loc_params_t *loc_params, const char
         attr = NULL;
 
     return (void *)attr;
+} /* end H5VL__stream_attr_open_impl() */
+
+/* See H5VL__stream_err_begin(): buffers this callback's error frames and
+ * pushes them as its last action. */
+static void *
+H5VL_stream_attr_open(void *obj, const H5VL_loc_params_t *loc_params, const char *name, hid_t aapl_id,
+                            hid_t dxpl_id, void **req)
+{
+    void * ret_value;
+
+    H5VL__stream_err_begin();
+    ret_value = H5VL__stream_attr_open_impl(obj, loc_params, name, aapl_id, dxpl_id, req);
+    H5VL__stream_err_end();
+
+    return ret_value;
 } /* end H5VL_stream_attr_open() */
 
 /*-------------------------------------------------------------------------
@@ -9628,7 +9699,7 @@ H5VL__stream_step_attr_index(H5VL_stream_t *o, size_t *out_index)
 } /* end H5VL__stream_step_attr_index() */
 
 static herr_t
-H5VL_stream_attr_write(void *attr, hid_t mem_type_id, const void *buf, hid_t dxpl_id, void **req)
+H5VL__stream_attr_write_impl(void *attr, hid_t mem_type_id, const void *buf, hid_t dxpl_id, void **req)
 {
     H5VL_stream_t *o = (H5VL_stream_t *)attr;
     herr_t               ret_value;
@@ -9760,6 +9831,20 @@ H5VL_stream_attr_write(void *attr, hid_t mem_type_id, const void *buf, hid_t dxp
     /* Check for async request */
     if (req && *req)
         *req = H5VL_stream_new_obj(*req, o->under_vol_id);
+
+    return ret_value;
+} /* end H5VL__stream_attr_write_impl() */
+
+/* See H5VL__stream_err_begin(): buffers this callback's error frames and
+ * pushes them as its last action. */
+static herr_t
+H5VL_stream_attr_write(void *attr, hid_t mem_type_id, const void *buf, hid_t dxpl_id, void **req)
+{
+    herr_t ret_value;
+
+    H5VL__stream_err_begin();
+    ret_value = H5VL__stream_attr_write_impl(attr, mem_type_id, buf, dxpl_id, req);
+    H5VL__stream_err_end();
 
     return ret_value;
 } /* end H5VL_stream_attr_write() */
@@ -9934,7 +10019,7 @@ H5VL_stream_attr_close(void *attr, hid_t dxpl_id, void **req)
  *-------------------------------------------------------------------------
  */
 static void *
-H5VL_stream_dataset_create(void *obj, const H5VL_loc_params_t *loc_params, const char *name,
+H5VL__stream_dataset_create_impl(void *obj, const H5VL_loc_params_t *loc_params, const char *name,
                                  hid_t lcpl_id, hid_t type_id, hid_t space_id, hid_t dcpl_id, hid_t dapl_id,
                                  hid_t dxpl_id, void **req)
 {
@@ -10004,6 +10089,22 @@ H5VL_stream_dataset_create(void *obj, const H5VL_loc_params_t *loc_params, const
         dset = NULL;
 
     return (void *)dset;
+} /* end H5VL__stream_dataset_create_impl() */
+
+/* See H5VL__stream_err_begin(): buffers this callback's error frames and
+ * pushes them as its last action. */
+static void *
+H5VL_stream_dataset_create(void *obj, const H5VL_loc_params_t *loc_params, const char *name,
+                                 hid_t lcpl_id, hid_t type_id, hid_t space_id, hid_t dcpl_id, hid_t dapl_id,
+                                 hid_t dxpl_id, void **req)
+{
+    void * ret_value;
+
+    H5VL__stream_err_begin();
+    ret_value = H5VL__stream_dataset_create_impl(obj, loc_params, name, lcpl_id, type_id, space_id, dcpl_id, dapl_id, dxpl_id, req);
+    H5VL__stream_err_end();
+
+    return ret_value;
 } /* end H5VL_stream_dataset_create() */
 
 /*-------------------------------------------------------------------------
@@ -10017,7 +10118,7 @@ H5VL_stream_dataset_create(void *obj, const H5VL_loc_params_t *loc_params, const
  *-------------------------------------------------------------------------
  */
 static void *
-H5VL_stream_dataset_open(void *obj, const H5VL_loc_params_t *loc_params, const char *name,
+H5VL__stream_dataset_open_impl(void *obj, const H5VL_loc_params_t *loc_params, const char *name,
                                hid_t dapl_id, hid_t dxpl_id, void **req)
 {
     H5VL_stream_t *dset;
@@ -10049,6 +10150,21 @@ H5VL_stream_dataset_open(void *obj, const H5VL_loc_params_t *loc_params, const c
         dset = NULL;
 
     return (void *)dset;
+} /* end H5VL__stream_dataset_open_impl() */
+
+/* See H5VL__stream_err_begin(): buffers this callback's error frames and
+ * pushes them as its last action. */
+static void *
+H5VL_stream_dataset_open(void *obj, const H5VL_loc_params_t *loc_params, const char *name,
+                               hid_t dapl_id, hid_t dxpl_id, void **req)
+{
+    void * ret_value;
+
+    H5VL__stream_err_begin();
+    ret_value = H5VL__stream_dataset_open_impl(obj, loc_params, name, dapl_id, dxpl_id, req);
+    H5VL__stream_err_end();
+
+    return ret_value;
 } /* end H5VL_stream_dataset_open() */
 
 /*-------------------------------------------------------------------------
@@ -10281,7 +10397,7 @@ H5VL__stream_step_create_index(H5VL_stream_t *o, size_t *out_index)
  *-------------------------------------------------------------------------
  */
 static herr_t
-H5VL_stream_dataset_write(size_t count, void *dset[], hid_t mem_type_id[], hid_t mem_space_id[],
+H5VL__stream_dataset_write_impl(size_t count, void *dset[], hid_t mem_type_id[], hid_t mem_space_id[],
                                 hid_t file_space_id[], hid_t plist_id, const void *buf[], void **req)
 {
     void  *obj_local;        /* Local buffer for obj */
@@ -10481,6 +10597,21 @@ H5VL_stream_dataset_write(size_t count, void *dset[], hid_t mem_type_id[], hid_t
         free(obj);
 
     return ret_value;
+} /* end H5VL__stream_dataset_write_impl() */
+
+/* See H5VL__stream_err_begin(): buffers this callback's error frames and
+ * pushes them as its last action. */
+static herr_t
+H5VL_stream_dataset_write(size_t count, void *dset[], hid_t mem_type_id[], hid_t mem_space_id[],
+                                hid_t file_space_id[], hid_t plist_id, const void *buf[], void **req)
+{
+    herr_t ret_value;
+
+    H5VL__stream_err_begin();
+    ret_value = H5VL__stream_dataset_write_impl(count, dset, mem_type_id, mem_space_id, file_space_id, plist_id, buf, req);
+    H5VL__stream_err_end();
+
+    return ret_value;
 } /* end H5VL_stream_dataset_write() */
 
 /*-------------------------------------------------------------------------
@@ -10559,7 +10690,7 @@ H5VL_stream_dataset_get(void *dset, H5VL_dataset_get_args_t *args, hid_t dxpl_id
  *-------------------------------------------------------------------------
  */
 static herr_t
-H5VL_stream_dataset_specific(void *obj, H5VL_dataset_specific_args_t *args, hid_t dxpl_id, void **req)
+H5VL__stream_dataset_specific_impl(void *obj, H5VL_dataset_specific_args_t *args, hid_t dxpl_id, void **req)
 {
     H5VL_stream_t *o = (H5VL_stream_t *)obj;
     hid_t                under_vol_id;
@@ -10666,6 +10797,20 @@ H5VL_stream_dataset_specific(void *obj, H5VL_dataset_specific_args_t *args, hid_
     /* Check for async request */
     if (req && *req)
         *req = H5VL_stream_new_obj(*req, under_vol_id);
+
+    return ret_value;
+} /* end H5VL__stream_dataset_specific_impl() */
+
+/* See H5VL__stream_err_begin(): buffers this callback's error frames and
+ * pushes them as its last action. */
+static herr_t
+H5VL_stream_dataset_specific(void *obj, H5VL_dataset_specific_args_t *args, hid_t dxpl_id, void **req)
+{
+    herr_t ret_value;
+
+    H5VL__stream_err_begin();
+    ret_value = H5VL__stream_dataset_specific_impl(obj, args, dxpl_id, req);
+    H5VL__stream_err_end();
 
     return ret_value;
 } /* end H5VL_stream_dataset_specific() */
@@ -11047,7 +11192,7 @@ H5VL_stream_file_create(const char *name, unsigned flags, hid_t fcpl_id, hid_t f
  *-------------------------------------------------------------------------
  */
 static void *
-H5VL_stream_file_open(const char *name, unsigned flags, hid_t fapl_id, hid_t dxpl_id, void **req)
+H5VL__stream_file_open_impl(const char *name, unsigned flags, hid_t fapl_id, hid_t dxpl_id, void **req)
 {
     H5VL_stream_info_t *info;
     H5VL_stream_t      *file;
@@ -11113,6 +11258,20 @@ H5VL_stream_file_open(const char *name, unsigned flags, hid_t fapl_id, hid_t dxp
     H5VL_stream_info_free(info);
 
     return (void *)file;
+} /* end H5VL__stream_file_open_impl() */
+
+/* See H5VL__stream_err_begin(): buffers this callback's error frames and
+ * pushes them as its last action. */
+static void *
+H5VL_stream_file_open(const char *name, unsigned flags, hid_t fapl_id, hid_t dxpl_id, void **req)
+{
+    void * ret_value;
+
+    H5VL__stream_err_begin();
+    ret_value = H5VL__stream_file_open_impl(name, flags, fapl_id, dxpl_id, req);
+    H5VL__stream_err_end();
+
+    return ret_value;
 } /* end H5VL_stream_file_open() */
 
 /*-------------------------------------------------------------------------
@@ -11295,7 +11454,7 @@ H5VL_stream_file_specific(void *file, H5VL_file_specific_args_t *args, hid_t dxp
  *-------------------------------------------------------------------------
  */
 static herr_t
-H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id, void **req)
+H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dxpl_id, void **req)
 {
     H5VL_stream_t *o = (H5VL_stream_t *)file;
     herr_t               ret_value;
@@ -11386,7 +11545,6 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
                                  "no step is open on this file -- H5Fend_step() must be preceded by a "
                                  "matching H5Fbegin_step()",
                                  -1);
-        o->file_state->step_note[0] = '\0';
 
         o->file_state->step_state = H5F_STEP_COMMITTING;
 
@@ -11499,7 +11657,6 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
             MPI_Barrier(o->file_state->comm);
 #endif
 
-        H5VL__stream_note_flush(o->file_state);
         return 0;
     }
     else if (args->op_type == H5VL_stream_op_step_status) {
@@ -11924,6 +12081,20 @@ H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
         *req = H5VL_stream_new_obj(*req, o->under_vol_id);
 
     return ret_value;
+} /* end H5VL__stream_file_optional_impl() */
+
+/* See H5VL__stream_err_begin(): buffers this callback's error frames and
+ * pushes them as its last action. */
+static herr_t
+H5VL_stream_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id, void **req)
+{
+    herr_t ret_value;
+
+    H5VL__stream_err_begin();
+    ret_value = H5VL__stream_file_optional_impl(file, args, dxpl_id, req);
+    H5VL__stream_err_end();
+
+    return ret_value;
 } /* end H5VL_stream_file_optional() */
 
 /*-------------------------------------------------------------------------
@@ -12035,7 +12206,7 @@ H5VL_stream_group_create(void *obj, const H5VL_loc_params_t *loc_params, const c
  *-------------------------------------------------------------------------
  */
 static void *
-H5VL_stream_group_open(void *obj, const H5VL_loc_params_t *loc_params, const char *name, hid_t gapl_id,
+H5VL__stream_group_open_impl(void *obj, const H5VL_loc_params_t *loc_params, const char *name, hid_t gapl_id,
                              hid_t dxpl_id, void **req)
 {
     H5VL_stream_t *group;
@@ -12089,6 +12260,21 @@ H5VL_stream_group_open(void *obj, const H5VL_loc_params_t *loc_params, const cha
         group = NULL;
 
     return (void *)group;
+} /* end H5VL__stream_group_open_impl() */
+
+/* See H5VL__stream_err_begin(): buffers this callback's error frames and
+ * pushes them as its last action. */
+static void *
+H5VL_stream_group_open(void *obj, const H5VL_loc_params_t *loc_params, const char *name, hid_t gapl_id,
+                             hid_t dxpl_id, void **req)
+{
+    void * ret_value;
+
+    H5VL__stream_err_begin();
+    ret_value = H5VL__stream_group_open_impl(obj, loc_params, name, gapl_id, dxpl_id, req);
+    H5VL__stream_err_end();
+
+    return ret_value;
 } /* end H5VL_stream_group_open() */
 
 /*-------------------------------------------------------------------------

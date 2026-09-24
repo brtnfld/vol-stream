@@ -30,6 +30,17 @@
 #define N 256 /* ints per write: 1 KiB */
 
 static int nerrors = 0;
+static int saw_refusal = 0; /* the capture refusal's frame reached the caller */
+
+static herr_t
+find_refusal(unsigned n, const H5E_error2_t *err, void *udata)
+{
+    (void)n;
+    (void)udata;
+    if (err && err->desc && strstr(err->desc, "refusing the capture"))
+        saw_refusal = 1;
+    return 0;
+}
 
 #define CHECK(cond, ...)                                                                                      \
     do {                                                                                                      \
@@ -68,6 +79,9 @@ write_one(const char *name, hid_t fapl)
         w = H5Dwrite(ds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, vals);
     }
     H5E_END_TRY
+    /* Before any other HDF5 call, which would clear the stack. */
+    if (w < 0)
+        H5Ewalk2(H5E_DEFAULT, H5E_WALK_DOWNWARD, find_refusal, NULL);
     H5Dclose(ds);
     H5Sclose(sp);
     if (H5Fend_step(fid) < 0)
@@ -124,6 +138,7 @@ main(void)
         return 1;
     }
     CHECK(write_one("t_config_lim.h5", fapl_lim) == -1, "max_pending_bytes=64 refuses a 1 KiB write");
+    CHECK(saw_refusal, "and the refusal's reason reaches the caller's error stack");
     CHECK(write_one("t_config_def.h5", fapl_def) == 0, "and a file without the limit still takes it");
 
     /* 3. The environment variable overrides the FAPL. */

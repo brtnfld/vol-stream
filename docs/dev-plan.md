@@ -1232,6 +1232,14 @@ matches the code. Each item is documented for users in
   first, and end_step collects its notes and pushes them as its last action.
   A `Discard` drop is reported that way (`t_queue_policy`), and so is the
   parallel Spill-as-Block warning, which had never been visible.
+- **The connector's error frames reach the caller.** Frames are buffered
+  while a connector callback runs and pushed as its last action, so the
+  connector's own HDF5 calls after a failure -- cleanup, closes -- no longer
+  erase them. It covers the step API and the dataset, attribute, file-open
+  and group-open callbacks, and replaces end_step's note mechanism.
+  `t_config` checks that a pending-limit refusal's reason reaches the caller,
+  and fails without the buffering. Frames are also pushed with a `"%s"`
+  format now; a `%` in a path used to be read as a conversion.
 - **Per-file configuration on the FAPL.** `H5Pset_fapl_stream(fapl,
   &config)` sets the NA string, payload staging, the pending-bytes cap, the
   spill directory, the concentrator factor and the bulk threshold for one
@@ -1304,11 +1312,8 @@ the one list. ★ marks what is being worked on next.
   correct; only a native view of the step sees a group (user guide §2.3). A
   virtual dataset mapped onto the last real copy would make the native view
   right too.
-- Error-stack coverage is incomplete. A frame the connector pushes before it
-  makes another public `H5VL*()` call in the same operation is erased by that
-  call, so a failure's detail often does not survive to the caller either.
-  Only end_step's collected notes are pushed late enough. A general fix would
-  route every diagnostic through such a note, per operation.
+- Error-stack coverage is incomplete: many interior helpers still fail with
+  a bare -1 and no frame of their own.
 - No fault tolerance for a rank failure inside a collective commit.
 - Objects from a failed replay are never reclaimed.
 - Writer and reader cannot cross an HDF5 major.minor boundary.
