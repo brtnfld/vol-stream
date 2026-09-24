@@ -1,0 +1,50 @@
+python/tests/stream_writer.c
+  s_3816fb7b7c4a27::t_d79e00bc8a2270 47-50
+  s_3816fb7b7c4a27::t_e48652aae06706 262-268
+docs/user-guide.md
+  s_3816fb7b7c4a27::t_c0bf8dc7246aba 1525-1538
+python/tests/test_stream.py
+  s_3816fb7b7c4a27::t_c7e469f48a66d1 206
+  s_3816fb7b7c4a27::t_092d00a89c1020 541
+  s_3816fb7b7c4a27::t_bcad28d0d78571 12-15
+  s_3816fb7b7c4a27::t_835a578c2aae2c 174-205,207-210
+test/CMakeLists.txt
+  s_3816fb7b7c4a27::t_b9a919450f94a1 101-102
+python/CMakeLists.txt
+  s_3816fb7b7c4a27::t_a90ba88c4eb119 87
+test/t_eos.c
+  s_3816fb7b7c4a27::t_879e45cfff85c2 521-523
+  s_3816fb7b7c4a27::t_753d8e2ec21457 537
+  s_3816fb7b7c4a27::t_eddf4a21940b71 25-27
+  s_3816fb7b7c4a27::t_e5a7cd5ce20f41 33
+  s_3816fb7b7c4a27::t_ab33cdf3c6a400 48-50
+  s_3816fb7b7c4a27::t_a9d50e30838c98 340-474
+python/volstream/_file.py
+  s_3816fb7b7c4a27::t_83663fed5eaf6f 181-197
+  s_3816fb7b7c4a27::t_b8c0483faa650e 233
+  s_3816fb7b7c4a27::t_f2fc740ba8b1f0 494-505
+  s_3816fb7b7c4a27::t_7b272ec2571faa 271,278-285
+  s_3816fb7b7c4a27::t_c7684c145e3f62 303-310,313
+  s_3816fb7b7c4a27::t_a6fab57a96ba0d 407-408
+  s_3816fb7b7c4a27::t_b2bdf5553a967f 342
+  s_3816fb7b7c4a27::t_8674783dfa08f0 286
+docs/python-plan.md
+  s_3816fb7b7c4a27::t_9c1ad7d459fd24 373-380
+  s_3816fb7b7c4a27::t_6edcc2a2b4a3bc 392
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "762c61b103928f54be51756f6f33f0f82065361b",
+  "prompts": {},
+  "sessions": {
+    "s_3816fb7b7c4a27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b5b5c72-aca3-496b-8412-0fb9ae85948c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
