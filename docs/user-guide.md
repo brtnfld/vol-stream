@@ -749,7 +749,29 @@ connector layout:
 > explains what to use instead — the answer is genuinely different, not merely
 > spelled differently.
 
-### 4.1 Transport and staging (environment)
+### 4.1 Transport and staging
+
+The behavioral settings below can be given per file, on its FAPL, or process
+wide, in the environment. Per file:
+
+```c
+H5VL_stream_config_t cfg;
+
+H5VL_stream_config_init(&cfg);     /* every field "not set" */
+cfg.na            = "ofi+tcp";     /* this file gets the live channel */
+cfg.stage_payload = 0;
+H5Pset_fapl_stream(fapl, &cfg);    /* connector over native, with these settings */
+```
+
+The fields are `na`, `stage_payload`, `max_pending_bytes`, `spill_dir`,
+`concentration` and `bulk_threshold`, each the counterpart of the variable of
+the same name below. **A variable that is set overrides the FAPL value**, so a
+job can be retuned without rebuilding. The same settings work in an
+`HDF5_VOL_CONNECTOR` string, after the under-connector part:
+`vol-stream under_vol=0;under_info={};na=na+sm;stage_payload=0`. A misspelled
+key is refused rather than ignored. The diagnostic variables
+(`VOL_STREAM_PUSH_STATS`, `VOL_STREAM_DEBUG_*`, `VOL_STREAM_TEST_DROP_PUSH`)
+are environment only.
 
 | Variable | Values | Default | Effect |
 |---|---|---|---|

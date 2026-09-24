@@ -1232,6 +1232,15 @@ matches the code. Each item is documented for users in
   first, and end_step collects its notes and pushes them as its last action.
   A `Discard` drop is reported that way (`t_queue_policy`), and so is the
   parallel Spill-as-Block warning, which had never been visible.
+- **Per-file configuration on the FAPL.** `H5Pset_fapl_stream(fapl,
+  &config)` sets the NA string, payload staging, the pending-bytes cap, the
+  spill directory, the concentrator factor and the bulk threshold for one
+  file, so one process can drive two streams configured differently. The
+  config travels in the connector info, so it also works in an
+  `HDF5_VOL_CONNECTOR` string, and an environment variable that is set still
+  overrides its field. `t_config` (two files, the cap, the override, the
+  string form) and `t_config_na` (the transport per file). Also fixed: the
+  info string parser wrote its terminator one byte past its buffer.
 - **An attribute written before its dataset in a step no longer loses the
   step.** Its entry came first, replay made a group of the dataset's name, and
   the dataset's create then failed. Replay now does a step's attributes after
@@ -1284,9 +1293,12 @@ the one list. ★ marks what is being worked on next.
   close this.
 - Subscriptions are not retroactive: a reader that joins at step 500 cannot
   get the steps it missed (subscribe-with-start-step).
-- A reader that vanishes costs the writer push timeouts until SWIM declares
-  it dead. A writer that leaves before any step or answer reaches a reader is
-  not recognised as the end of the stream.
+- A reader that vanishes without closing costs the writer up to one push
+  timeout (1 s) per step until SWIM declares it dead -- about 5 s in CI, after
+  which its subscriptions are dropped. Accepted as the bound: skipping a
+  subscriber after one timeout would lose a slow-but-alive reader's data. A
+  writer that leaves before any step or answer reaches a reader is not
+  recognised as the end of the stream.
 - An attribute written in a step that does not write its dataset is held on a
   group of that name under `/step/<n>/`. Reads through the connector are
   correct; only a native view of the step sees a group (user guide §2.3). A
@@ -1303,7 +1315,6 @@ the one list. ★ marks what is being worked on next.
 
 **Configuration and release**
 
-- Settings are environment variables only; there is no FAPL configuration path.
 - Connector value 1091 is provisional; request an official one before release.
 - The `FLUSH_REFRESH` capability flag is reported and misleading.
 

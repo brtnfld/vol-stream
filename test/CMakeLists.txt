@@ -1,6 +1,6 @@
 foreach(t t_smoke t_step t_replay t_reader t_deferred t_vl_reject t_manifest_cache t_ref_path t_ref_roundtrip
            t_vl_roundtrip t_attr_convert t_payload_compress t_step_rewrite t_reregister t_memspace t_manypaths
-           t_dset_resize t_retention)
+           t_dset_resize t_retention t_config)
   add_executable(${t} ${t}.c)
   target_link_libraries(${t} PRIVATE vol_stream)
 endforeach()
@@ -11,6 +11,9 @@ add_executable(b_step_scale b_step_scale.c)
 target_link_libraries(b_step_scale PRIVATE vol_stream)
 
 add_test(NAME smoke COMMAND t_smoke)
+# Per-file settings through H5Pset_fapl_stream(), their env-var overrides and
+# the HDF5_VOL_CONNECTOR string form.
+add_test(NAME config COMMAND t_config)
 add_test(NAME step COMMAND t_step)
 add_test(NAME replay COMMAND t_replay)
 add_test(NAME reader COMMAND t_reader)
@@ -119,6 +122,16 @@ if(VOL_STREAM_HAVE_MERCURY)
       TIMEOUT 60
     )
   endforeach()
+
+  # The transport turned on per file through H5Pset_fapl_stream(), with
+  # VOL_STREAM_NA unset.
+  add_executable(t_config_na t_config_na.c)
+  target_link_libraries(t_config_na PRIVATE vol_stream)
+  add_test(NAME config_na COMMAND t_config_na)
+  set_tests_properties(config_na PROPERTIES
+    ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
+    TIMEOUT 60
+  )
 
   # A variable-length dataset is not pushed: its pointers mean nothing in
   # another process, and the buffer holding them was already freed.

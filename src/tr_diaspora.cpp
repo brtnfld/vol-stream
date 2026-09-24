@@ -1335,6 +1335,12 @@ vs_tr_set_refilter_shape_cb(vs_tr_t *tr, vs_tr_refilter_shape_fn fn)
 }
 
 void
+vs_tr_set_bulk_threshold(vs_tr_t *, int64_t)
+{
+    /* Payloads travel through Diaspora's own data path; no bulk threshold. */
+}
+
+void
 vs_tr_set_convert_cb(vs_tr_t *tr, vs_tr_convert_fn fn)
 {
     if (tr && fn)

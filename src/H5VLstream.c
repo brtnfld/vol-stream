@@ -345,6 +345,15 @@ struct H5VL_stream_file_state_t {
     size_t                       retain_max_steps;
     uint64_t                     retain_max_bytes;
     uint64_t                     retain_floor;
+    /* Per-file settings from the FAPL (H5Pset_fapl_stream()); an environment
+     * variable that is set overrides each -- see the H5VL__stream_cfg_*()
+     * helpers. */
+    char                        *cfg_na;             /* NULL: no transport */
+    int                          cfg_stage_payload;  /* -1 default (on) */
+    uint64_t                     cfg_max_pending;    /* 0: no limit */
+    char                        *cfg_spill_dir;      /* NULL: /tmp */
+    unsigned                     cfg_concentration;  /* 0/1: off */
+    int64_t                      cfg_bulk_threshold; /* -1: default */
     uint64_t                    *retain_bytes;
     size_t                       n_retain;
     size_t                       cap_retain;
@@ -593,7 +602,7 @@ static herr_t H5VL__stream_replay_local_writes(H5VL_stream_t *file_obj, uint64_t
 static herr_t H5VL__stream_replay_step_parallel(H5VL_stream_t *file_obj);
 /* M6.5 (concentrator topology): see H5VL__stream_replay_concentrated_writes()'s
  * comment for the design. */
-static int    H5VL__stream_concentration_factor(void);
+static int    H5VL__stream_concentration_factor(const H5VL_stream_file_state_t *fs);
 static herr_t H5VL__stream_write_replica(H5VL_stream_t *file_obj, uint64_t physical_step,
                              const char *rel_path, hid_t type_id, hid_t space_id, const void *payload);
 static herr_t H5VL__stream_send_write_entry_to_concentrator(const H5VL_stream_pending_entry_t *pe,
@@ -624,7 +633,7 @@ static void H5VL__stream_step_completion_decref(H5VL_stream_step_completion_t *c
 static herr_t H5VL__stream_make_deferred_request(H5VL_stream_file_state_t *fs, void **req);
 static void H5VL__stream_deferred_request_free(H5VL_stream_t *r);
 #ifdef VOL_STREAM_HAVE_MERCURY
-static const char *H5VL__stream_transport_na(void);
+static const char *H5VL__stream_transport_na(const H5VL_stream_file_state_t *fs);
 static char *H5VL__stream_vsaddr_path(const char *filename);
 static void H5VL__stream_transport_start_writer(H5VL_stream_file_state_t *fs, const char *name);
 static void H5VL__stream_transport_start_reader(H5VL_stream_file_state_t *fs, const char *name);
@@ -1327,10 +1336,57 @@ H5VL__stream_file_state_new(void)
     if (NULL == (fs = (H5VL_stream_file_state_t *)calloc(1, sizeof(H5VL_stream_file_state_t))))
         return NULL;
 
-    fs->refcount = 1;
+    fs->refcount           = 1;
+    fs->cfg_stage_payload  = -1;
+    fs->cfg_bulk_threshold = -1;
 
     return fs;
 } /* end H5VL__stream_file_state_new() */
+
+/*-------------------------------------------------------------------------
+ * Per-file configuration (H5Pset_fapl_stream()). The config travels in the
+ * connector info, so these helpers give it value semantics: its two strings
+ * are owned copies wherever a config is stored.
+ *-------------------------------------------------------------------------
+ */
+static void
+H5VL__stream_config_copy(H5VL_stream_config_t *dst, const H5VL_stream_config_t *src)
+{
+    *dst           = *src;
+    dst->na        = src->na ? strdup(src->na) : NULL;
+    dst->spill_dir = src->spill_dir ? strdup(src->spill_dir) : NULL;
+} /* end H5VL__stream_config_copy() */
+
+static void
+H5VL__stream_config_free(H5VL_stream_config_t *c)
+{
+    free((char *)(uintptr_t)c->na);
+    free((char *)(uintptr_t)c->spill_dir);
+    c->na = c->spill_dir = NULL;
+} /* end H5VL__stream_config_free() */
+
+static int
+H5VL__stream_strcmp_null(const char *a, const char *b)
+{
+    if (!a || !b)
+        return (a != NULL) - (b != NULL);
+    return strcmp(a, b);
+} /* end H5VL__stream_strcmp_null() */
+
+/* The file's settings, from its FAPL's connector info. A config of version 0
+ * (none given) leaves every setting at its default. */
+static void
+H5VL__stream_apply_config(H5VL_stream_file_state_t *fs, const H5VL_stream_config_t *c)
+{
+    if (!fs || !c || c->version == 0)
+        return;
+    fs->cfg_na             = c->na ? strdup(c->na) : NULL;
+    fs->cfg_spill_dir      = c->spill_dir ? strdup(c->spill_dir) : NULL;
+    fs->cfg_stage_payload  = c->stage_payload < 0 ? -1 : (c->stage_payload ? 1 : 0);
+    fs->cfg_max_pending    = c->max_pending_bytes;
+    fs->cfg_concentration  = c->concentration;
+    fs->cfg_bulk_threshold = c->bulk_threshold < 0 ? -1 : c->bulk_threshold;
+} /* end H5VL__stream_apply_config() */
 
 static void
 H5VL__stream_file_state_incref(H5VL_stream_file_state_t *fs)
@@ -1493,6 +1549,8 @@ H5VL__stream_file_state_decref(H5VL_stream_file_state_t *fs)
         vs_bake_stop(fs->spill_bake);
     free(fs->spill_dir);
 #endif
+    free(fs->cfg_na);
+    free(fs->cfg_spill_dir);
 
 #ifdef VOL_STREAM_HAVE_MERCURY
     H5VL__stream_schema_clear(fs);
@@ -1638,9 +1696,11 @@ H5VL__stream_deferred_request_free(H5VL_stream_t *r)
  *-------------------------------------------------------------------------
  */
 static const char *
-H5VL__stream_transport_na(void)
+H5VL__stream_transport_na(const H5VL_stream_file_state_t *fs)
 {
-    return getenv("VOL_STREAM_NA");
+    const char *env = getenv("VOL_STREAM_NA");
+
+    return env ? env : fs->cfg_na;
 } /* end H5VL__stream_transport_na() */
 
 #ifdef VOL_STREAM_HAVE_BAKE
@@ -1656,10 +1716,12 @@ H5VL__stream_transport_na(void)
  *-------------------------------------------------------------------------
  */
 static const char *
-H5VL__stream_spill_dir(void)
+H5VL__stream_spill_dir(const H5VL_stream_file_state_t *fs)
 {
     const char *dir = getenv("VOL_STREAM_SPILL_DIR");
 
+    if (!dir)
+        dir = fs->cfg_spill_dir;
     return dir ? dir : "/tmp";
 } /* end H5VL__stream_spill_dir() */
 #endif
@@ -1707,13 +1769,14 @@ H5VL__stream_ssg_group_path(const char *filename)
 static void
 H5VL__stream_transport_start_writer(H5VL_stream_file_state_t *fs, const char *name)
 {
-    const char *na_str = H5VL__stream_transport_na();
+    const char *na_str = H5VL__stream_transport_na(fs);
     char       *group_file;
 
     if (!na_str)
         return;
     if (NULL == (fs->transport = vs_tr_start(na_str)))
         return;
+    vs_tr_set_bulk_threshold(fs->transport, fs->cfg_bulk_threshold);
 
     /* M8.5 precision, and M9 predicate pushdown: register once, right after
      * start -- see vs_tr_set_refilter_cb()'s comment. All writer-side
@@ -1758,7 +1821,7 @@ H5VL__stream_transport_start_writer(H5VL_stream_file_state_t *fs, const char *na
 static void
 H5VL__stream_transport_start_reader(H5VL_stream_file_state_t *fs, const char *name)
 {
-    const char *na_str = H5VL__stream_transport_na();
+    const char *na_str = H5VL__stream_transport_na(fs);
     char       *group_file;
     int         attempt;
 
@@ -1985,9 +2048,9 @@ H5VL__stream_new_child_obj(void *under_obj, hid_t under_vol_id, H5VL_stream_file
  *-------------------------------------------------------------------------
  */
 static size_t
-H5VL__stream_pending_limit(void)
+H5VL__stream_pending_limit(const H5VL_stream_file_state_t *fs)
 {
-    static int    resolved = 0;
+    static int    resolved = 0, from_env = 0;
     static size_t limit    = 0;
 
     if (!resolved) {
@@ -1997,13 +2060,15 @@ H5VL__stream_pending_limit(void)
             char             *end;
             unsigned long long v = strtoull(s, &end, 10);
 
-            if (end != s && *end == '\0')
-                limit = (size_t)v;
+            if (end != s && *end == '\0') {
+                limit    = (size_t)v;
+                from_env = 1;
+            }
         }
         resolved = 1;
     }
 
-    return limit;
+    return from_env ? limit : (size_t)fs->cfg_max_pending;
 } /* end H5VL__stream_pending_limit() */
 
 /*-------------------------------------------------------------------------
@@ -2026,7 +2091,7 @@ H5VL__stream_pending_limit(void)
 static size_t
 H5VL__stream_pending_append(H5VL_stream_file_state_t *fs, const H5VL_stream_pending_entry_t *entry)
 {
-    size_t limit = H5VL__stream_pending_limit();
+    size_t limit = H5VL__stream_pending_limit(fs);
 
     if (limit > 0 && entry->payload_len > 0) {
         /* Both halves matter. The second is the running total; the first
@@ -4296,7 +4361,7 @@ H5VL__stream_pathmap_clear(H5VL_stream_pathmap_t *m)
  *-------------------------------------------------------------------------
  */
 static int
-H5VL__stream_stage_payload(void)
+H5VL__stream_stage_payload(const H5VL_stream_file_state_t *fs)
 {
     /* Deliberately not cached in a static, unlike the two DEBUG flags: those
      * are read inside the per-subscriber, per-run push loop, while this is
@@ -4305,10 +4370,9 @@ H5VL__stream_stage_payload(void)
      * child -- exactly how the test for this knob first failed. */
     const char *s = getenv("VOL_STREAM_STAGE_PAYLOAD");
 
-    if (s && (s[0] == '0' || s[0] == 'n' || s[0] == 'N' || s[0] == 'f' || s[0] == 'F'))
-        return 0;
-
-    return 1;
+    if (s)
+        return !(s[0] == '0' || s[0] == 'n' || s[0] == 'N' || s[0] == 'f' || s[0] == 'F');
+    return !(fs && fs->cfg_stage_payload == 0);
 } /* end H5VL__stream_stage_payload() */
 
 /*-------------------------------------------------------------------------
@@ -6667,7 +6731,7 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
             H5Sclose(space);
         }
 
-        if (H5VL__stream_stage_payload()) {
+        if (H5VL__stream_stage_payload(file_obj->file_state)) {
             hsize_t dims[1] = {(hsize_t)payload_len};
             hid_t   space   = H5Screate_simple(1, dims, NULL);
             hid_t   pdcpl   = H5P_DATASET_CREATE_DEFAULT;
@@ -6771,7 +6835,7 @@ H5VL__stream_replay_step(H5VL_stream_t *file_obj)
      * data, in both time and peak memory -- measured at ~6ms of a 33ms
      * end_step for a 64MB step (see H5VL__stream_build_manifest()). */
     if (H5VL__stream_build_manifest(fs, &manifest_buf, &manifest_len, &payload_buf, &payload_len,
-                                      H5VL__stream_stage_payload()) < 0)
+                                      H5VL__stream_stage_payload(fs)) < 0)
         return -1;
 
     ret_value = H5VL__stream_replay_manifest(file_obj, manifest_buf, manifest_len, payload_buf, fs->pending,
@@ -7282,14 +7346,15 @@ H5VL__stream_replay_local_writes(H5VL_stream_t *file_obj, uint64_t physical_step
  *-------------------------------------------------------------------------
  */
 static int
-H5VL__stream_concentration_factor(void)
+H5VL__stream_concentration_factor(const H5VL_stream_file_state_t *fs)
 {
     const char *s = getenv("VOL_STREAM_CONCENTRATION");
     long        v;
 
     if (!s || !*s)
-        return 1;
-    v = strtol(s, NULL, 10);
+        v = (long)fs->cfg_concentration;
+    else
+        v = strtol(s, NULL, 10);
     return (v > 1) ? (int)v : 1;
 } /* end H5VL__stream_concentration_factor() */
 
@@ -7876,7 +7941,7 @@ H5VL__stream_replay_step_parallel(H5VL_stream_t *file_obj)
     }
 
     {
-        int group_size = H5VL__stream_concentration_factor();
+        int group_size = H5VL__stream_concentration_factor(fs);
         herr_t write_ret = (group_size > 1)
                                 ? H5VL__stream_replay_concentrated_writes(file_obj, fs->physical_step, group_size)
                                 : H5VL__stream_replay_local_writes(file_obj, fs->physical_step);
@@ -7986,7 +8051,7 @@ H5VL__stream_spill_step(H5VL_stream_t *file_obj)
      * most files never trigger Spill even with the policy set, so most
      * files never pay for a BAKE provider/target at all. */
     if (!fs->spill_bake && fs->transport)
-        fs->spill_bake = vs_bake_start(vs_tr_get_mid(fs->transport), H5VL__stream_spill_dir());
+        fs->spill_bake = vs_bake_start(vs_tr_get_mid(fs->transport), H5VL__stream_spill_dir(fs));
     if (!fs->spill_bake)
         return -1;
 
@@ -8852,6 +8917,7 @@ H5VL_stream_info_copy(const void *_info)
 
     if (info->under_vol_info)
         H5VLcopy_connector_info(new_info->under_vol_id, &(new_info->under_vol_info), info->under_vol_info);
+    H5VL__stream_config_copy(&new_info->config, &info->config);
 
     return new_info;
 } /* end H5VL_stream_info_copy() */
@@ -8894,6 +8960,26 @@ H5VL_stream_info_cmp(int *cmp_value, const void *_info1, const void *_info2)
     if (*cmp_value != 0)
         return 0;
 
+    /* And the per-file settings: two FAPLs that differ only there must not
+     * be treated as the same file access. */
+    {
+        const H5VL_stream_config_t *a = &info1->config, *b = &info2->config;
+
+        if (a->version != b->version)
+            *cmp_value = a->version < b->version ? -1 : 1;
+        else if ((*cmp_value = H5VL__stream_strcmp_null(a->na, b->na)) != 0 ||
+                 (*cmp_value = H5VL__stream_strcmp_null(a->spill_dir, b->spill_dir)) != 0)
+            ;
+        else if (a->stage_payload != b->stage_payload)
+            *cmp_value = a->stage_payload < b->stage_payload ? -1 : 1;
+        else if (a->max_pending_bytes != b->max_pending_bytes)
+            *cmp_value = a->max_pending_bytes < b->max_pending_bytes ? -1 : 1;
+        else if (a->concentration != b->concentration)
+            *cmp_value = a->concentration < b->concentration ? -1 : 1;
+        else if (a->bulk_threshold != b->bulk_threshold)
+            *cmp_value = a->bulk_threshold < b->bulk_threshold ? -1 : 1;
+    }
+
     return 0;
 } /* end H5VL_stream_info_cmp() */
 
@@ -8928,6 +9014,8 @@ H5VL_stream_info_free(void *_info)
     H5Idec_ref(info->under_vol_id);
 
     H5Eset_current_stack(err_id);
+
+    H5VL__stream_config_free(&info->config);
 
     /* Free pass through info object itself */
     free(info);
@@ -8965,14 +9053,36 @@ H5VL_stream_info_to_str(const void *_info, char **str)
     if (under_vol_string)
         under_vol_str_len = strlen(under_vol_string);
 
-    /* Allocate space for our info */
-    size_t strSize = 32 + under_vol_str_len;
-    *str           = (char *)H5allocate_memory(strSize, (bool)0);
-    assert(*str);
+    /* Allocate space for our info: the under-connector part, then any
+     * per-file settings as ;key=value pairs (the keys str_to_info reads). */
+    {
+        const H5VL_stream_config_t *c = &info->config;
+        size_t strSize = 32 + under_vol_str_len + 192 + (c->na ? strlen(c->na) : 0) +
+                         (c->spill_dir ? strlen(c->spill_dir) : 0);
+        size_t len;
 
-    /* Encode our info */
-    snprintf(*str, strSize, "under_vol=%u;under_info={%s}", (unsigned)under_value,
-             (under_vol_string ? under_vol_string : ""));
+        *str = (char *)H5allocate_memory(strSize, (bool)0);
+        assert(*str);
+
+        len = (size_t)snprintf(*str, strSize, "under_vol=%u;under_info={%s}", (unsigned)under_value,
+                               (under_vol_string ? under_vol_string : ""));
+        if (c->version > 0) {
+            if (c->na)
+                len += (size_t)snprintf(*str + len, strSize - len, ";na=%s", c->na);
+            if (c->stage_payload >= 0)
+                len += (size_t)snprintf(*str + len, strSize - len, ";stage_payload=%d", c->stage_payload);
+            if (c->max_pending_bytes > 0)
+                len += (size_t)snprintf(*str + len, strSize - len, ";max_pending_bytes=%llu",
+                                        (unsigned long long)c->max_pending_bytes);
+            if (c->spill_dir)
+                len += (size_t)snprintf(*str + len, strSize - len, ";spill_dir=%s", c->spill_dir);
+            if (c->concentration > 1)
+                len += (size_t)snprintf(*str + len, strSize - len, ";concentration=%u", c->concentration);
+            if (c->bulk_threshold >= 0)
+                snprintf(*str + len, strSize - len, ";bulk_threshold=%lld", (long long)c->bulk_threshold);
+        }
+    }
+    H5free_memory(under_vol_string);
 
     return 0;
 } /* end H5VL_stream_info_to_str() */
@@ -9010,10 +9120,13 @@ H5VL_stream_str_to_info(const char *str, void **_info)
     if (under_vol_info_end != (under_vol_info_start + 1)) {
         char *under_vol_info_str;
 
+        /* The text between the braces, and its terminator: exactly
+         * (end - start) bytes. The terminator used to be written one past
+         * the end of this buffer. */
         under_vol_info_str = (char *)malloc((size_t)(under_vol_info_end - under_vol_info_start));
         memcpy(under_vol_info_str, under_vol_info_start + 1,
                (size_t)((under_vol_info_end - under_vol_info_start) - 1));
-        *(under_vol_info_str + (under_vol_info_end - under_vol_info_start)) = '\0';
+        under_vol_info_str[(under_vol_info_end - under_vol_info_start) - 1] = '\0';
 
         H5VLconnector_str_to_info(under_vol_info_str, under_vol_id, &under_vol_info);
 
@@ -9024,6 +9137,47 @@ H5VL_stream_str_to_info(const char *str, void **_info)
     info                 = (H5VL_stream_info_t *)calloc(1, sizeof(H5VL_stream_info_t));
     info->under_vol_id   = under_vol_id;
     info->under_vol_info = under_vol_info;
+
+    /* Per-file settings after the under-connector part: ;key=value pairs, the
+     * keys H5VL_stream_info_to_str() writes. An unknown key fails the parse
+     * rather than being ignored, so a misspelled setting is not silently
+     * dropped. */
+    H5VL_stream_config_init(&info->config);
+    info->config.version = 0;
+    if (under_vol_info_end && under_vol_info_end[1] != '\0') {
+        char *rest = strdup(under_vol_info_end + 1), *save = NULL, *tok;
+        int   bad  = (rest == NULL);
+
+        for (tok = rest ? strtok_r(rest, ";", &save) : NULL; tok && !bad; tok = strtok_r(NULL, ";", &save)) {
+            char *eq = strchr(tok, '=');
+
+            if (!eq) {
+                bad = 1;
+                break;
+            }
+            *eq++                = '\0';
+            info->config.version = H5VL_STREAM_CONFIG_VERSION;
+            if (!strcmp(tok, "na"))
+                info->config.na = strdup(eq);
+            else if (!strcmp(tok, "stage_payload"))
+                info->config.stage_payload = atoi(eq);
+            else if (!strcmp(tok, "max_pending_bytes"))
+                info->config.max_pending_bytes = (uint64_t)strtoull(eq, NULL, 10);
+            else if (!strcmp(tok, "spill_dir"))
+                info->config.spill_dir = strdup(eq);
+            else if (!strcmp(tok, "concentration"))
+                info->config.concentration = (unsigned)strtoul(eq, NULL, 10);
+            else if (!strcmp(tok, "bulk_threshold"))
+                info->config.bulk_threshold = (int64_t)strtoll(eq, NULL, 10);
+            else
+                bad = 1;
+        }
+        free(rest);
+        if (bad) {
+            H5VL_stream_info_free(info);
+            return -1;
+        }
+    }
 
     /* Set return value */
     *_info = info;
@@ -10857,6 +11011,7 @@ H5VL_stream_file_create(const char *name, unsigned flags, hid_t fcpl_id, hid_t f
             file->path                             = strdup("");
             file->file_state->file_under_object   = under;
             file->file_state->file_under_vol_id   = info->under_vol_id;
+            H5VL__stream_apply_config(file->file_state, &info->config);
 #ifdef H5_HAVE_PARALLEL
             H5VL__stream_detect_mpi_comm(file->file_state, fapl_id);
 #endif
@@ -10932,6 +11087,7 @@ H5VL_stream_file_open(const char *name, unsigned flags, hid_t fapl_id, hid_t dxp
             file->file_state->file_under_object = under;
             file->file_state->file_under_vol_id = info->under_vol_id;
             file->file_state->is_reader         = ((flags & H5F_ACC_RDWR) == 0) ? 1 : 0;
+            H5VL__stream_apply_config(file->file_state, &info->config);
 #ifdef H5_HAVE_PARALLEL
             H5VL__stream_detect_mpi_comm(file->file_state, fapl_id);
 #endif
@@ -13216,6 +13372,47 @@ H5VL_stream_register(void)
 
     return H5VL_STREAM_g;
 } /* end H5VL_stream_register() */
+
+void
+H5VL_stream_config_init(H5VL_stream_config_t *config)
+{
+    if (!config)
+        return;
+    memset(config, 0, sizeof(*config));
+    config->version        = H5VL_STREAM_CONFIG_VERSION;
+    config->stage_payload  = -1;
+    config->bulk_threshold = -1;
+} /* end H5VL_stream_config_init() */
+
+herr_t
+H5Pset_fapl_stream(hid_t fapl_id, const H5VL_stream_config_t *config)
+{
+    H5VL_stream_info_t info;
+    hid_t              vol_id;
+    herr_t             ret_value;
+
+    if ((vol_id = H5VL_stream_register()) < 0)
+        return -1;
+    if (config && config->version != H5VL_STREAM_CONFIG_VERSION)
+        return -1; /* built against a different layout of the struct */
+
+    memset(&info, 0, sizeof(info));
+    info.under_vol_id = H5VL_NATIVE;
+    if (config)
+        info.config = *config; /* H5Pset_vol() deep-copies it through info_copy */
+    else
+        H5VL_stream_config_init(&info.config);
+
+    /* The info copy accepts only an ID the application holds a reference to,
+     * which the library's own native ID is not until one is taken -- the
+     * same as H5VL__stream_default_info(). */
+    if (H5Iinc_ref(info.under_vol_id) < 0)
+        return -1;
+    ret_value = H5Pset_vol(fapl_id, vol_id, &info);
+    H5Idec_ref(info.under_vol_id);
+
+    return ret_value;
+} /* end H5Pset_fapl_stream() */
 
 /* Plugin loader entry points.  These are what make HDF5_VOL_CONNECTOR=vol-stream
  * work, and are the one piece the in-tree pass-through template does not have,

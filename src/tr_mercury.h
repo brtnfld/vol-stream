@@ -236,6 +236,11 @@ typedef struct vs_tr_run_t {
  * loss. */
 #define VS_TR_MAX_PRED_RUNS 64
 
+/* Writer side, Phase 1: this file's bulk threshold in bytes (see
+ * VOL_STREAM_BULK_THRESHOLD, which overrides it when set), or -1 for the
+ * default. Call once, right after vs_tr_start(). */
+void vs_tr_set_bulk_threshold(vs_tr_t *tr, int64_t bytes);
+
 /* Carried on every push: which narrowing the writer could not apply exactly,
  * so the push may hold a superset of what the subscriber asked for. The
  * values are H5VL_STREAM_DELIVERY_* in H5VLstream.h, kept equal there by a

@@ -205,10 +205,33 @@
 #define H5VL_STREAM_VALUE   1091 /* provisional; see note above */
 #define H5VL_STREAM_VERSION 0
 
-/* vol-stream connector info */
+/* Per-file connector settings, set on a FAPL with H5Pset_fapl_stream().
+ *
+ * Each setting has an environment variable of the same meaning (named in its
+ * comment). A variable that is set overrides the FAPL value, so a job can be
+ * retuned without rebuilding; one that is unset leaves the FAPL value in
+ * charge. Settings not given either way take their documented default.
+ *
+ * Start from H5VL_stream_config_init(), which fills in the version and the
+ * "not set" value of every field, then change only what you need. */
+#define H5VL_STREAM_CONFIG_VERSION 1
+
+typedef struct H5VL_stream_config_t {
+    unsigned    version;           /* H5VL_STREAM_CONFIG_VERSION; 0 means "no configuration" */
+    const char *na;                /* VOL_STREAM_NA: Mercury NA string, NULL = no transport */
+    int         stage_payload;     /* VOL_STREAM_STAGE_PAYLOAD: 1 on, 0 off, -1 default (on) */
+    uint64_t    max_pending_bytes; /* VOL_STREAM_MAX_PENDING_BYTES: 0 = no limit */
+    const char *spill_dir;         /* VOL_STREAM_SPILL_DIR: NULL = /tmp */
+    unsigned    concentration;     /* VOL_STREAM_CONCENTRATION: ranks per I/O concentrator, 0 or 1 = off */
+    int64_t     bulk_threshold;    /* VOL_STREAM_BULK_THRESHOLD: bytes, -1 = default (64 KiB) */
+} H5VL_stream_config_t;
+
+/* vol-stream connector info. Built by H5Pset_fapl_stream(); an application
+ * that fills it in directly for H5Pset_vol() may leave config zeroed. */
 typedef struct H5VL_stream_info_t {
-    hid_t under_vol_id;   /* VOL ID for underlying connector   */
-    void *under_vol_info; /* VOL info for underlying connector */
+    hid_t                under_vol_id;   /* VOL ID for underlying connector   */
+    void                *under_vol_info; /* VOL info for underlying connector */
+    H5VL_stream_config_t config;         /* per-file settings; version 0 = none */
 } H5VL_stream_info_t;
 
 /* The connector is built with hidden visibility so its ~140 internal callbacks
@@ -920,6 +943,37 @@ H5VL_STREAM_API herr_t H5Fset_stream_retention_policy(hid_t file_id, size_t max_
  * \return Connector ID on success, H5I_INVALID_HID on failure
  */
 H5VL_STREAM_API hid_t H5VL_stream_register(void);
+
+/**
+ * \brief Fill \p config with H5VL_STREAM_CONFIG_VERSION and every field's
+ *        "not set" value, ready for the caller to change what it needs.
+ *
+ * \param config OUT: the configuration to initialize
+ */
+H5VL_STREAM_API void H5VL_stream_config_init(H5VL_stream_config_t *config);
+
+/**
+ * \brief Use the vol-stream connector on \p fapl_id, with per-file settings.
+ *
+ * The configuration-struct counterpart of H5Pset_vol(fapl_id,
+ * H5VL_stream_register(), NULL): a file opened or created with this FAPL gets
+ * these settings, so one process can drive two streams configured
+ * differently -- a coarse one over the network next to a full one to local
+ * disk. The connector sits over the native connector. \p config is copied,
+ * strings included, so it need not outlive the call.
+ *
+ * Each environment variable named in H5VL_stream_config_t still overrides its
+ * field when set. The same settings can also be given in an
+ * HDF5_VOL_CONNECTOR string, after the under-connector part:
+ * "vol-stream under_vol=0;under_info={};na=na+sm;stage_payload=0;
+ * max_pending_bytes=...;spill_dir=...;concentration=...;bulk_threshold=...".
+ *
+ * \param fapl_id File access property list
+ * \param config  Settings, from H5VL_stream_config_init() and then edited;
+ *                NULL for the defaults
+ * \return \herr_t
+ */
+H5VL_STREAM_API herr_t H5Pset_fapl_stream(hid_t fapl_id, const H5VL_stream_config_t *config);
 
 #ifdef __cplusplus
 }

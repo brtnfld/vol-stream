@@ -116,11 +116,13 @@ static uint64_t vs_push_stats_bulk        = 0; /* pushes whose payload went by b
  * bulk). The default is a placeholder until the RDMA payload-size sweep
  * (Phase 0) measures the crossover. Read once. */
 #define VS_TR_BULK_THRESHOLD_DEFAULT (64u * 1024u)
-static int      vs_bulk_threshold_read = 0;
+static int      vs_bulk_threshold_read = 0, vs_bulk_threshold_env = 0;
 static uint64_t vs_bulk_threshold      = VS_TR_BULK_THRESHOLD_DEFAULT;
 
+/* The environment variable, when set, overrides file_setting (the file's own
+ * tr->bulk_threshold, from H5Pset_fapl_stream(); -1 when it gave none). */
 static uint64_t
-vs_tr_bulk_threshold(void)
+vs_tr_bulk_threshold(int64_t file_setting)
 {
     if (!vs_bulk_threshold_read) {
         const char *e = getenv("VOL_STREAM_BULK_THRESHOLD");
@@ -129,11 +131,15 @@ vs_tr_bulk_threshold(void)
             char              *end = NULL;
             unsigned long long v   = strtoull(e, &end, 10);
 
-            if (end && *end == '\0')
-                vs_bulk_threshold = (uint64_t)v;
+            if (end && *end == '\0') {
+                vs_bulk_threshold     = (uint64_t)v;
+                vs_bulk_threshold_env = 1;
+            }
         }
         vs_bulk_threshold_read = 1;
     }
+    if (!vs_bulk_threshold_env && file_setting >= 0)
+        return (uint64_t)file_setting;
     return vs_bulk_threshold;
 }
 
@@ -547,6 +553,7 @@ struct vs_tr_t {
     vs_tr_inflight_t *inflight;
     size_t             n_inflight;
     size_t             n_borrowed_bulk; /* in-flight pushes pulling from caller memory */
+    int64_t            bulk_threshold;  /* this file's setting, -1 = default */
     size_t             cap_inflight;
 
     /* Members whose push failed during the current vs_tr_writer_push_data()
@@ -1622,6 +1629,7 @@ vs_tr_start(const char *na_str)
         const char *e = getenv("VOL_STREAM_TEST_DROP_PUSH");
 
         tr->test_drop_push = (e && *e) ? (int64_t)strtoll(e, NULL, 10) : -1;
+        tr->bulk_threshold = -1; /* the default until vs_tr_set_bulk_threshold() */
     }
 
     /* Both roles receive RPCs, so both need MARGO_SERVER_MODE and a real
@@ -1701,6 +1709,13 @@ vs_tr_set_refilter_cb(vs_tr_t *tr, vs_tr_refilter_fn fn)
     if (tr)
         tr->refilter_fn = fn;
 }
+
+void
+vs_tr_set_bulk_threshold(vs_tr_t *tr, int64_t bytes)
+{
+    if (tr)
+        tr->bulk_threshold = bytes < 0 ? -1 : bytes;
+} /* end vs_tr_set_bulk_threshold() */
 
 void
 vs_tr_set_convert_cb(vs_tr_t *tr, vs_tr_convert_fn fn)
@@ -2937,7 +2952,7 @@ vs_tr_push_one_item(vs_tr_t *tr, hg_addr_t addr, vs_member_id_t member_id, uint6
      * cover the transfer: 1 s plus 1 ms per 64 KiB, a floor of ~64 MB/s, so
      * a slow link is not mistaken for a dead peer. A failed registration
      * just keeps the payload inline. */
-    if (tr && payload_len > 0 && payload_len >= vs_tr_bulk_threshold()) {
+    if (tr && payload_len > 0 && payload_len >= vs_tr_bulk_threshold(tr->bulk_threshold)) {
         void     *seg     = (void *)(uintptr_t)payload_buf;
         hg_size_t seg_len = (hg_size_t)payload_len;
 
