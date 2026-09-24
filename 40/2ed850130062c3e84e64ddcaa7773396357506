@@ -1,0 +1,28 @@
+docs/python-plan.md
+  s_3816fb7b7c4a27::t_a948678e58e651 367-377,395-397
+pyproject.toml
+  s_3816fb7b7c4a27::t_031be0cdce7056 1-45
+.github/workflows/ci.yml
+  s_3816fb7b7c4a27::t_b14449551cdd0a 384-400
+docs/user-guide.md
+  s_3816fb7b7c4a27::t_a948678e58e651 433
+python/CMakeLists.txt
+  s_3816fb7b7c4a27::t_b8779184b9fbff 15-16,20-36
+  s_3816fb7b7c4a27::t_da26a31a0b301a 37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "402ed850130062c3e84e64ddcaa7773396357506",
+  "prompts": {},
+  "sessions": {
+    "s_3816fb7b7c4a27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b5b5c72-aca3-496b-8412-0fb9ae85948c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
