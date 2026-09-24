@@ -357,10 +357,16 @@ Stated plainly so you can plan around them:
   dimensions equal the dataset's (whole rows); otherwise it is a flat slice of
   the same size. This affects how a re-filtered push is stored in transit, not
   which elements are chosen.
-- **Variable-length datasets and attributes are not pushed.** Their in-memory
-  form is pointers, which mean nothing in another process, so a subscription
-  to one receives nothing; read it from the file. (It used to push the pointer
-  bytes, from a buffer already freed.) `test/t_vl_push.c`.
+- **Variable-length data is pushed whole and un-narrowed.** Its in-memory form
+  is pointers, so the writer sends its serialized form and
+  `H5Fget_subscribed_data()` decodes it into *one* allocation: the `char *` or
+  `hvl_t` array first, the bytes it points to after it, so a single `free()`
+  still releases everything. `size` is the array's size. A selection,
+  predicate or datatype narrowing cannot be applied to it element by element,
+  so it arrives whole and the delivery flags say which were not applied.
+  Only a write whose selection is one contiguous run is pushed (attributes
+  always are); nested variable-length types are not. The Python binding still
+  refuses variable-length types. `test/t_vl_push.c`.
 - **`h5py` cannot open a step.** The step API is optional operations; `h5py` has
   no binding for `H5VLfile_optional_op()`. Python reaches the stream through
   the separate `volstream` package instead, as a subscriber only; see

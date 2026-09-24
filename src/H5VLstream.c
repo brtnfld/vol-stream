@@ -2427,6 +2427,100 @@ H5VL__stream_get_u64le(const uint8_t *src)
     return v;
 }
 
+#ifdef VOL_STREAM_HAVE_MERCURY
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_vl_flatten
+ *
+ * Purpose:     A subscriber's decode of a pushed variable-length object:
+ *              count elements of H5VL__stream_vl_serialize()'s form, turned
+ *              back into hvl_t or char * values -- in ONE allocation, the
+ *              pointer array first and the bytes it points to after it, so
+ *              the caller of H5Fget_subscribed_data() still frees the
+ *              buffer with a single free(). *out_size is the pointer
+ *              array's size (count * the element size), matching what a
+ *              fixed-size push reports.
+ *
+ * Return:      0 on success, -1 on a malformed payload or a type that is
+ *              not variable-length
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_vl_flatten(const uint8_t *type_enc, size_t type_enc_len, const uint8_t *src, size_t src_len,
+                        uint64_t count, void **out, size_t *out_size)
+{
+    hid_t    type = H5I_INVALID_HID, base = H5I_INVALID_HID;
+    int      kind;
+    size_t   elem, base_size = 1, off = 0, total = 0, i;
+    uint8_t *block = NULL, *data;
+    herr_t   ret_value = -1;
+
+    if (!type_enc || !src || !out || !out_size || (type = H5Tdecode2(type_enc, type_enc_len)) < 0)
+        return -1;
+    if ((kind = H5VL__stream_type_vl_kind(type)) == H5VL_STREAM_VL_NONE)
+        goto done;
+    if (kind == H5VL_STREAM_VL_SEQ) {
+        if ((base = H5Tget_super(type)) < 0 || (base_size = H5Tget_size(base)) == 0)
+            goto done;
+        elem = sizeof(hvl_t);
+    }
+    else
+        elem = sizeof(char *);
+
+    /* Pass 1: validate and size. */
+    for (i = 0; i < count; i++) {
+        uint64_t tag;
+
+        if (src_len - off < 8)
+            goto done;
+        tag = H5VL__stream_get_u64le(src + off);
+        off += 8;
+        if (tag > 0) {
+            if (tag - 1 > src_len - off || (kind == H5VL_STREAM_VL_SEQ && (tag - 1) % base_size != 0))
+                goto done;
+            total += (size_t)(tag - 1) + (kind == H5VL_STREAM_VL_STR ? 1 : 0);
+            off += (size_t)(tag - 1);
+        }
+    }
+    if (NULL == (block = (uint8_t *)malloc((size_t)count * elem + total + 1)))
+        goto done;
+
+    /* Pass 2: fill the pointer array, and the bytes after it. */
+    data = block + (size_t)count * elem;
+    for (off = 0, i = 0; i < count; i++) {
+        uint64_t tag = H5VL__stream_get_u64le(src + off);
+        size_t   n   = tag > 0 ? (size_t)(tag - 1) : 0;
+
+        off += 8;
+        if (kind == H5VL_STREAM_VL_SEQ) {
+            hvl_t *v = &((hvl_t *)(void *)block)[i];
+
+            v->len = tag > 0 ? n / base_size : 0;
+            v->p   = tag > 0 ? data : NULL;
+        }
+        else
+            ((char **)(void *)block)[i] = tag > 0 ? (char *)data : NULL;
+        if (tag > 0) {
+            memcpy(data, src + off, n);
+            data += n;
+            if (kind == H5VL_STREAM_VL_STR)
+                *data++ = '\0';
+        }
+        off += n;
+    }
+    *out      = block;
+    *out_size = (size_t)count * elem;
+    block     = NULL;
+    ret_value = 0;
+
+done:
+    free(block);
+    if (base >= 0)
+        H5Tclose(base);
+    H5Tclose(type);
+    return ret_value;
+} /* end H5VL__stream_vl_flatten() */
+#endif /* VOL_STREAM_HAVE_MERCURY */
+
 /*-------------------------------------------------------------------------
  * Function:    H5VL__stream_vl_serialize
  *
@@ -6418,10 +6512,10 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                      * must not fail the replay that already durably
                      * committed this data to the real file.
                      *
-                     * Not for a variable-length type: its in-memory form is
-                     * hvl_t/char* pointers, meaningless in another process,
-                     * and the rebuilt vl_buf holding them is already freed
-                     * above. Such an object is read from the file instead. */
+                     * A variable-length type takes the branch after this one:
+                     * its in-memory form is hvl_t/char* pointers, meaningless
+                     * in another process, so it is pushed in its serialized
+                     * form instead. */
                     if (vl_kind == H5VL_STREAM_VL_NONE && file_obj->file_state &&
                         file_obj->file_state->transport) {
                         uint64_t w_start, w_count;
@@ -6546,6 +6640,31 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                              * points into the manifest buffer, not to an
                              * allocation of this call's own. Nothing in
                              * native_ctx is owned here either. */
+                            free(push_type_enc);
+                            free(push_space_enc);
+                        }
+                    }
+                    else if (vl_kind != H5VL_STREAM_VL_NONE && plen > 0 && file_obj->file_state &&
+                             file_obj->file_state->transport) {
+                        /* The captured payload is already the serialized
+                         * form ([u64 tag][bytes] per selected element, in
+                         * selection order), which the subscriber decodes.
+                         * Only for a write whose selection is one run in
+                         * flat order, where the elements' order is the
+                         * range's own; otherwise it is not pushed. */
+                        H5VL_stream_flat_run_t run;
+
+                        if (H5VL__stream_space_flat_runs(dspace, &run, 1) == 1) {
+                            uint8_t *push_type_enc      = NULL, *push_space_enc = NULL;
+                            size_t   push_type_enc_len  = 0, push_space_enc_len = 0;
+
+                            H5VL__stream_encode_type(dtype, &push_type_enc, &push_type_enc_len);
+                            H5VL__stream_encode_space(dspace, &push_space_enc, &push_space_enc_len);
+                            vs_tr_writer_push_opaque(file_obj->file_state->transport, physical_step, path,
+                                                     entry_payload, (uint64_t)plen, run.start, run.count,
+                                                     push_type_enc, (uint64_t)push_type_enc_len,
+                                                     push_space_enc, (uint64_t)push_space_enc_len,
+                                                     VS_TR_DELIVERY_VL_SERIALIZED);
                             free(push_type_enc);
                             free(push_space_enc);
                         }
@@ -6734,6 +6853,22 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                             free(push_type_enc);
                             free(push_space_enc);
                         }
+                    }
+                    else if (vl_kind != H5VL_STREAM_VL_NONE && a_nelem > 0 && file_obj->file_state &&
+                             file_obj->file_state->transport) {
+                        /* Serialized, as the dataset push above: an
+                         * attribute is always whole, elements 0..n-1. */
+                        uint8_t *push_type_enc     = NULL, *push_space_enc = NULL;
+                        size_t   push_type_enc_len = 0, push_space_enc_len = 0;
+
+                        H5VL__stream_encode_type(dtype, &push_type_enc, &push_type_enc_len);
+                        H5VL__stream_encode_space(dspace, &push_space_enc, &push_space_enc_len);
+                        vs_tr_writer_push_opaque(file_obj->file_state->transport, physical_step, path,
+                                                 entry_payload, (uint64_t)plen, 0, (uint64_t)a_nelem,
+                                                 push_type_enc, (uint64_t)push_type_enc_len, push_space_enc,
+                                                 (uint64_t)push_space_enc_len, VS_TR_DELIVERY_VL_SERIALIZED);
+                        free(push_type_enc);
+                        free(push_space_enc);
                     }
 #endif
                 }
@@ -12634,6 +12769,7 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
 
         {
             uint64_t size64 = 0;
+            uint32_t delivery = 0;
             uint8_t *dcpl_enc = NULL, *type_enc = NULL;
             uint64_t dcpl_enc_len = 0, type_enc_len = 0;
             uint32_t filter_mask = 0;
@@ -12641,7 +12777,7 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
                                                   sargs->physical_step, sargs->path, sargs->buf, &size64,
                                                   sargs->elem_start, sargs->elem_count, &dcpl_enc,
                                                   &dcpl_enc_len, &type_enc, &type_enc_len, &filter_mask,
-                                                  sargs->delivery);
+                                                  &delivery);
 
             *sargs->size = (size_t)size64;
 
@@ -12682,6 +12818,33 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
                     r            = -1;
                 }
             }
+
+            /* A variable-length object arrives serialized: decode it into
+             * one flat allocation (H5VL__stream_vl_flatten()). The marker is
+             * internal and never reaches the caller's flags. */
+            if (r == 0 && (delivery & VS_TR_DELIVERY_VL_SERIALIZED)) {
+                void  *flat      = NULL;
+                size_t flat_size = 0;
+
+                if (H5VL__stream_vl_flatten(type_enc, (size_t)type_enc_len, (const uint8_t *)*sargs->buf,
+                                            *sargs->size, *sargs->elem_count, &flat, &flat_size) == 0) {
+                    free(*sargs->buf);
+                    *sargs->buf  = flat;
+                    *sargs->size = flat_size;
+                }
+                else {
+                    free(*sargs->buf);
+                    *sargs->buf  = NULL;
+                    *sargs->size = 0;
+                    free(*sargs->path);
+                    *sargs->path = NULL;
+                    H5VL_STREAM_ERR(H5VL_stream_err_transport_g,
+                                    "a pushed variable-length object could not be decoded");
+                    r = -1;
+                }
+            }
+            if (sargs->delivery)
+                *sargs->delivery = delivery & ~(uint32_t)VS_TR_DELIVERY_VL_SERIALIZED;
             free(dcpl_enc);
             free(type_enc);
 

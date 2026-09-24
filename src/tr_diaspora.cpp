@@ -1368,6 +1368,13 @@ vs_tr_writer_announce_to(vs_tr_t *, uint64_t, uint64_t, uint64_t)
     return -1;
 }
 
+int
+vs_tr_writer_push_opaque(vs_tr_t *, uint64_t, const char *, const void *, uint64_t, uint64_t, uint64_t,
+                         const uint8_t *, uint64_t, const uint8_t *, uint64_t, uint32_t)
+{
+    return 0; /* not delivered on this backend, as before */
+}
+
 void
 vs_tr_writer_add_region(vs_tr_t *, const void *, uint64_t)
 {

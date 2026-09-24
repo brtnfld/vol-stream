@@ -1232,6 +1232,13 @@ matches the code. Each item is documented for users in
   first, and end_step collects its notes and pushes them as its last action.
   A `Discard` drop is reported that way (`t_queue_policy`), and so is the
   parallel Spill-as-Block warning, which had never been visible.
+- **Variable-length data reaches subscribers.** The writer pushes the
+  serialized form capture already made (`vs_tr_writer_push_opaque()`, marked
+  with an internal delivery bit), and `H5Fget_subscribed_data()` decodes it
+  into one allocation -- pointers first, bytes after -- so one `free()` still
+  releases it. The delivery flags report the narrowings it could not apply;
+  a whole-object subscription gets none. `t_vl_push`: VL strings (NULL and
+  empty kept apart) and VL int sequences, exact.
 - **The `/stream` overlay: a timeline for native tools (and H5Web).** Opt-in
   (`overlay` / `VOL_STREAM_OVERLAY`). `/stream/<path>` is a "printf" virtual
   dataset, `[rows, dims...]` with an unlimited first dimension, whose row j is
@@ -1340,9 +1347,9 @@ the one list. ★ marks what is being worked on next.
 
 **Protocol and semantics**
 
-- Variable-length objects are not pushed to subscribers (they are read from
-  the file). Pushing their serialized form, with a reader-side decode, would
-  close this.
+- Variable-length data is pushed whole (no selection, predicate or type
+  narrowing), only for writes whose selection is one contiguous run, and the
+  Python binding still refuses it.
 - Backfill (`H5Fsubscribe_from()`) must be a reader's first subscription,
   waits for the writer's next step boundary, and is not on the diaspora
   backend.

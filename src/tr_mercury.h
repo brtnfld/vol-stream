@@ -296,6 +296,24 @@ void vs_tr_set_bulk_threshold(vs_tr_t *tr, int64_t bytes);
 #define VS_TR_DELIVERY_PREDICATE_UNEVALUATED 0x2u /* predicate not evaluated: run sent whole */
 #define VS_TR_DELIVERY_PREDICATE_SPAN        0x4u /* matches too fragmented: their span sent */
 #define VS_TR_DELIVERY_TYPE_NATIVE           0x8u /* conversion declined: object's own type sent */
+/* Internal, never shown to an application: the payload is a variable-length
+ * object's serialized form ([u64 tag][tag-1 bytes] per element, see
+ * H5VL__stream_vl_serialize()), which the reader decodes before handing it
+ * over. */
+#define VS_TR_DELIVERY_VL_SERIALIZED         0x80000000u
+
+/* Writer side: push bytes that cannot be narrowed element by element -- a
+ * variable-length object's serialized form -- whole, to every subscriber of
+ * path whose range overlaps [write_start, write_start + write_count). Each
+ * push carries `extra` (VS_TR_DELIVERY_VL_SERIALIZED) plus the bits for the
+ * narrowings it could not apply: the subscriber's selection when it does not
+ * cover the whole write, its predicate, its datatype. Like
+ * vs_tr_writer_push_data(), bytes must stay alive until
+ * vs_tr_writer_release_sources(). */
+int vs_tr_writer_push_opaque(vs_tr_t *tr, uint64_t physical_step, const char *path, const void *bytes,
+                             uint64_t len, uint64_t write_start, uint64_t write_count, const uint8_t *type_enc,
+                             uint64_t type_enc_len, const uint8_t *space_enc, uint64_t space_enc_len,
+                             uint32_t extra);
 
 /* M9: implemented by H5VLstream.c, registered via vs_tr_set_predicate_cb().
  * Same division of labour as vs_tr_refilter_fn -- this module carries

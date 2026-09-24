@@ -3891,6 +3891,88 @@ vs_tr_writer_push_data(vs_tr_t *tr, uint64_t physical_step, const char *path, co
 }
 
 int
+vs_tr_writer_push_opaque(vs_tr_t *tr, uint64_t physical_step, const char *path, const void *bytes,
+                         uint64_t len, uint64_t write_start, uint64_t write_count, const uint8_t *type_enc,
+                         uint64_t type_enc_len, const uint8_t *space_enc, uint64_t space_enc_len,
+                         uint32_t extra)
+{
+    typedef struct {
+        vs_member_id_t member_id;
+        uint32_t       delivery;
+        uint8_t       *sel;     /* the subscriber's selection, to check after the lock */
+        uint64_t       sel_len;
+    } target_t;
+    target_t *targets = NULL;
+    size_t    n = 0, i;
+    uint64_t  write_end = write_start + write_count;
+
+    if (!tr || !path || !bytes || len == 0)
+        return -1;
+    if (!tr->in_group)
+        return 0;
+    tr->n_failed = 0;
+    vs_tr_region_add(tr, bytes, len);
+
+    pthread_mutex_lock(&tr->sub_lock);
+    if (tr->n_sub > 0)
+        targets = (target_t *)malloc(tr->n_sub * sizeof(*targets));
+    for (i = 0; targets && i < tr->n_sub; i++) {
+        vs_tr_sub_entry_t *e = &tr->sub_table[i];
+        uint64_t           s_end;
+
+        if (strcmp(e->path, path) != 0 || e->backfill_state != 0 || e->member_id == tr->self_id)
+            continue;
+        if (tr->push_only_set && e->member_id != tr->push_only_member)
+            continue;
+        s_end = e->sel_count == UINT64_MAX ? UINT64_MAX : e->sel_start + e->sel_count;
+        if (e->sel_start >= write_end || s_end <= write_start)
+            continue; /* its range does not touch this write */
+        targets[n].member_id = e->member_id;
+        targets[n].delivery  = extra;
+        targets[n].sel       = NULL;
+        targets[n].sel_len   = 0;
+        if (e->sel_start > write_start || s_end < write_end)
+            targets[n].delivery |= VS_TR_DELIVERY_SELECTION_SPAN;
+        else if (e->space_enc_len > 0 && NULL != (targets[n].sel = (uint8_t *)malloc(e->space_enc_len))) {
+            memcpy(targets[n].sel, e->space_enc, e->space_enc_len);
+            targets[n].sel_len = e->space_enc_len;
+        }
+        if (e->pred_enc_len > 0)
+            targets[n].delivery |= VS_TR_DELIVERY_PREDICATE_UNEVALUATED;
+        if (e->want_type_enc_len > 0)
+            targets[n].delivery |= VS_TR_DELIVERY_TYPE_NATIVE;
+        n++;
+    }
+    pthread_mutex_unlock(&tr->sub_lock);
+
+    for (i = 0; i < n; i++) {
+        hg_addr_t addr;
+
+        /* Its bounds cover the write, but the selection inside them may
+         * not: exact only if it is the whole write, as one run. */
+        if (targets[i].sel) {
+            vs_tr_run_t run;
+            int         k = tr->selection_fn ? tr->selection_fn(targets[i].sel, targets[i].sel_len, space_enc,
+                                                                space_enc_len, write_start, write_count, &run, 1)
+                                             : -1;
+
+            if (!(k == 1 && run.start == 0 && run.count == write_count))
+                targets[i].delivery |= VS_TR_DELIVERY_SELECTION_SPAN;
+            free(targets[i].sel);
+            targets[i].sel = NULL;
+        }
+        if (vs_tr_member_failed(tr, targets[i].member_id) ||
+            0 != vs_tr_member_addr(tr, targets[i].member_id, &addr))
+            continue;
+        vs_tr_push_one_item(tr, addr, targets[i].member_id, physical_step, path, write_start, write_count, bytes,
+                            len, NULL, 0, type_enc, type_enc_len, 0, targets[i].delivery, NULL);
+        margo_addr_free(tr->mid, addr);
+    }
+    free(targets);
+    return 0;
+} /* end vs_tr_writer_push_opaque() */
+
+int
 vs_tr_reader_wait_data(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physical_step, char **out_path,
                          void **out_buf, uint64_t *out_size, uint64_t *out_elem_start,
                          uint64_t *out_elem_count, uint8_t **out_dcpl_enc, uint64_t *out_dcpl_enc_len,
