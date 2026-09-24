@@ -23,6 +23,10 @@
  *   idle       then nothing until "go" (write step 1) or "done".
  *   eos        then steps 1..3 back to back, and closes at once without
  *              waiting for "done": the reader sees the writer leave.
+ *   grow       writes "/series" instead of "/grid": an unlimited dataset of
+ *              GCOLS ints per row, one row in step 0, then steps 1..3 each
+ *              extend it by a row and write only that row (value r*100+c),
+ *              the tail-only pattern of test/b_push_fanout.c.
  *   block      then sets the Block queue policy with one slot of slack and
  *              commits steps 1..6 back to back, printing how long that took
  *              as "writer_ms <ms>". A reader that acks makes it wait.
@@ -31,7 +35,7 @@
  * "committed" after step 0 and "writes_done" after its last step, and waits
  * for "ready" (the reader has subscribed) and "done" (the reader has closed).
  *
- * usage: stream_writer <column|narrowing|lifecycle|idle|eos|block> <file> <syncdir>
+ * usage: stream_writer <column|narrowing|lifecycle|idle|eos|block|grow> <file> <syncdir>
  */
 
 #include <stdio.h>
@@ -47,6 +51,7 @@
 #define COLS     8
 #define LOCKSTEP 3
 #define LAST     7
+#define GCOLS    4
 
 static char g_syncdir[512];
 
@@ -121,6 +126,48 @@ write_step(hid_t fid, hid_t space, hid_t *ds, int s)
     return 0;
 }
 
+/* One row of "/series": created in step 0, extended by a row per step. */
+static int
+write_grow_step(hid_t fid, hid_t *ds, int s)
+{
+    hsize_t start[2] = {(hsize_t)s, 0}, count[2] = {1, GCOLS};
+    hsize_t dims[2] = {(hsize_t)s + 1, GCOLS};
+    int     vals[GCOLS], c;
+    hid_t   fspace = H5I_INVALID_HID, mspace = H5I_INVALID_HID;
+    int     rc = -1;
+
+    for (c = 0; c < GCOLS; c++)
+        vals[c] = s * 100 + c;
+    if (H5Fbegin_step(fid, 0, NULL, 0) < 0)
+        goto done;
+    if (s == 0) {
+        hsize_t maxdims[2] = {H5S_UNLIMITED, GCOLS};
+        hid_t   space = H5Screate_simple(2, dims, maxdims), dcpl = H5Pcreate(H5P_DATASET_CREATE);
+
+        if (space < 0 || dcpl < 0 || H5Pset_chunk(dcpl, 2, count) < 0 ||
+            (*ds = H5Dcreate2(fid, "/series", H5T_NATIVE_INT, space, H5P_DEFAULT, dcpl, H5P_DEFAULT)) < 0)
+            goto done;
+        H5Sclose(space);
+        H5Pclose(dcpl);
+    }
+    else if (H5Dset_extent(*ds, dims) < 0)
+        goto done;
+    if ((fspace = H5Dget_space(*ds)) < 0 ||
+        H5Sselect_hyperslab(fspace, H5S_SELECT_SET, start, NULL, count, NULL) < 0 ||
+        (mspace = H5Screate_simple(2, count, NULL)) < 0 ||
+        H5Dwrite(*ds, H5T_NATIVE_INT, mspace, fspace, H5P_DEFAULT, vals) < 0 || H5Fend_step(fid) < 0)
+        goto done;
+    rc = 0;
+done:
+    if (fspace >= 0)
+        H5Sclose(fspace);
+    if (mspace >= 0)
+        H5Sclose(mspace);
+    if (rc < 0)
+        fprintf(stderr, "stream_writer: FAIL grow step %d\n", s);
+    return rc;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -131,8 +178,10 @@ main(int argc, char **argv)
 
     if (argc != 4 || (strcmp(argv[1], "column") != 0 && strcmp(argv[1], "narrowing") != 0 &&
                       strcmp(argv[1], "lifecycle") != 0 && strcmp(argv[1], "idle") != 0 &&
-                      strcmp(argv[1], "eos") != 0 && strcmp(argv[1], "block") != 0)) {
-        fprintf(stderr, "usage: %s <column|narrowing|lifecycle|idle|eos|block> <file> <syncdir>\n", argv[0]);
+                      strcmp(argv[1], "eos") != 0 && strcmp(argv[1], "block") != 0 &&
+                      strcmp(argv[1], "grow") != 0)) {
+        fprintf(stderr, "usage: %s <column|narrowing|lifecycle|idle|eos|block|grow> <file> <syncdir>\n",
+                argv[0]);
         return 2;
     }
     mode = argv[1];
@@ -147,7 +196,7 @@ main(int argc, char **argv)
         return 1;
     }
 
-    if (write_step(fid, space, &ds, 0) < 0)
+    if ((!strcmp(mode, "grow") ? write_grow_step(fid, &ds, 0) : write_step(fid, space, &ds, 0)) < 0)
         return 1;
     touch("committed");
     if (wait_for("ready", 60) < 0)
@@ -192,6 +241,11 @@ main(int argc, char **argv)
         }
         printf("max_commit_ms %.1f\n", worst);
         fflush(stdout);
+    }
+    else if (!strcmp(mode, "grow")) {
+        for (s = 1; s <= 3; s++)
+            if (write_grow_step(fid, &ds, s) < 0)
+                return 1;
     }
     else if (!strcmp(mode, "block")) {
         double t0;

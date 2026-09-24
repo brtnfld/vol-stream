@@ -74,8 +74,11 @@ def _dtype(kind, size, order):
 
 
 class _Subscription:
-    def __init__(self, var, start, count):
+    def __init__(self, var, start, count, whole=False):
         self.path = var.path
+        # A whole-dataset subscription follows growth along the first
+        # dimension: the returned array covers whatever rows arrived.
+        self.whole = whole
         self.dims = var.shape
         self.dtype = var.dtype
         self.native_dtype = var.dtype  # what the writer sends without narrowing
@@ -114,13 +117,19 @@ class _Subscription:
         ):
             return pushes[0].data.reshape(self.count)
 
-        out = np.zeros(self.count, dtype=self.dtype)
-        got = np.zeros(self.count, dtype=bool)
+        count = self.count
+        if self.whole:
+            # Rows past the extent seen at subscribe time: the dataset grew.
+            last = max(p.start + len(p.data) for p in pushes) - 1
+            count = (max(count[0], last // self.strides[0] + 1),) + count[1:]
+
+        out = np.zeros(count, dtype=self.dtype)
+        got = np.zeros(count, dtype=bool)
         for p in pushes:
             flat = np.arange(p.start, p.start + len(p.data), dtype=np.int64)
             keep = np.ones(len(flat), dtype=bool)
             local = []
-            for k, (st, dim, s0, c) in enumerate(zip(self.strides, self.dims, self.start, self.count)):
+            for k, (st, dim, s0, c) in enumerate(zip(self.strides, self.dims, self.start, count)):
                 coord = flat // st if k == 0 else (flat // st) % dim
                 coord = coord - s0
                 keep &= (coord >= 0) & (coord < c)
@@ -246,7 +255,7 @@ class File:
                 start, count = (tuple(int(x) for x in s) for s in sel)
                 entry = (path, var.shape, start, count)
             entries.append(entry if deflate is None else entry + (int(deflate),))
-            subs[path] = _Subscription(var, start, count)
+            subs[path] = _Subscription(var, start, count, whole=sel is None)
 
         first = not self._subs
         self._raw.subscribe(entries)

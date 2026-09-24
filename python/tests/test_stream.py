@@ -27,6 +27,9 @@ ctest entry per mode) so every scenario gets a fresh transport.
   samestream The same stream opened twice at once in one process; both
              copies must receive every step.
   reopen     Open, close, and open the same stream again in one process.
+  grow       A dataset extended by one row per step, each step writing only
+             its new row. A whole-dataset subscription must deliver each new
+             row, in an array that has grown to hold it.
   deflate    subscribe(deflate=6): the writer must actually re-filter this
              subscriber's data (its VOL_STREAM_DEBUG_REFILTER trace says so),
              and the values must arrive decoded and exact.
@@ -34,7 +37,7 @@ ctest entry per mode) so every scenario gets a fresh transport.
              test-only VOL_STREAM_TEST_DROP_PUSH): that step must arrive as a
              masked array with exactly the lost row masked.
 
-usage: test_stream.py <stream_writer executable> <column|narrowing|iterate|getonly|torch|eos|drop|ack|noack|twostreams|samestream|reopen|deflate>
+usage: test_stream.py <stream_writer executable> <column|narrowing|iterate|getonly|torch|eos|drop|ack|noack|twostreams|samestream|reopen|deflate|grow>
 """
 
 import os
@@ -340,6 +343,27 @@ class DeflateTest(StreamTest):
         self.assertIn("refilter  filter=1 ", err, "the writer never deflated this subscriber's data")
 
 
+class GrowTest(StreamTest):
+    mode = "grow"
+    GCOLS = 4
+
+    def test_grow(self):
+        self.wait_for("committed")
+        with volstream.follow(self.path, "/series") as f:
+            self.assertEqual(f.schema()["/series"].shape, (1, self.GCOLS))
+            self.touch("ready")
+            steps = list(f.steps(max_steps=3, timeout=30))
+        self.assertEqual(len(steps), 3, "not every step arrived")
+        for s, step in enumerate(steps, start=1):
+            self.assertIn("/series", step, f"step {s}: its new row was never sent")
+            a = step["/series"]
+            self.assertEqual(a.shape, (s + 1, self.GCOLS), f"step {s}")
+            np.testing.assert_array_equal(np.ma.getdata(a)[s], [s * 100 + c for c in range(self.GCOLS)])
+            self.assertTrue(np.ma.getmaskarray(a)[:s].all(), f"step {s}: rows it did not write are not masked")
+        self.touch("done")
+        self.assertEqual(self.writer.wait(timeout=60), 0)
+
+
 def whole_grid(s):
     return np.array([[value(s, r, c) for c in range(COLS)] for r in range(ROWS)], dtype=np.int32)
 
@@ -442,7 +466,7 @@ if __name__ == "__main__":
              "getonly": GetOnlyTest, "torch": TorchTest, "eos": EndOfStreamTest, "drop": DropTest,
              "ack": BackpressureTest, "noack": NoBackpressureTest,
              "twostreams": MultiFileTest, "samestream": MultiFileTest, "reopen": MultiFileTest,
-             "deflate": DeflateTest}
+             "deflate": DeflateTest, "grow": GrowTest}
     if mode not in cases:
         sys.exit(__doc__)
     if mode == "torch":
