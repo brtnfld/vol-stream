@@ -110,6 +110,16 @@ run_reader(void)
     H5Sclose(space);
     touch(SUBSCRIBED_SENTINEL);
 
+    /* A later step's push can already be queued when a step is announced --
+     * the backfilled steps go out back to back -- so a push past the current
+     * step is held for its own step, as the Python binding does. */
+    {
+    uint64_t held_p = 0, held_es = 0, held_ec = 0;
+    char    *held_path = NULL;
+    void    *held_buf  = NULL;
+    size_t   held_size = 0;
+    int      have_held = 0;
+
     for (s = 0; s < 4; s++) {
         int got_x = 0, ok = 1;
 
@@ -131,8 +141,19 @@ run_reader(void)
             size_t   size = 0;
             int      i;
 
-            if (H5Fget_subscribed_data(fid, 0, &p, &path, &buf, &size, &es, &ec, NULL) < 0)
+            if (have_held) {
+                if (held_p != (uint64_t)s)
+                    break; /* still a later step's */
+                p = held_p, es = held_es, ec = held_ec, path = held_path, buf = held_buf, size = held_size;
+                have_held = 0;
+            }
+            else if (H5Fget_subscribed_data(fid, 0, &p, &path, &buf, &size, &es, &ec, NULL) < 0)
                 break;
+            if (p > (uint64_t)s) {
+                held_p = p, held_es = es, held_ec = ec, held_path = path, held_buf = buf, held_size = size;
+                have_held = 1;
+                break;
+            }
             if (p != (uint64_t)s || !path || strcmp(path, "/x") != 0 || es != 0 || ec != N ||
                 size != N * sizeof(int))
                 ok = 0;
@@ -157,6 +178,11 @@ run_reader(void)
     if (!rc && H5Fwait_step_ready(fid, 500, &phys, &wall) >= 0) {
         printf("  FAIL  an extra step %llu was announced\n", (unsigned long long)phys);
         rc = 1;
+    }
+    if (have_held) {
+        free(held_path);
+        free(held_buf);
+    }
     }
 
     H5Fclose(fid);
