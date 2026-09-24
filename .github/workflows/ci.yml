@@ -396,6 +396,13 @@ jobs:
           ROOT=$PWD
           cd "$RUNNER_TEMP"
           python3 -c "import volstream, sys; assert '$ROOT' not in volstream.__file__, volstream.__file__; print('installed at', volstream.__file__)"
+          # The installed extension's search path must not point into pip's
+          # temporary build directory (seen on macOS with Homebrew GCC).
+          EXT=$(python3 -c "import volstream._volstream as e; print(e.__file__)")
+          readelf -d "$EXT" | grep -E "RPATH|RUNPATH"
+          if readelf -d "$EXT" | grep -E "RPATH|RUNPATH" | grep -q "/tmp/"; then
+            echo "installed extension's RPATH points into a temporary build directory"; exit 1
+          fi
           python3 "$ROOT/python/tests/test_open.py" "$ROOT/build/python/py_stream_fixture"
           LD_LIBRARY_PATH=$HOME/mochi-install/lib:$HOME/mochi-install/lib64:$LD_LIBRARY_PATH \
             python3 "$ROOT/python/tests/test_stream.py" "$ROOT/build/python/py_stream_writer" column
@@ -433,7 +440,7 @@ jobs:
           VOL_STREAM_NA=ofi+tcp \
           LD_LIBRARY_PATH=$HOME/mochi-install/lib:$HOME/mochi-install/lib64:$LD_LIBRARY_PATH \
             ctest --test-dir build --output-on-failure \
-              -R 'transport|rendezvous|queue_policy|subscribe|precision$|chunk_zerocopy|subvolume_nd|strided_write|schema'
+              -R 'transport|rendezvous|queue_policy|subscribe|precision$|chunk_zerocopy|subvolume_nd|strided_write|schema|python_stream|python_lifecycle'
 
   # ---------------------------------------------------------------------------
   # Sanitizers. A background progress thread plus a step queue is the classic

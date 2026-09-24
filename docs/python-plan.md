@@ -385,16 +385,21 @@ supported, or depends on something outside this binding.
 
 ### Untested
 
-- **`ofi+tcp`.** Every Python test runs over `na+sm`. The C suite's `ofi+tcp`
-  pass is a subset and non-gating.
+- **`ofi+tcp` is not gating.** The Python stream and lifecycle tests run in
+  CI's `ofi+tcp` pass as well as its `na+sm` one, but that pass is
+  non-gating (it tolerates a known libfabric teardown stall; see ci.yml), so
+  an `ofi+tcp` failure is reported rather than blocking.
 - **Two Files open at once in one process**, including two on the same file.
   Nothing tests it. The connector starts a transport per file, and whether
   two transports coexist in one process has not been checked.
 - **`volstream.torch` outside CI.** It is tested only where torch is
   installed (the CI job installs the CPU wheel). Elsewhere the test is skipped.
-- **Anything but Linux.** CI builds and tests on Ubuntu only. The binding
-  assumes a POSIX system (`fork()`, `getpid()`, `clock_gettime()`). It has
-  not been built on macOS, and Windows is out of scope.
+- **macOS with the transport.** CI is Linux only. On macOS (checked locally
+  on 2026-09-24, against HDF5 2.3.0 and MPICH 4.3.2, without Mochi) the
+  connector and the binding build, `pip install .` works, and the tests that
+  need no transport pass. Nothing with the transport has run on macOS.
+  Windows is out of scope: the binding assumes POSIX (`fork()`, `getpid()`,
+  `clock_gettime()`).
 
 ### Not supported
 
@@ -435,7 +440,8 @@ supported, or depends on something outside this binding.
   extension's RPATH still lists pip's temporary build directory (deleted
   after the install) and GCC's library directories. The package imports and
   its tests pass from outside the source tree, so this is cosmetic. Not
-  investigated further; on Linux CI it has not been checked either way.
+  investigated further. On Linux, CI prints the installed extension's RPATH
+  and fails if it points into a temporary build directory.
 
 ## What this does not fix
 

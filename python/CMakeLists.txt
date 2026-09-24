@@ -76,7 +76,9 @@ if(VOL_STREAM_BUILD_TESTS)
             $<TARGET_FILE:py_stream_fixture>)
   set_tests_properties(python_open PROPERTIES ENVIRONMENT "${_py_env}" TIMEOUT 60)
 
-  # P2 exit gate: whole steps from a live C writer, over na+sm.
+  # P2 exit gate: whole steps from a live C writer. The scripts default
+  # VOL_STREAM_NA to na+sm themselves rather than having it forced here, so
+  # CI's ofi+tcp pass can run them over ofi+tcp by exporting it.
   if(VOL_STREAM_HAVE_MERCURY)
     add_executable(py_stream_writer tests/stream_writer.c)
     target_link_libraries(py_stream_writer PRIVATE vol_stream)
@@ -87,7 +89,7 @@ if(VOL_STREAM_BUILD_TESTS)
         COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_stream.py
                 $<TARGET_FILE:py_stream_writer> ${mode})
       set_tests_properties(python_stream_${mode} PROPERTIES
-        ENVIRONMENT "${_py_env};VOL_STREAM_NA=na+sm"
+        ENVIRONMENT "${_py_env}"
         TIMEOUT 120
         SKIP_RETURN_CODE 77
       )
@@ -100,7 +102,7 @@ if(VOL_STREAM_BUILD_TESTS)
         COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_lifecycle.py
                 $<TARGET_FILE:py_stream_writer> ${mode})
       set_tests_properties(python_lifecycle_${mode} PROPERTIES
-        ENVIRONMENT "${_py_env};VOL_STREAM_NA=na+sm"
+        ENVIRONMENT "${_py_env}"
         TIMEOUT 120
       )
     endforeach()
