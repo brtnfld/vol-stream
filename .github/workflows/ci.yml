@@ -151,7 +151,7 @@ jobs:
   # mercury, argobots, mochi-margo, mochi-thallium, mochi-flock,
   # mochi-abt-io and mochi-bake are not Ubuntu packages, so build them from
   # source -- the exact versions verified locally: argobots 1.2, mercury
-  # 2.3.1 (+sm +ofi), mochi-margo 0.24.2 (CMake as of this release, not
+  # 2.4.1 (+sm +ofi), mochi-margo 0.24.2 (CMake as of this release, not
   # autotools -- see below), mochi-thallium 0.17.1 (flock's C++ dependency;
   # needs only cereal, apt-installed as libcereal-dev), mochi-flock 0.8.0,
   # mochi-abt-io 0.9.0, mochi-bake 0.6.4. margo and flock floors are
@@ -251,10 +251,10 @@ jobs:
           ./configure --prefix=$HOME/mochi-install
           make -j"$(nproc)" && make install
 
-      - name: Build mercury 2.3.1
+      - name: Build mercury 2.4.1
         run: |
-          curl -sSL https://github.com/mercury-hpc/mercury/releases/download/v2.3.1/mercury-2.3.1.tar.bz2 | tar xj
-          cmake -S mercury-2.3.1 -B mercury-build -G Ninja \
+          curl -sSL https://github.com/mercury-hpc/mercury/releases/download/v2.4.1/mercury-2.4.1.tar.bz2 | tar xj
+          cmake -S mercury-2.4.1 -B mercury-build -G Ninja \
             -DCMAKE_INSTALL_PREFIX=$HOME/mochi-install \
             -DCMAKE_PREFIX_PATH=$HOME/mochi-install \
             -DCMAKE_BUILD_TYPE=Release \
