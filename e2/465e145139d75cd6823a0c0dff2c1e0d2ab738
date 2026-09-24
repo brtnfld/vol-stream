@@ -1,0 +1,22 @@
+python/_volstream.c
+  s_3816fb7b7c4a27::t_7f8fef3f9802d4 556-557,588-591,595,599-600,628-642,644-645,707,986
+python/volstream/_file.py
+  s_3816fb7b7c4a27::t_7f8fef3f9802d4 181-197,294,298-299
+  s_3816fb7b7c4a27::t_0e9e25b2259313 292-293,300
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e2465e145139d75cd6823a0c0dff2c1e0d2ab738",
+  "prompts": {},
+  "sessions": {
+    "s_3816fb7b7c4a27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b5b5c72-aca3-496b-8412-0fb9ae85948c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
