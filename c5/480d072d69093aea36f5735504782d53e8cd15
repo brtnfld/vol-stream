@@ -1,0 +1,25 @@
+docs/python-plan.md
+  s_3816fb7b7c4a27::t_2dbe150a2a844b 430-432
+src/H5VLstream.c
+  s_3816fb7b7c4a27::t_2dbe150a2a844b 2936-2942
+src/H5VLstream.h
+  s_3816fb7b7c4a27::t_2dbe150a2a844b 157-163,458-461
+docs/user-guide.md
+  s_3816fb7b7c4a27::t_2dbe150a2a844b 323-327
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c5480d072d69093aea36f5735504782d53e8cd15",
+  "prompts": {},
+  "sessions": {
+    "s_3816fb7b7c4a27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b5b5c72-aca3-496b-8412-0fb9ae85948c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
