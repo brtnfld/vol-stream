@@ -33,6 +33,12 @@
  * dataset each step -- the pattern the connector already handled, and the
  * one dev-plan.md decision #2 describes as successive versions of one named
  * object landing group-based at /step/<n>/.
+ *
+ * Attributes had the same bug, found 2026-09-24 by the Python binding's types
+ * test: H5Awrite through a handle whose creating step had been replayed went
+ * straight to the under connector, so a rewritten attribute was never pushed
+ * and step 0's copy took the last value written. The fix is the same shape
+ * (H5VL__stream_step_attr_index()), and /temp@scale below pins it.
  */
 
 #include <stdio.h>
@@ -53,6 +59,47 @@ static int
 val_for(int s, int i)
 {
     return s * 100 + i;
+}
+
+/* The attribute's value in step s. */
+static int
+attr_for(int s)
+{
+    return s * 10 + 7;
+}
+
+static int
+check_attr(hid_t nfid, int s)
+{
+    char  path[64];
+    hid_t ds, attr;
+    int   got = -1;
+
+    snprintf(path, sizeof(path), "/step/%d/temp", s);
+    if ((ds = H5Dopen2(nfid, path, H5P_DEFAULT)) < 0) {
+        printf("  FAIL  %s missing\n", path);
+        return 1;
+    }
+    H5E_BEGIN_TRY
+    {
+        attr = H5Aopen(ds, "scale", H5P_DEFAULT);
+    }
+    H5E_END_TRY
+    if (attr < 0) {
+        printf("  FAIL  %s has no attribute 'scale' -- the rewrite was never captured\n", path);
+        H5Dclose(ds);
+        return 1;
+    }
+    if (H5Aread(attr, H5T_NATIVE_INT, &got) < 0 || got != attr_for(s)) {
+        printf("  FAIL  %s@scale = %d, expected %d%s\n", path, got, attr_for(s),
+               s == 0 ? " -- a later step's write landed on step 0's copy" : "");
+        H5Aclose(attr);
+        H5Dclose(ds);
+        return 1;
+    }
+    H5Aclose(attr);
+    H5Dclose(ds);
+    return 0;
 }
 
 static int
@@ -93,7 +140,8 @@ check_step(hid_t nfid, int s)
 int
 main(void)
 {
-    hid_t   vol_id, fapl, fid, space, ds, nfid;
+    hid_t   vol_id, fapl, fid, space, ds, nfid, scalar, attr;
+    int     aval;
     hsize_t dims = NELEM;
     int     vals[NELEM];
     int     s, i, nerrors = 0;
@@ -132,7 +180,11 @@ main(void)
     }
     for (i = 0; i < NELEM; i++)
         vals[i] = val_for(0, i);
-    if (H5Dwrite(ds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, vals) < 0) {
+    aval = attr_for(0);
+    if (H5Dwrite(ds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, vals) < 0 ||
+        (scalar = H5Screate(H5S_SCALAR)) < 0 ||
+        (attr = H5Acreate2(ds, "scale", H5T_NATIVE_INT, scalar, H5P_DEFAULT, H5P_DEFAULT)) < 0 ||
+        H5Awrite(attr, H5T_NATIVE_INT, &aval) < 0) {
         printf("  FAIL  write step 0\n");
         return 1;
     }
@@ -148,7 +200,9 @@ main(void)
         }
         for (i = 0; i < NELEM; i++)
             vals[i] = val_for(s, i);
-        if (H5Dwrite(ds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, vals) < 0) {
+        aval = attr_for(s);
+        if (H5Dwrite(ds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, vals) < 0 ||
+            H5Awrite(attr, H5T_NATIVE_INT, &aval) < 0) {
             printf("  FAIL  write step %d\n", s);
             return 1;
         }
@@ -158,6 +212,8 @@ main(void)
         }
     }
 
+    H5Aclose(attr);
+    H5Sclose(scalar);
     H5Dclose(ds);
     H5Sclose(space);
     H5Fclose(fid);
@@ -173,6 +229,15 @@ main(void)
 
     if (!nerrors)
         printf("  ok    each of %d steps holds its own values at /step/<n>/temp\n", NSTEPS);
+    {
+        int attr_errors = 0;
+
+        for (s = 0; s < NSTEPS; s++)
+            attr_errors += check_attr(nfid, s);
+        if (!attr_errors)
+            printf("  ok    and its own value of the attribute rewritten through one handle\n");
+        nerrors += attr_errors;
+    }
 
     /* A partial write through the same live handle: same capture path, but
      * only part of the extent, so it also pins that the synthesized create

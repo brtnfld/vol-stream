@@ -9301,6 +9301,95 @@ H5VL_stream_attr_read(void *attr, hid_t mem_type_id, void *buf, hid_t dxpl_id, v
  *
  *-------------------------------------------------------------------------
  */
+static int H5VL__stream_dset_capture(H5VL_stream_t *o);
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_step_attr_index
+ *
+ * Purpose:     Index of the pending Attr entry a write to attribute o
+ *              belongs to, creating one if this step has none.
+ *
+ *              The attribute counterpart of H5VL__stream_step_create_index().
+ *              A placeholder already knows its own entry. A live attribute
+ *              -- one whose creating step has been replayed, written again
+ *              through the same handle in a later step -- does not, and used
+ *              to fall through to the under connector: the write never
+ *              entered a manifest (no push, nothing in /step/<n>/) and landed
+ *              on the earlier step's copy, rewriting committed history. That
+ *              is the dataset bug test/t_step_rewrite.c pins, left open for
+ *              attributes. The step gets an entry synthesized from the
+ *              attribute's real type, dataspace and ACPL, read back through
+ *              the under connector, so its replayed copy matches the original.
+ *
+ *              owner_wrapper stays NULL: o keeps its own live under object,
+ *              and replay closes the copy it makes for this step.
+ *
+ * Return:      0 on success (*out_index set), -1 on failure.
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL__stream_step_attr_index(H5VL_stream_t *o, size_t *out_index)
+{
+    H5VL_stream_file_state_t   *fs = o->file_state;
+    H5VL_stream_pending_entry_t ae;
+    H5VL_attr_get_args_t        gargs;
+    size_t                      k, idx;
+
+    if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER) {
+        *out_index = o->pending_index;
+        return 0;
+    }
+
+    /* One entry per attribute per step, as for a placeholder: H5Awrite
+     * overwrites atomically, so a second write in the step replaces it. */
+    for (k = 0; k < fs->n_pending; k++)
+        if (fs->pending[k].kind == vs_Kind_Attr && fs->pending[k].path &&
+            strcmp(fs->pending[k].path, o->path) == 0) {
+            *out_index = k;
+            return 0;
+        }
+
+    memset(&ae, 0, sizeof(ae));
+    ae.kind     = vs_Kind_Attr;
+    ae.type_id  = H5I_INVALID_HID;
+    ae.space_id = H5I_INVALID_HID;
+    ae.dcpl_id  = H5I_INVALID_HID;
+    ae.dapl_id  = H5I_INVALID_HID;
+
+    memset(&gargs, 0, sizeof(gargs));
+    gargs.op_type = H5VL_ATTR_GET_TYPE;
+    if (H5VLattr_get(o->under_object, o->under_vol_id, &gargs, H5P_DATASET_XFER_DEFAULT, NULL) < 0)
+        return -1;
+    ae.type_id = gargs.args.get_type.type_id;
+
+    memset(&gargs, 0, sizeof(gargs));
+    gargs.op_type = H5VL_ATTR_GET_SPACE;
+    if (H5VLattr_get(o->under_object, o->under_vol_id, &gargs, H5P_DATASET_XFER_DEFAULT, NULL) < 0) {
+        H5VL__stream_pending_entry_clear(&ae);
+        return -1;
+    }
+    ae.space_id = gargs.args.get_space.space_id;
+
+    memset(&gargs, 0, sizeof(gargs));
+    gargs.op_type = H5VL_ATTR_GET_ACPL;
+    if (H5VLattr_get(o->under_object, o->under_vol_id, &gargs, H5P_DATASET_XFER_DEFAULT, NULL) < 0) {
+        H5VL__stream_pending_entry_clear(&ae);
+        return -1;
+    }
+    ae.dcpl_id = gargs.args.get_acpl.acpl_id;
+
+    if (NULL == (ae.path = strdup(o->path))) {
+        H5VL__stream_pending_entry_clear(&ae);
+        return -1;
+    }
+    if ((idx = H5VL__stream_pending_append(fs, &ae)) == (size_t)-1) {
+        H5VL__stream_pending_entry_clear(&ae);
+        return -1;
+    }
+    *out_index = idx;
+    return 0;
+} /* end H5VL__stream_step_attr_index() */
+
 static herr_t
 H5VL_stream_attr_write(void *attr, hid_t mem_type_id, const void *buf, hid_t dxpl_id, void **req)
 {
@@ -9322,11 +9411,18 @@ H5VL_stream_attr_write(void *attr, hid_t mem_type_id, const void *buf, hid_t dxp
      * garbage. Nothing in the suite caught it because every attribute
      * scenario used matching native types; see test/t_attr_convert.c.
      */
-    if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER) {
-        H5VL_stream_pending_entry_t *e = &o->file_state->pending[o->pending_index];
+    if (H5VL__stream_dset_capture(o)) {
+        H5VL_stream_pending_entry_t *e;
+        size_t                        idx;
         hssize_t                      n_elem;
         size_t                        nbytes;
         int                           vl_kind;
+
+        /* A placeholder's own entry, or one synthesized for a live attribute
+         * being written again in a later step. */
+        if (H5VL__stream_step_attr_index(o, &idx) < 0)
+            return -1;
+        e = &o->file_state->pending[idx];
 
         if ((n_elem = H5Sget_select_npoints(e->space_id)) < 0)
             return -1;
