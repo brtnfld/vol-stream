@@ -23,11 +23,15 @@ ctest entry per mode) so every scenario gets a fresh transport.
              a consumer that takes 0.4 s per step must slow the writer down.
   noack      The same without backpressure: the writer must not wait, which
              is what a subscriber that never acks gets.
+  twostreams Two different live streams open at once in one process.
+  samestream The same stream opened twice at once in one process; both
+             copies must receive every step.
+  reopen     Open, close, and open the same stream again in one process.
   drop       The column scenario with one push lost on the way (the writer's
              test-only VOL_STREAM_TEST_DROP_PUSH): that step must arrive as a
              masked array with exactly the lost row masked.
 
-usage: test_stream.py <stream_writer executable> <column|narrowing|iterate|getonly|torch|eos|drop|ack|noack>
+usage: test_stream.py <stream_writer executable> <column|narrowing|iterate|getonly|torch|eos|drop|ack|noack|twostreams|samestream|reopen>
 """
 
 import os
@@ -253,6 +257,64 @@ class NoBackpressureTest(BackpressureTest):
         self.assertLess(writer_ms, 1000, f"the writer waited for a reader that never acks ({writer_ms:.0f} ms)")
 
 
+class MultiFileTest(StreamTest):
+    """One process, more than one File. The writer is in narrowing mode:
+    step 0 before "ready", then steps 1..3 back to back."""
+
+    mode = "narrowing"
+
+    def read_three(self, f, who):
+        got = [step["/grid"] for step in f.steps(max_steps=3, timeout=30)]
+        self.assertEqual(len(got), 3, f"{who}: not every step arrived")
+        for s, a in enumerate(got, start=1):
+            np.testing.assert_array_equal(a, whole_grid(s), err_msg=f"{who}, step {s}")
+
+    def second_writer(self):
+        sync = os.path.join(self.tmp.name, "second")
+        os.mkdir(sync)
+        path = os.path.join(sync, "stream.h5")
+        writer = subprocess.Popen([WRITER, "narrowing", path, sync], env=dict(os.environ))
+        return writer, path, sync
+
+    def test_twostreams(self):
+        writer2, path2, sync2 = self.second_writer()
+        try:
+            self.wait_for("committed")
+            deadline = time.monotonic() + 60
+            while not os.path.exists(os.path.join(sync2, "committed")):
+                self.assertLess(time.monotonic(), deadline, "second writer never committed")
+                time.sleep(0.05)
+            with volstream.follow(self.path, "/grid") as a, volstream.follow(path2, "/grid") as b:
+                self.touch("ready")
+                open(os.path.join(sync2, "ready"), "w").close()
+                self.read_three(a, "first stream")
+                self.read_three(b, "second stream")
+        finally:
+            open(os.path.join(sync2, "done"), "w").close()
+            self.assertEqual(writer2.wait(timeout=60), 0, "second writer failed")
+        self.touch("done")
+        self.assertEqual(self.writer.wait(timeout=60), 0)
+
+    def test_samestream(self):
+        self.wait_for("committed")
+        with volstream.follow(self.path, "/grid") as a, volstream.follow(self.path, "/grid") as b:
+            self.touch("ready")
+            self.read_three(a, "first File")
+            self.read_three(b, "second File")
+        self.touch("done")
+        self.assertEqual(self.writer.wait(timeout=60), 0)
+
+    def test_reopen(self):
+        self.wait_for("committed")
+        with volstream.follow(self.path, "/grid") as a:
+            self.assertFalse(a.closed)
+        with volstream.follow(self.path, "/grid") as b:
+            self.touch("ready")
+            self.read_three(b, "reopened File")
+        self.touch("done")
+        self.assertEqual(self.writer.wait(timeout=60), 0)
+
+
 def whole_grid(s):
     return np.array([[value(s, r, c) for c in range(COLS)] for r in range(ROWS)], dtype=np.int32)
 
@@ -353,7 +415,8 @@ if __name__ == "__main__":
     mode = sys.argv.pop(1)
     cases = {"column": ColumnTest, "narrowing": NarrowingTest, "iterate": IterateTest,
              "getonly": GetOnlyTest, "torch": TorchTest, "eos": EndOfStreamTest, "drop": DropTest,
-             "ack": BackpressureTest, "noack": NoBackpressureTest}
+             "ack": BackpressureTest, "noack": NoBackpressureTest,
+             "twostreams": MultiFileTest, "samestream": MultiFileTest, "reopen": MultiFileTest}
     if mode not in cases:
         sys.exit(__doc__)
     if mode == "torch":
@@ -362,6 +425,9 @@ if __name__ == "__main__":
         except ImportError:
             print("torch is not installed; skipping")
             sys.exit(77)
-    suite = unittest.defaultTestLoader.loadTestsFromTestCase(cases[mode])
+    if cases[mode] is MultiFileTest:
+        suite = unittest.TestSuite([MultiFileTest(f"test_{mode}")])
+    else:
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(cases[mode])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)
