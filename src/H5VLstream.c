@@ -5686,9 +5686,55 @@ H5VL__stream_space_flat_runs_range(hid_t space_id, uint64_t range_start, uint64_
         for (d = 0; d < rank; d++)
             cur[d] = bs[d];
 
+        /* The walk below is one step per leading coordinate, which a
+         * selection made against an unbounded first dimension -- a
+         * subscription following a growing dataset -- makes ~2**60 steps
+         * long. Two shortcuts keep it proportional to the answer: */
+        if (rank > 1 && stride[0] > 0) {
+            int full = 1;
+
+            for (d = 1; d < rank; d++)
+                if (bs[d] != 0 || be[d] != dims[d] - 1)
+                    full = 0;
+            if (full) {
+                /* spanning every trailing dimension, the block is one run */
+                uint64_t cs = (uint64_t)bs[0] * (uint64_t)stride[0];
+                uint64_t ce = ((uint64_t)be[0] + 1) * (uint64_t)stride[0];
+
+                if (cs < range_start)
+                    cs = range_start;
+                if (ce > range_end)
+                    ce = range_end;
+                if (cs >= ce)
+                    continue;
+                if (n_runs > 0 && runs[n_runs - 1].start + runs[n_runs - 1].count == cs)
+                    runs[n_runs - 1].count += ce - cs;
+                else {
+                    if (n_runs >= max_runs) {
+                        free(blocks);
+                        return -1;
+                    }
+                    runs[n_runs].start = cs;
+                    runs[n_runs].count = ce - cs;
+                    n_runs++;
+                }
+                continue;
+            }
+            /* otherwise start at the first row the range reaches: every
+             * element of an earlier row is before range_start */
+            if ((uint64_t)cur[0] < range_start / (uint64_t)stride[0])
+                cur[0] = (hsize_t)(range_start / (uint64_t)stride[0]);
+            if (cur[0] > be[0])
+                continue;
+        }
+
         for (;;) {
             uint64_t flat = 0;
             uint64_t cs, ce;
+
+            /* ...and stop at the first row past it: the walk only ascends */
+            if (rank > 1 && stride[0] > 0 && (uint64_t)cur[0] * (uint64_t)stride[0] >= range_end)
+                break;
 
             for (d = 0; d < rank; d++)
                 flat += (uint64_t)cur[d] * (uint64_t)stride[d];

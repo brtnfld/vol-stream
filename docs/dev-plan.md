@@ -1351,7 +1351,11 @@ matches the code. Each item is documented for users in
   including rows not yet written: an ROI of every future frame. `tail=True`
   returns only the rows a step sent, with `step.first_row[path]`, so a
   step's cost no longer grows with the run. `python_stream_growtail`;
-  `examples/silx_live_view` uses it.
+  `examples/silx_live_view` uses it. That subscription is a hyperslab about
+  2**60 rows tall, and the writer's flat-run decomposition walked it one row at
+  a time: CI hung. It now starts at the first row the push's range reaches,
+  stops past its end, and takes a block spanning every trailing dimension
+  as one run.
 - **`H5Dset_extent()` on a dataset created in the open step now works.** A
   NeXus detector writer creates its frame stack empty (`[0, i, j]`,
   unlimited) and extends it before the first frame, all in one step. That
