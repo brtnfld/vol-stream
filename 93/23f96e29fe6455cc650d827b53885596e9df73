@@ -1,0 +1,35 @@
+docs/dev-plan.md
+  s_3816fb7b7c4a27::t_7e3e858bf40bed 1402-1407
+docs/user-guide.md
+  s_3816fb7b7c4a27::t_7e3e858bf40bed 1676
+examples/silx_live_view/silx_live_view.py
+  s_3816fb7b7c4a27::t_df07a94a6c074a 1-175
+examples/detector_pipeline/detector_writer.c
+  s_3816fb7b7c4a27::t_8fe963fa160e73 169-171,212-214,216-219
+  s_3816fb7b7c4a27::t_5c93165ac8706c 215
+python/CMakeLists.txt
+  s_3816fb7b7c4a27::t_b07222939beacb 110-122
+examples/detector_pipeline/README.md
+  s_3816fb7b7c4a27::t_5c93165ac8706c 103
+examples/silx_live_view/README.md
+  s_3816fb7b7c4a27::t_68a8b5deea9599 1-64
+examples/silx_live_view/run_live_view.sh
+  s_3816fb7b7c4a27::t_e637f140fbd663 24
+  s_3816fb7b7c4a27::t_8d1210af73e600 1-23,25-47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9323f96e29fe6455cc650d827b53885596e9df73",
+  "prompts": {},
+  "sessions": {
+    "s_3816fb7b7c4a27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b5b5c72-aca3-496b-8412-0fb9ae85948c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
