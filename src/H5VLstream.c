@@ -11264,11 +11264,39 @@ H5VL__stream_dataset_specific_impl(void *obj, H5VL_dataset_specific_args_t *args
         (args->op_type == H5VL_DATASET_FLUSH || args->op_type == H5VL_DATASET_REFRESH))
         return H5VL__stream_step_flush_refresh(args->op_type == H5VL_DATASET_FLUSH, "H5Drefresh()");
 
-    /* M2: not supported against a placeholder (H5Dset_extent on a
-     * not-yet-real object) -- a documented gap, not part of the M2
-     * exit-gate matrix. */
+    /* H5Dset_extent() on a dataset created in this step: the extent it will
+     * be created with is the pending entry's space, which nothing reads
+     * until the step commits (manifest, schema and replay all take it
+     * then), and H5Dget_space() already answers from it -- so resizing is
+     * resizing that space. The create-empty-then-extend pattern of every
+     * NeXus detector writer (examples/detector_pipeline) needs it. Growing
+     * only: a write already staged against the larger extent would fall
+     * outside a shrunken one at replay. */
+    if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER && args->op_type == H5VL_DATASET_SET_EXTENT) {
+        H5VL_stream_pending_entry_t *e    = &o->file_state->pending[o->pending_index];
+        const hsize_t               *size = args->args.set_extent.size;
+        hsize_t                      dims[H5S_MAX_RANK], maxdims[H5S_MAX_RANK];
+        int                          rank, d;
+
+        if ((rank = H5Sget_simple_extent_dims(e->space_id, dims, maxdims)) < 0)
+            return -1;
+        for (d = 0; d < rank; d++) {
+            if (size[d] < dims[d])
+                H5VL_STREAM_GOTO_ERR(H5VL_stream_err_capture_g,
+                                     "shrinking a dataset created in the open step is not supported; "
+                                     "only growing it",
+                                     -1);
+            if (maxdims[d] != H5S_UNLIMITED && size[d] > maxdims[d])
+                H5VL_STREAM_GOTO_ERR(H5VL_stream_err_capture_g, "new extent exceeds the dataset's maximum", -1);
+        }
+        return H5Sset_extent_simple(e->space_id, rank, size, maxdims) < 0 ? -1 : 0;
+    }
+
+    /* Any other operation on a not-yet-real object (none today: set_extent,
+     * flush and refresh are the only dataset-specific ones). */
     if (o->obj_state == H5VL_STREAM_OBJ_PLACEHOLDER)
-        return -1;
+        H5VL_STREAM_GOTO_ERR(H5VL_stream_err_capture_g,
+                             "not supported on a dataset created in the open step", -1);
 
     /* H5Dset_extent() on a LIVE dataset being captured into an open step --
      * the same predicate H5VL_stream_dataset_write() uses to decide

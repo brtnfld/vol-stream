@@ -1333,6 +1333,15 @@ matches the code. Each item is documented for users in
 - **A chunk shape of any rank is honored** as its element count per push,
   where rank 2 or more used to be ignored. `t_chunk_shape_split` covers a
   (2, 8) chunk on an 8x8 dataset.
+- **`H5Dset_extent()` on a dataset created in the open step now works.** A
+  NeXus detector writer creates its frame stack empty (`[0, i, j]`,
+  unlimited) and extends it before the first frame, all in one step. That
+  extend returned a bare -1, since such a dataset is a placeholder with no
+  real object, so `examples/detector_pipeline`'s writer failed on frame 0.
+  Nothing ran that writer in CI until `examples/silx_live_view` did. The
+  resize now changes the pending create's extent, which nothing reads before
+  the commit. Growing is allowed; shrinking is refused with a message, because
+  it could orphan writes already staged. `t_placeholder_extend`.
 
 ## Remaining gaps
 
@@ -1392,6 +1401,12 @@ the one list. ★ marks what is being worked on next.
 - The ADIOS2 SST comparison is single-node, single-rank and statistically
   informal.
 - `precision_dual` (the literal M8 exit gate) is still `DISABLED`.
+
+- A writer that exits in the middle of a step, without closing a dataset it
+  created in that step, crashes in `H5D_flush_all` when the connector's exit
+  handler closes the file. Seen in CI after `detector_writer` returned early
+  on the `H5Dset_extent()` failure above. Only an application that is already
+  failing reaches it.
 
 **Python binding** (details in [`python-plan.md`](python-plan.md))
 

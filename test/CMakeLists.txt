@@ -1,7 +1,7 @@
 foreach(t t_smoke t_step t_replay t_reader t_deferred t_vl_reject t_manifest_cache t_ref_path t_ref_roundtrip
            t_vl_roundtrip t_attr_convert t_payload_compress t_step_rewrite t_reregister t_memspace t_manypaths
            t_dset_resize t_retention t_config t_flush_refresh t_open_step_objects t_overlay
-           t_error_messages)
+           t_error_messages t_placeholder_extend)
   add_executable(${t} ${t}.c)
   target_link_libraries(${t} PRIVATE vol_stream)
 endforeach()
@@ -37,6 +37,9 @@ add_test(NAME vl_roundtrip COMMAND t_vl_roundtrip)
 add_test(NAME attr_convert COMMAND t_attr_convert)
 add_test(NAME payload_compress COMMAND t_payload_compress)
 add_test(NAME step_rewrite COMMAND t_step_rewrite)
+# H5Dset_extent() on a dataset created in the open step: a NeXus detector
+# writer's create-empty-then-extend. See t_placeholder_extend.c.
+add_test(NAME placeholder_extend COMMAND t_placeholder_extend)
 add_test(NAME reregister COMMAND t_reregister)
 # Guards the capture path against ignoring mem_space_id -- see t_memspace.c's
 # own comment. Asserts bracketed and unbracketed writes agree, which is the
