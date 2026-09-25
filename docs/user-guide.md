@@ -1580,7 +1580,10 @@ import volstream
 # Subscribe to one quadrant of a simulation's 2-D field, delivered as float32
 # and compressed in transit. Shapes and types come from the writer's schema;
 # a (start, count) selection is fixed, while a whole-dataset subscription
-# ({"/temperature": None}) also follows growth along the first dimension.
+# ({"/temperature": None}) also follows growth along the first dimension, and
+# so does a box whose count[0] is None: {"/frames": ((0, 100, 0), (None, 64, 256))}
+# is rows 100-163 of every frame of a growing stack. tail=True returns only the
+# rows each step sent (step.first_row[path] says where they start).
 with volstream.follow("run.h5", {"/temperature": ((0, 0), (64, 64))}, deflate=4) as stream:
     stream.subscribe_type("/temperature", np.float32)
     for step in stream:                  # ends when the writer closes the file

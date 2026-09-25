@@ -1333,6 +1333,12 @@ matches the code. Each item is documented for users in
 - **A chunk shape of any rank is honored** as its element count per push,
   where rank 2 or more used to be ignored. `t_chunk_shape_split` covers a
   (2, 8) chunk on an 8x8 dataset.
+- **Python: a box that follows growth, and `tail=True`.** `count[0]=None` in
+  a `(start, count)` selection subscribes every row from `start[0]` on,
+  including rows not yet written: an ROI of every future frame. `tail=True`
+  returns only the rows a step sent, with `step.first_row[path]`, so a
+  step's cost no longer grows with the run. `python_stream_growtail`;
+  `examples/silx_live_view` uses it.
 - **`H5Dset_extent()` on a dataset created in the open step now works.** A
   NeXus detector writer creates its frame stack empty (`[0, i, j]`,
   unlimited) and extends it before the first frame, all in one step. That
@@ -1414,12 +1420,12 @@ the one list. ★ marks what is being worked on next.
 - Per-subscriber precision is deflate only; other filters and chunk shape are
   not exposed.
 - A whole-dataset subscription follows growth along the first dimension only.
-- No strided selection (the C API has it) and no box that follows growth, so
-  a downsampled or ROI live view of a growing `[nP, i, j]` stack can't be
-  expressed (`examples/silx_live_view`).
-- A whole-dataset subscription on a growing dataset reassembles every row up to
-  the newest, plus a mask, on each step, though only the new row was sent. The
-  cost per step grows with the run.
+- No strided selection. It would not help yet anyway: the writer sends one
+  push per contiguous run of the intersection and falls back to the whole
+  bounding span past 256 runs (`SELECTION_SPAN`). So a subsampled frame,
+  such as every 4th pixel, would cross the wire in full. A useful stride
+  needs a packed delivery, meaning the selected elements gathered into one
+  push, which is a protocol change.
 - `StreamDataset` is `num_workers=0` only (by design).
 - One process-wide HDF5 lock: a blocking wait on one `File` can delay a call on
   another by up to 100 ms.

@@ -51,14 +51,10 @@ want. The CTest `python_silx_live_view` uses it so that the check "frames
 
 ## Limits
 
-- **No stride.** Python `subscribe()` takes the whole dataset or a fixed
-  `(start, count)` box. MAX IV's "downsample for the live view" would be a
-  strided selection, which the C API has and the binding lacks. A fixed box
-  also doesn't follow a growing dataset, so an ROI view isn't possible either.
-- **Each step allocates the whole grown stack.** A whole-dataset subscription
-  on a growing `[nP, i, j]` reassembles an array (plus a mask) covering every
-  row up to the newest, of which only the last row was sent. The cost of a step
-  grows with the run, which is fine for a demo of hundreds of frames and
-  wrong for a 20-minute acquisition.
+- **No downsampling on the wire.** MAX IV's "downsample for the live view"
+  would be a strided selection. The binding has none, and a stride would not
+  cut bytes yet anyway: past 256 contiguous runs the writer sends the whole
+  bounding span. A region of interest does work, as a box that follows
+  growth: `subscribe({path: ((0, r0, c0), (None, nr, nc))}, tail=True)`.
 - **Only the newest frame is drawn,** with no binning or averaging. Reduction
   selects values; it never computes them.

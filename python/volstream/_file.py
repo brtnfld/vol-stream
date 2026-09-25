@@ -68,15 +68,20 @@ class Step:
     either way -- elements outside the selection are dropped, and a predicate
     the writer could not apply exactly is applied here -- so this says only
     how much more than necessary crossed the wire.
+
+    first_row maps each growing path (see File.subscribe()) to the dataset row
+    that its array's row 0 is. Without tail that is the subscription's own
+    first row; with tail it is the first row this step sent.
     """
 
-    __slots__ = ("phys", "wall_time_ns", "arrays", "delivery")
+    __slots__ = ("phys", "wall_time_ns", "arrays", "delivery", "first_row")
 
-    def __init__(self, phys, wall_time_ns, arrays, delivery=None):
+    def __init__(self, phys, wall_time_ns, arrays, delivery=None, first_row=None):
         self.phys = phys
         self.wall_time_ns = wall_time_ns
         self.arrays = arrays
         self.delivery = delivery if delivery is not None else {}
+        self.first_row = first_row if first_row is not None else {}
 
     def __getitem__(self, path):
         return self.arrays[path]
@@ -114,11 +119,14 @@ def _dtype(desc):
 
 
 class _Subscription:
-    def __init__(self, var, start, count, whole=False):
+    def __init__(self, var, start, count, grow=False, tail=False):
         self.path = var.path
-        # A whole-dataset subscription follows growth along the first
-        # dimension: the returned array covers whatever rows arrived.
-        self.whole = whole
+        # A growing subscription (the whole dataset, or a box whose count[0]
+        # was None) follows growth along the first dimension: the returned
+        # array covers whatever rows arrived -- from the subscription's first
+        # row, or with tail only the rows this step sent.
+        self.grow = grow
+        self.tail = tail
         self.dims = var.shape
         self.dtype = var.dtype
         self.native_dtype = var.dtype  # what the writer sends without narrowing
@@ -162,8 +170,10 @@ class _Subscription:
             return np.ones(len(push.data), dtype=bool)
 
     def assemble(self, pushes):
+        """The step's array, and the dataset row its first row is (None unless growing)."""
+        first_row = self.start[0] if self.grow else None
         if not self.dims:  # scalar
-            return pushes[-1].data.reshape(())
+            return pushes[-1].data.reshape(()), None
 
         if (
             len(pushes) == 1
@@ -172,13 +182,20 @@ class _Subscription:
             and pushes[0].start == self.flat_first
             and len(pushes[0].data) == self.nelem
         ):
-            return pushes[0].data.reshape(self.count)
+            return pushes[0].data.reshape(self.count), first_row
 
-        count = self.count
-        if self.whole:
+        count, origin = self.count, self.start
+        if self.grow:
             # Rows past the extent seen at subscribe time: the dataset grew.
-            last = max(p.start + len(p.data) for p in pushes) - 1
-            count = (max(count[0], last // self.strides[0] + 1),) + count[1:]
+            last_row = (max(p.start + len(p.data) for p in pushes) - 1) // self.strides[0]
+            if self.tail:
+                # Only the rows this step sent: the cost is what arrived,
+                # not everything the dataset has grown to.
+                first_row = max(self.start[0], min(p.start for p in pushes) // self.strides[0])
+                count = (max(0, last_row - first_row + 1),) + count[1:]
+                origin = (first_row,) + origin[1:]
+            else:
+                count = (max(count[0], last_row - self.start[0] + 1),) + count[1:]
 
         out = np.zeros(count, dtype=self.dtype)
         got = np.zeros(count, dtype=bool)
@@ -186,7 +203,7 @@ class _Subscription:
             flat = np.arange(p.start, p.start + len(p.data), dtype=np.int64)
             keep = np.ones(len(flat), dtype=bool)
             local = []
-            for k, (st, dim, s0, c) in enumerate(zip(self.strides, self.dims, self.start, count)):
+            for k, (st, dim, s0, c) in enumerate(zip(self.strides, self.dims, origin, count)):
                 coord = flat // st if k == 0 else (flat // st) % dim
                 coord = coord - s0
                 keep &= (coord >= 0) & (coord < c)
@@ -195,8 +212,8 @@ class _Subscription:
             out[index] = p.data[keep]
             got[index] = self._matches(p)[keep] if p.delivery & _DELIVERY_PREDICATE else True
         if got.all():
-            return out
-        return np.ma.MaskedArray(out, mask=~got)
+            return out, first_row
+        return np.ma.MaskedArray(out, mask=~got), first_row
 
 
 # Every File still open, so they can be closed before the interpreter shuts
@@ -312,12 +329,23 @@ class File:
             for path, is_attr, dims, type_json in entries
         }
 
-    def subscribe(self, selections, timeout_ms=10000, deflate=None, expect=None, from_step=None):
+    def subscribe(self, selections, timeout_ms=10000, deflate=None, expect=None, from_step=None, tail=False):
         """Subscribe to one or more datasets.
 
         selections is a path, a list of paths, or a dict mapping each path to
         None (the whole dataset) or a (start, count) pair of tuples. Shapes
         and types come from the writer's schema.
+
+        The whole dataset follows growth along dimension 0: rows written
+        after subscribe() arrive too. So does a box whose count[0] is None,
+        which means every row from start[0] on, now and later -- for example
+        ((0, 100, 0), (None, 64, 256)) is rows 100-163 of every frame of a
+        growing [nP, i, j] stack, including frames not yet written.
+
+        tail=True makes each step's array for a growing path hold only the
+        rows that step sent, rather than every row from the first, so a
+        step's cost is what arrived. step.first_row[path] says which dataset
+        row the array starts at.
 
         expect maps paths to (shape, dtype) for objects the writer has not
         described yet. The schema exists only once the writer has committed a
@@ -360,6 +388,7 @@ class File:
                 _check_expected(var, schema[path])
         entries, subs = [], {}
         for path, sel in selections.items():
+            grow = False
             var = schema.get(path) or declared.get(path)
             if var is None:
                 raise KeyError(f"{path!r} is not in the stream's schema")
@@ -373,15 +402,30 @@ class File:
                 raise NotImplementedError(f"{path!r} does not have a simple dataspace")
             if sel is None:
                 start, count = (0,) * len(var.shape), var.shape
-                extent = var.shape if var.is_attr else _growing_extent(var.shape)
+                grow = bool(var.shape) and not var.is_attr
+                extent = _growing_extent(var.shape) if grow else var.shape
                 entry = (path, extent, None, None)
                 chunk = tuple(max(1, d) for d in var.shape)
             else:
-                start, count = (tuple(int(x) for x in s) for s in sel)
-                entry = (path, var.shape, start, count)
-                chunk = None
+                start = tuple(int(x) for x in sel[0])
+                if len(sel[1]) and sel[1][0] is None:
+                    # A box that follows growth: every row from start[0] on.
+                    if var.is_attr or not var.shape:
+                        raise ValueError(f"{path!r}: count[0]=None needs a dataset of rank 1 or more")
+                    grow = True
+                    extent = _growing_extent(var.shape)
+                    count = (max(0, var.shape[0] - start[0]),) + tuple(int(x) for x in sel[1][1:])
+                    entry = (path, extent, start, (extent[0] - start[0],) + count[1:])
+                    chunk = (1,) + tuple(max(1, c) for c in count[1:])  # not the ~2**62-row count
+                else:
+                    count = tuple(int(x) for x in sel[1])
+                    entry = (path, var.shape, start, count)
+                    chunk = None
+            if tail and not grow:
+                raise ValueError(f"{path!r}: tail=True applies only to a growing selection "
+                                 "(the whole dataset, or count[0]=None)")
             entries.append(entry if deflate is None else entry + (int(deflate), chunk))
-            subs[path] = _Subscription(var, start, count, whole=sel is None and not var.is_attr)
+            subs[path] = _Subscription(var, start, count, grow=grow, tail=tail)
 
         # The backlog is drained before subscribing, not after: a writer
         # released by H5Fwait_subscribers() can announce its next step as
@@ -489,11 +533,15 @@ class File:
         for p in pushes:
             if p.path in self._subs:
                 by_path.setdefault(p.path, []).append(p)
-        arrays = {path: self._subs[path].assemble(plist) for path, plist in by_path.items()}
+        arrays, first_row = {}, {}
+        for path, plist in by_path.items():
+            arrays[path], row = self._subs[path].assemble(plist)
+            if row is not None:
+                first_row[path] = row
         delivery = {path: _or_all(p.delivery for p in plist) for path, plist in by_path.items()}
         if self.backpressure:
             self._raw.ack(phys)
-        return Step(phys, wall_ns, arrays, delivery)
+        return Step(phys, wall_ns, arrays, delivery, first_row)
 
     @property
     def end_of_stream(self):

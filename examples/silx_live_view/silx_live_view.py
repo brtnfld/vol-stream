@@ -52,7 +52,9 @@ class LiveStack:
         schema = self.file.schema(int(timeout_s * 1000))
         self.path = pick_stack(schema, path)
         var = schema[self.path]
-        self.file.subscribe(self.path, from_step=from_step)
+        # tail: each step's array is just the frame(s) it sent, however
+        # long the run -- not the whole grown stack with earlier rows masked.
+        self.file.subscribe(self.path, from_step=from_step, tail=True)
         if dtype is not None:
             self.file.subscribe_type(self.path, dtype)
         self.dtype = np.dtype(dtype) if dtype is not None else var.dtype
@@ -67,10 +69,8 @@ class LiveStack:
         step = self.file.next_step(timeout_ms)
         while step is not None:
             if self.path in step:
-                a = step[self.path]
-                # Rows are frames; the step wrote the last one. Earlier rows
-                # are masked (not sent this step) -- only the new one is read.
-                out.append((a.shape[0] - 1, np.ma.getdata(a)[-1]))
+                a, first = step[self.path], step.first_row[self.path]
+                out.extend((first + k, np.ma.getdata(a)[k]) for k in range(a.shape[0]))
             step = self.file.next_step(0)
         return out
 
@@ -92,7 +92,7 @@ class LiveStack:
 
 def run_text(stack, args):
     """--no-gui: print every frame, then check what arrived against --expect-*."""
-    seen, hits = set(), 0
+    seen = {}  # frame index -> hit; a backfilled step may resend earlier frames
     deadline = time.monotonic() + args.timeout
     while time.monotonic() < deadline and not stack.ended:
         for index, frame in stack.frames(500):
@@ -100,15 +100,15 @@ def run_text(stack, args):
                 print(f"viewer: FAIL frame {index} is {frame.dtype}{list(frame.shape)}")
                 return 1
             hit = int(frame.max()) >= args.hit_threshold
-            hits += hit
-            seen.add(index)
+            seen[index] = hit
             print(f"viewer: frame {index:4d}  max {int(frame.max()):6d}  sum {int(frame.sum(dtype=np.int64)):9d}"
                   f"  {'HIT' if hit else '   '}  ({frame.nbytes // 1024} KiB as {frame.dtype})", flush=True)
         if args.expect_frames and len(seen) >= args.expect_frames:
             break
 
+    hits = sum(seen.values())
     print(f"viewer: {len(seen)} frame(s), {hits} over {args.hit_threshold}")
-    if args.expect_frames and seen != set(range(args.expect_frames)):
+    if args.expect_frames and set(seen) != set(range(args.expect_frames)):
         print(f"viewer: FAIL expected frames 0..{args.expect_frames - 1}, got {sorted(seen)}")
         return 1
     if args.expect_hits is not None and hits != args.expect_hits:

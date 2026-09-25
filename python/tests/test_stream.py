@@ -37,6 +37,10 @@ ctest entry per mode) so every scenario gets a fresh transport.
   grow       A dataset extended by one row per step, each step writing only
              its new row. A whole-dataset subscription must deliver each new
              row, in an array that has grown to hold it.
+  growtail   The grow writer, subscribed as a box that follows growth
+             (columns 1-2 of every row, count[0]=None) with tail=True: each
+             step must arrive as just its own row's two columns, unmasked,
+             with first_row naming the row.
   types      A compound dataset {int, double, char[4]} and a scalar double
              attribute on it, both rewritten every step: structured arrays
              and attributes must arrive with every field right.
@@ -47,7 +51,7 @@ ctest entry per mode) so every scenario gets a fresh transport.
              test-only VOL_STREAM_TEST_DROP_PUSH): that step must arrive as a
              masked array with exactly the lost row masked.
 
-usage: test_stream.py <stream_writer executable> <column|narrowing|iterate|getonly|torch|eos|drop|ack|noack|twostreams|samestream|reopen|deflate|grow|types>
+usage: test_stream.py <stream_writer executable> <column|narrowing|iterate|getonly|torch|eos|drop|ack|noack|twostreams|samestream|reopen|deflate|grow|growtail|types>
 """
 
 import os
@@ -419,6 +423,29 @@ class DeflateTest(StreamTest):
         self.assertIn("refilter  filter=1 ", err, "the writer never deflated this subscriber's data")
 
 
+class GrowTailTest(StreamTest):
+    mode = "grow"  # the writer's scenario; registered as "growtail" below
+
+    def test_grow_tail(self):
+        self.attach()
+        self.assertEqual(self.file.schema()["/series"].shape, (1, GrowTest.GCOLS))
+        self.file.subscribe({"/series": ((0, 1), (None, 2))}, tail=True)
+        self.touch("ready")
+        steps = list(self.file.steps(max_steps=3, timeout=30))
+        self.assertEqual(len(steps), 3, "not every step arrived")
+        for s, step in enumerate(steps, start=1):
+            self.assertIn("/series", step, f"step {s}: its new row was never sent")
+            a = step["/series"]
+            self.assertNotIsInstance(a, np.ma.MaskedArray, f"step {s}")
+            self.assertEqual(a.shape, (1, 2), f"step {s}: tail must hold only the row this step sent")
+            self.assertEqual(step.first_row["/series"], s)
+            np.testing.assert_array_equal(a[0], [s * 100 + 1, s * 100 + 2])
+        with self.assertRaises(ValueError):
+            self.file.subscribe({"/series": ((0, 0), (2, 2))}, tail=True)  # tail needs a growing selection
+        self.touch("done")
+        self.assertEqual(self.writer.wait(timeout=60), 0)
+
+
 class GrowTest(StreamTest):
     mode = "grow"
     GCOLS = 4
@@ -570,7 +597,7 @@ if __name__ == "__main__":
              "getonly": GetOnlyTest, "torch": TorchTest, "eos": EndOfStreamTest, "drop": DropTest,
              "ack": BackpressureTest, "noack": NoBackpressureTest,
              "twostreams": MultiFileTest, "samestream": MultiFileTest, "reopen": MultiFileTest,
-             "deflate": DeflateTest, "grow": GrowTest, "types": TypesTest}
+             "deflate": DeflateTest, "grow": GrowTest, "growtail": GrowTailTest, "types": TypesTest}
     if mode not in cases:
         sys.exit(__doc__)
     if mode == "torch":

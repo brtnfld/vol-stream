@@ -456,9 +456,12 @@ supported, or depends on something outside this binding.
 - **A dataset resized in any dimension but the first.** A whole-dataset
   subscription follows growth along the first dimension: it is made against
   an unbounded first dimension so the writer sends new rows, and the returned
-  array grows to hold them (rows not written that step are masked). An
-  explicit `(start, count)` selection stays fixed. A change to any other
-  dimension would place elements wrongly; re-subscribe after one.
+  array grows to hold them (rows not written that step are masked). So
+  does a box whose `count[0]` is `None` (every row from `start[0]` on).
+  `tail=True` returns only the rows a step sent, so a step costs what
+  arrived rather than everything the dataset has grown to. A box with a
+  fixed `count[0]` stays fixed. A change to any other dimension would place
+  elements wrongly; re-subscribe after one.
 - **`num_workers > 0` in a DataLoader.** Refused, by design (see P4).
 
 ### Depends on the connector or the Mochi stack
