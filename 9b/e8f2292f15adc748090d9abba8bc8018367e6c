@@ -1,0 +1,31 @@
+test/t_group_attrs.c
+  s_3816fb7b7c4a27::t_c4f5fb764fcdac 28
+  s_3816fb7b7c4a27::t_11c9651a94a792 1-27,29-233
+docs/dev-plan.md
+  s_3816fb7b7c4a27::t_d926102eca2d60 1359-1375
+docs/user-guide.md
+  s_3816fb7b7c4a27::t_d926102eca2d60 2134-2135,2143-2151
+  s_3816fb7b7c4a27::t_cd7fac4ef29772 2152
+test/CMakeLists.txt
+  s_3816fb7b7c4a27::t_c4f5fb764fcdac 4,43-45
+src/H5VLstream.c
+  s_3816fb7b7c4a27::t_57f8385b50238e 12570-12616,12622-12630,12636-12637,12700-12760,12824-12826,12831,12833
+  s_3816fb7b7c4a27::t_08bcd655aa0123 367-371,547-549,1643-1645,9803-9806,10025-10169,12953-12955
+  s_3816fb7b7c4a27::t_2d863259a8ea20 12956
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9be8f2292f15adc748090d9abba8bc8018367e6c",
+  "prompts": {},
+  "sessions": {
+    "s_3816fb7b7c4a27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b5b5c72-aca3-496b-8412-0fb9ae85948c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
