@@ -1356,6 +1356,23 @@ matches the code. Each item is documented for users in
   a time: CI hung. It now starts at the first row the push's range reaches,
   stops past its end, and takes a block spanning every trailing dimension
   as one run.
+- **Group attributes written outside a step reach the stream.** A NeXus
+  writer sets `NX_class`, `@signal` and `/@default` on its groups before the
+  first step. Those writes passed through to the live groups and nothing more:
+  no `/step/<n>/entry` had `NX_class`, and no subscriber or connector reader
+  saw it. `H5VL__stream_note_group_attr()` now records each such creation, and
+  `H5Fend_step()` reads the value back into the committing step, unless the
+  step wrote it itself. The live write stays byte-identical. Not carried: an
+  out-of-step *rewrite* through `H5Aopen`, and a parallel writer's attributes.
+  `t_group_attrs`.
+- **A backfilled step sends what it wrote, not its whole copy.** For a
+  dataset growing in N-D, a step's copy has fill in the rows other steps
+  wrote, because carry-forward is 1-D. Backfill sent the whole copy, so a
+  late joiner's earlier frames were overwritten with fill. `python_silx_live_view`
+  caught it once it used `tail=True`: frame 0 arrived a second time as zeros.
+  Backfill now reads the step's manifest and pushes each DsetWrite selection as
+  runs, as the live push did. It falls back to the whole copy only when the
+  manifest is unreadable or a selection is too fragmented.
 - **`H5Dset_extent()` on a dataset created in the open step now works.** A
   NeXus detector writer creates its frame stack empty (`[0, i, j]`,
   unlimited) and extends it before the first frame, all in one step. That

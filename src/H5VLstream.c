@@ -364,6 +364,11 @@ struct H5VL_stream_file_state_t {
     struct H5VL_stream_overlay_t *overlay;           /* datasets the overlay covers, or gave up on */
     size_t                       n_overlay, cap_overlay;
     int                          warned_overlay_retention;
+    /* Group and root attributes written outside a step ("/entry@NX_class"),
+     * which H5Fend_step() folds into the next step's manifest -- see
+     * H5VL__stream_fold_group_attrs(). */
+    char                       **group_attrs;
+    size_t                       n_group_attrs, cap_group_attrs;
     uint64_t                    *retain_bytes;
     size_t                       n_retain;
     size_t                       cap_retain;
@@ -539,6 +544,9 @@ static void  H5VL__stream_pending_entry_clear(H5VL_stream_pending_entry_t *e);
 static void  H5VL__stream_pending_discard_all(H5VL_stream_file_state_t *fs);
 static char *H5VL__stream_child_path(const char *parent_path, const char *name);
 static char *H5VL__stream_attr_path(const char *parent_path, const char *name);
+static void  H5VL__stream_note_group_attr(const struct H5VL_stream_t *o, const H5VL_loc_params_t *loc_params,
+                                          const char *name);
+static void  H5VL__stream_fold_group_attrs(H5VL_stream_file_state_t *fs);
 static H5VL_stream_t *H5VL__stream_new_child_obj(void *under_obj, hid_t under_vol_id,
                              H5VL_stream_file_state_t *file_state, const char *parent_path,
                              const char *name);
@@ -1632,6 +1640,9 @@ H5VL__stream_file_state_decref(H5VL_stream_file_state_t *fs)
         for (k = 0; k < fs->n_overlay; k++)
             free(fs->overlay[k].path);
         free(fs->overlay);
+        for (k = 0; k < fs->n_group_attrs; k++)
+            free(fs->group_attrs[k]);
+        free(fs->group_attrs);
     }
 
 #ifdef VOL_STREAM_HAVE_MERCURY
@@ -9789,6 +9800,10 @@ H5VL__stream_attr_create_impl(void *obj, const H5VL_loc_params_t *loc_params, co
     under = H5VLattr_create(o->under_object, loc_params, o->under_vol_id, name, type_id, space_id, acpl_id,
                             aapl_id, dxpl_id, req);
     if (under) {
+        /* A group or root attribute written outside a step -- NeXus's
+         * NX_class, @signal and @default, set up before acquisition -- goes
+         * into the next step too, so subscribers and /step/<n>/ carry it. */
+        H5VL__stream_note_group_attr(o, loc_params, name);
         attr = H5VL__stream_new_child_obj(under, o->under_vol_id, o->file_state, NULL, NULL);
 
         /* Check for async request */
@@ -10006,6 +10021,151 @@ H5VL__stream_step_attr_index(H5VL_stream_t *o, size_t *out_index)
     *out_index = idx;
     return 0;
 } /* end H5VL__stream_step_attr_index() */
+
+/*-------------------------------------------------------------------------
+ * Group and root attributes written outside a step.
+ *
+ * An attribute created while no step is open passes straight through to the
+ * live object, which keeps an unbracketed write byte-identical to plain
+ * HDF5. For a dataset that is all there is to it. For a group it left the
+ * attribute out of the stream: no manifest carried it, so no subscriber saw
+ * it and no /step/<n>/ group had it -- and that is where a NeXus writer puts
+ * NX_class, @signal, @axes and @default, before its first step. So its path
+ * is noted here, and H5Fend_step() reads the attribute's current value back
+ * from the live object into the committing step, unless the step wrote it
+ * itself. Serial writers only: a parallel writer's out-of-step writes are
+ * collective, and folding them would need every rank to agree.
+ *-------------------------------------------------------------------------
+ */
+static void
+H5VL__stream_note_group_attr(const H5VL_stream_t *o, const H5VL_loc_params_t *loc_params, const char *name)
+{
+    H5VL_stream_file_state_t *fs = o->file_state;
+    char                     *path;
+    size_t                    k;
+
+    if (!fs || fs->is_reader || fs->step_state == H5F_STEP_IN_STEP || !o->path ||
+        loc_params->type != H5VL_OBJECT_BY_SELF ||
+        (loc_params->obj_type != H5I_GROUP && loc_params->obj_type != H5I_FILE))
+        return;
+#ifdef H5_HAVE_PARALLEL
+    if (fs->has_comm)
+        return;
+#endif
+    if (NULL == (path = H5VL__stream_attr_path(o->path, name)))
+        return;
+    for (k = 0; k < fs->n_group_attrs; k++)
+        if (!strcmp(fs->group_attrs[k], path)) {
+            free(path);
+            return;
+        }
+    if (fs->n_group_attrs == fs->cap_group_attrs) {
+        size_t cap   = fs->cap_group_attrs ? fs->cap_group_attrs * 2 : 8;
+        char **grown = (char **)realloc(fs->group_attrs, cap * sizeof(*grown));
+
+        if (!grown) {
+            free(path);
+            return;
+        }
+        fs->group_attrs     = grown;
+        fs->cap_group_attrs = cap;
+    }
+    fs->group_attrs[fs->n_group_attrs++] = path;
+} /* end H5VL__stream_note_group_attr() */
+
+/* Called by H5Fend_step() before it commits: the noted attributes, as they
+ * are now, become Attr entries of this step. Best effort -- an attribute
+ * that cannot be read back (deleted since, or a type capture refuses) is
+ * skipped, and the step commits either way. */
+static void
+H5VL__stream_fold_group_attrs(H5VL_stream_file_state_t *fs)
+{
+    size_t i, k;
+
+    for (i = 0; i < fs->n_group_attrs; i++) {
+        const char                 *path = fs->group_attrs[i];
+        const char                 *at   = strrchr(path, '@');
+        char                        obj[1100];
+        H5VL_loc_params_t           loc;
+        H5VL_attr_get_args_t        g;
+        H5VL_stream_pending_entry_t e;
+        hssize_t                    n;
+        void                       *a, *buf = NULL;
+        int                         vl_kind, taken = 0;
+
+        for (k = 0; k < fs->n_pending; k++)
+            if (fs->pending[k].kind == vs_Kind_Attr && fs->pending[k].path && !strcmp(fs->pending[k].path, path))
+                break;
+        if (k < fs->n_pending || !at || (size_t)(at - path) >= sizeof(obj))
+            continue; /* the step wrote it itself */
+        snprintf(obj, sizeof(obj), "%.*s", (int)(at - path), path);
+
+        memset(&loc, 0, sizeof(loc));
+        loc.obj_type                     = H5I_FILE;
+        loc.type                         = H5VL_OBJECT_BY_NAME;
+        loc.loc_data.loc_by_name.name    = obj[0] ? obj : "/";
+        loc.loc_data.loc_by_name.lapl_id = H5P_LINK_ACCESS_DEFAULT;
+        if (NULL == (a = H5VLattr_open(H5VL__stream_file_under(fs), &loc, fs->file_under_vol_id, at + 1,
+                                       H5P_ATTRIBUTE_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL))) {
+            H5Eclear2(H5E_DEFAULT); /* deleted since: nothing to carry */
+            continue;
+        }
+
+        memset(&e, 0, sizeof(e));
+        e.kind     = vs_Kind_Attr;
+        e.type_id  = H5I_INVALID_HID;
+        e.space_id = H5I_INVALID_HID;
+        e.dcpl_id  = H5I_INVALID_HID;
+        e.dapl_id  = H5I_INVALID_HID;
+        g.op_type  = H5VL_ATTR_GET_TYPE;
+        if (H5VLattr_get(a, fs->file_under_vol_id, &g, H5P_DATASET_XFER_DEFAULT, NULL) < 0)
+            goto next;
+        e.type_id = g.args.get_type.type_id;
+        g.op_type = H5VL_ATTR_GET_SPACE;
+        if (H5VLattr_get(a, fs->file_under_vol_id, &g, H5P_DATASET_XFER_DEFAULT, NULL) < 0)
+            goto next;
+        e.space_id = g.args.get_space.space_id;
+        g.op_type  = H5VL_ATTR_GET_ACPL;
+        if (H5VLattr_get(a, fs->file_under_vol_id, &g, H5P_DATASET_XFER_DEFAULT, NULL) < 0)
+            goto next;
+        e.dcpl_id = g.args.get_acpl.acpl_id;
+        if (H5VL__stream_type_unsafe_to_capture(e.type_id) != 0 || (n = H5Sget_select_npoints(e.space_id)) < 0)
+            goto next;
+
+        vl_kind = H5VL__stream_type_vl_kind(e.type_id);
+        if (n > 0) {
+            size_t nbytes = (size_t)n * H5Tget_size(e.type_id);
+
+            if (NULL == (buf = malloc(nbytes)) ||
+                H5VLattr_read(a, fs->file_under_vol_id, e.type_id, buf, H5P_DATASET_XFER_DEFAULT, NULL) < 0)
+                goto next;
+            if (vl_kind != H5VL_STREAM_VL_NONE) {
+                int rc = H5VL__stream_vl_serialize(buf, (size_t)n, e.type_id, vl_kind, &e.payload, &e.payload_len);
+
+                H5Treclaim(e.type_id, e.space_id, H5P_DEFAULT, buf);
+                if (rc < 0)
+                    goto next;
+            }
+            else {
+                e.payload     = (uint8_t *)buf; /* already in the file type, which replay writes */
+                e.payload_len = nbytes;
+                buf           = NULL;
+            }
+        }
+        if (NULL == (e.path = strdup(path)) || H5VL__stream_pending_append(fs, &e) == (size_t)-1)
+            goto next;
+        taken = 1;
+
+next:
+        if (!taken)
+            H5VL__stream_pending_entry_clear(&e);
+        free(buf);
+        H5VLattr_close(a, fs->file_under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+    }
+    for (i = 0; i < fs->n_group_attrs; i++)
+        free(fs->group_attrs[i]);
+    fs->n_group_attrs = 0;
+} /* end H5VL__stream_fold_group_attrs() */
 
 static herr_t
 H5VL__stream_attr_write_impl(void *attr, hid_t mem_type_id, const void *buf, hid_t dxpl_id, void **req)
@@ -12407,19 +12567,74 @@ H5VL_stream_file_specific(void *file, H5VL_file_specific_args_t *args, hid_t dxp
 } /* end H5VL_stream_file_specific() */
 
 #ifdef VOL_STREAM_HAVE_MERCURY
+/* Committed step k's manifest, read back and verified, or NULL. Free it. */
+static uint8_t *
+H5VL__stream_step_manifest(H5VL_stream_file_state_t *fs, uint64_t k, vs_Step_table_t *step)
+{
+    H5VL_loc_params_t       loc;
+    H5VL_dataset_get_args_t g;
+    char                    path[48];
+    void                   *mds;
+    hid_t                   dtype = H5I_INVALID_HID, space = H5I_INVALID_HID;
+    hssize_t                n;
+    uint8_t                *buf = NULL;
+    int                     ok  = 0;
+
+    memset(&loc, 0, sizeof(loc));
+    loc.obj_type = H5I_FILE;
+    loc.type     = H5VL_OBJECT_BY_SELF;
+    snprintf(path, sizeof(path), "/step/%llu/.manifest", (unsigned long long)k);
+    if (NULL == (mds = H5VLdataset_open(H5VL__stream_file_under(fs), &loc, fs->file_under_vol_id, path,
+                                        H5P_DATASET_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL)))
+        return NULL;
+    g.op_type = H5VL_DATASET_GET_TYPE;
+    if (H5VLdataset_get(mds, fs->file_under_vol_id, &g, H5P_DATASET_XFER_DEFAULT, NULL) >= 0) {
+        dtype     = g.args.get_type.type_id;
+        g.op_type = H5VL_DATASET_GET_SPACE;
+        if (H5VLdataset_get(mds, fs->file_under_vol_id, &g, H5P_DATASET_XFER_DEFAULT, NULL) >= 0) {
+            space = g.args.get_space.space_id;
+            if ((n = H5Sget_simple_extent_npoints(space)) > 0 && NULL != (buf = (uint8_t *)malloc((size_t)n))) {
+                void *bufp = buf;
+
+                ok = H5VLdataset_read(1, &mds, fs->file_under_vol_id, &dtype, &space, &space,
+                                      H5P_DATASET_XFER_DEFAULT, &bufp, NULL) >= 0 &&
+                     vs_Step_verify_as_root(buf, (size_t)n) == 0 && NULL != (*step = vs_Step_as_root(buf));
+            }
+        }
+    }
+    if (dtype >= 0)
+        H5Tclose(dtype);
+    if (space >= 0)
+        H5Sclose(space);
+    H5VLdataset_close(mds, fs->file_under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+    if (!ok) {
+        free(buf);
+        return NULL;
+    }
+    return buf;
+} /* end H5VL__stream_step_manifest() */
+
 /*-------------------------------------------------------------------------
  * Function:    H5VL__stream_backfill_one
  *
  * Purpose:     Push one path's value at committed step k to one subscriber,
  *              read back from this writer's own /step/<k>/ copy. A dataset
- *              goes whole; an attribute ("/T@scale") likewise. A
- *              variable-length object is skipped, as the live push skips it.
+ *              sends what step k wrote -- each of its DsetWrite selections in
+ *              the step's manifest, one push per contiguous run, as the live
+ *              push did -- not the whole copy: for a dataset growing in N-D,
+ *              the copy's other rows are fill (carry-forward is 1-D only),
+ *              and sent as data they would overwrite earlier frames. Without
+ *              a readable manifest, or for a selection too fragmented to
+ *              send as runs, it goes whole. An attribute ("/T@scale") goes
+ *              whole. A variable-length object is skipped, as the live push
+ *              skips it.
  *              Best-effort: a failure leaves that step without this path,
  *              which the subscriber sees exactly as a lost push.
  *-------------------------------------------------------------------------
  */
 static void
-H5VL__stream_backfill_one(H5VL_stream_file_state_t *fs, uint64_t member, const char *path, uint64_t k)
+H5VL__stream_backfill_one(H5VL_stream_file_state_t *fs, uint64_t member, const char *path, uint64_t k,
+                          vs_Step_table_t step)
 {
     const char       *at = strchr(path, '@');
     char              full[1024];
@@ -12481,6 +12696,67 @@ H5VL__stream_backfill_one(H5VL_stream_file_state_t *fs, uint64_t member, const c
         H5VL__stream_type_vl_kind(mtype) != H5VL_STREAM_VL_NONE || (esize = H5Tget_size(mtype)) == 0 ||
         (n = H5Sget_simple_extent_npoints(space)) <= 0 || NULL == (buf = malloc((size_t)n * esize)))
         goto done;
+
+    if (!at && step) {
+        /* What step k wrote: its DsetWrite selections for this path. */
+        vs_Entry_vec_t entries = vs_Step_entries(step);
+        size_t         ne = entries ? vs_Entry_vec_len(entries) : 0, i;
+        int            sent = 0, whole = 0;
+
+        H5VL__stream_encode_type(mtype, &tenc, &tlen);
+        H5VL__stream_encode_space(space, &senc, &slen);
+        for (i = 0; i < ne && !whole; i++) {
+            vs_Entry_table_t       e = vs_Entry_vec_at(entries, i);
+            flatbuffers_uint8_vec_t sp;
+            H5VL_stream_flat_run_t runs[H5VL_STREAM_MAX_PUSH_RUNS];
+            hid_t                  sel, mem;
+            hssize_t               ns;
+            hsize_t                nm;
+            void                  *wbuf;
+            uint64_t               off = 0;
+            int                    nr, r;
+
+            if (vs_Entry_kind(e) != vs_Kind_DsetWrite || !vs_Entry_path(e) || strcmp(vs_Entry_path(e), path) ||
+                NULL == (sp = vs_Entry_space_enc(e)))
+                continue;
+            if ((sel = H5Sdecode(sp)) < 0)
+                continue;
+            if ((ns = H5Sget_select_npoints(sel)) <= 0 ||
+                (nr = H5VL__stream_space_flat_runs(sel, runs, H5VL_STREAM_MAX_PUSH_RUNS)) <= 0) {
+                whole = ns > 0; /* too fragmented to send as runs */
+                H5Sclose(sel);
+                continue;
+            }
+            nm = (hsize_t)ns;
+            if (NULL == (wbuf = malloc((size_t)ns * esize)) || (mem = H5Screate_simple(1, &nm, NULL)) < 0) {
+                free(wbuf);
+                H5Sclose(sel);
+                continue;
+            }
+            /* Packed in selection order, which is the runs' ascending order. */
+            if (H5VLdataset_read(1, &obj, fs->file_under_vol_id, &mtype, &mem, &sel, H5P_DATASET_XFER_DEFAULT,
+                                 &wbuf, NULL) >= 0) {
+                for (r = 0; r < nr; r++) {
+                    vs_tr_writer_push_data_to(fs->transport, member, k, path, (uint8_t *)wbuf + off * esize,
+                                              (uint64_t)esize, runs[r].start, runs[r].count, tenc, (uint64_t)tlen,
+                                              senc, (uint64_t)slen);
+                    off += runs[r].count;
+                }
+                vs_tr_writer_release_sources(fs->transport); /* wbuf is freed next */
+                sent = 1;
+            }
+            free(wbuf);
+            H5Sclose(mem);
+            H5Sclose(sel);
+        }
+        if (!whole) {
+            (void)sent; /* created but not written this step: nothing to send, as live */
+            goto done;
+        }
+        free(tenc);
+        free(senc);
+        tenc = senc = NULL;
+    }
 
     if (at) {
         if (H5VLattr_read(obj, fs->file_under_vol_id, mtype, buf, H5P_DATASET_XFER_DEFAULT, NULL) < 0)
@@ -12545,12 +12821,16 @@ H5VL__stream_serve_backfill(H5VL_stream_file_state_t *fs)
         /* Committed steps are 0 .. physical_step-1, both at H5Fbegin_step()
          * and inside an open step. */
         for (k = from; k < fs->physical_step; k++) {
+            vs_Step_table_t step = NULL;
+            uint8_t        *mbuf = H5VL__stream_step_manifest(fs, k, &step);
+
             for (i = 0; i < n; i++) {
                 uint64_t resolved;
 
                 if (H5VL__stream_path_index_resolve(fs, paths[i], k, &resolved) >= 0 && resolved == k)
-                    H5VL__stream_backfill_one(fs, member, paths[i], k);
+                    H5VL__stream_backfill_one(fs, member, paths[i], k, step);
             }
+            free(mbuf);
             vs_tr_writer_announce_to(fs->transport, member, k, 0);
         }
         for (i = 0; i < n; i++)
@@ -12669,6 +12949,10 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
                                  "no step is open on this file -- H5Fend_step() must be preceded by a "
                                  "matching H5Fbegin_step()",
                                  -1);
+
+        /* Group attributes written since the last step: see
+         * H5VL__stream_note_group_attr(). */
+        H5VL__stream_fold_group_attrs(o->file_state);
 
 #ifdef VOL_STREAM_HAVE_MERCURY
         /* A backfill requested while this step was open, served before the

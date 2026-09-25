@@ -2131,13 +2131,24 @@ that subscribes after step 1 commits never receives step 1's data. Either have
 the writer wait for it (`H5Fwait_subscribers()`), or subscribe with
 `H5Fsubscribe_from(fid, start_step, ...)`, which asks the writer to *backfill*:
 it reads each committed step from `start_step` back from its own file and
-sends it, then the live steps, each step once and in order. It must be the
+sends what that step wrote (the selections in its manifest, as the live push
+did), then the live steps, each step once and in order. It must be the
 reader's first subscription, and the writer serves it at its next
 `H5Fbegin_step()` or `H5Fend_step()`, holding that reader's live delivery back
 until then. In Python, `subscribe(..., from_step=k)`. (`H5Fwait_step_ready()`
 is different again: a consumer joining mid-stream is seeded with the writer's
 current step, so the first call returns immediately. Discard that before a
 backfilled subscription, whose steps come in order after it.)
+
+**My NeXus skeleton is written before the first step. Does it reach readers?**
+
+Yes, for groups. An attribute created on a group or on the root while no step
+is open, such as `NX_class`, `@signal`, `@axes` or `/@default`, is written to
+the live group as plain HDF5 does. It is also carried into the next step that
+commits, so it appears on `/step/<n>/entry` and reaches subscribers and
+connector readers. Two exceptions: an attribute *rewritten* outside a step
+(opened and written again) is not carried, so write it inside a step; and a
+parallel writer's out-of-step attributes are not carried at all.
 
 **Why is my data at `/step/0/foo` instead of `/foo`?**
 
