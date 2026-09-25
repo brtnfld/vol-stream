@@ -1254,6 +1254,19 @@ matches the code. Each item is documented for users in
   link per covered dataset per step. Fixed-shape, non-VL datasets only; off
   under a retention policy and for parallel writers. `t_overlay` checks it
   natively; h5dump and h5py (and so H5Web through h5grove) read it.
+- **The overlay covers growing frame stacks, and is NeXus.** A dataset growing
+  along dim 0 (rank 2 or more), such as a detector's `[nP, i, j]`, was
+  excluded, although it is the layout NeXus prescribes. It is now viewed a row
+  per frame: `/stream/.frames/<path>/k` is a one-mapping VDS selecting frame k
+  in the copy of the step that wrote it (carry-forward is 1-D only, so no one
+  copy holds every frame), and the view is a printf VDS over those. That is a
+  VDS of VDSs, which plain HDF5 reads. No data is copied; there is one small
+  object per frame. Every covered dataset is also an `NXdata`,
+  `/stream/<path>`, with `data` (the view), a `step` axis, `@signal`, `@axes`
+  and `data@interpretation`, under an `NXentry` `/stream` whose `@default` is
+  the first. That moves the view from `/stream/<path>` to
+  `/stream/<path>/data`. The root `@default` is left alone: an application
+  that later created it would fail. `t_overlay`.
 - **Phase 1 follow-ups: shared registrations, overlapped transfers.** A
   borrowed bulk push now pulls from a region registered once -- the step's
   whole staging buffer, or one write's data -- at an offset carried in the

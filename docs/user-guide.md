@@ -239,14 +239,15 @@ works at all.
 #### The `/stream` overlay: a timeline for native tools
 
 Turn on the overlay (`overlay = 1` in `H5Pset_fapl_stream()`'s config, or
-`VOL_STREAM_OVERLAY=1`) and the writer also builds `/stream/<path>`, a virtual
-dataset shaped `[rows, dims...]`, one row per step. Row *j* is the dataset's
-state as of step `first_step + j` (an attribute on it). A step that did not
-write the dataset repeats the last value that was written. Any tool that reads
-HDF5 natively then sees the time series in place, with no export step:
+`VOL_STREAM_OVERLAY=1`) and the writer also builds `/stream/<path>/data`, a
+virtual dataset shaped `[rows, dims...]`, one row per step. Row *j* is the
+dataset's state as of step `first_step + j` (an attribute on it). A step that
+did not write the dataset repeats the last value that was written. Any tool
+that reads HDF5 natively then sees the time series in place, with no export
+step:
 
 ```
-$ h5dump -d /stream/T stream.h5
+$ h5dump -d /stream/T/data stream.h5
    DATASPACE  SIMPLE { ( 4, 3 ) / ( H5S_UNLIMITED, 3 ) }
    (0,0): 0, 1, 2,
    (1,0): 10, 11, 12,
@@ -254,13 +255,27 @@ $ h5dump -d /stream/T stream.h5
    (3,0): 30, 31, 32
 ```
 
-h5py reads it the same way, so H5Web does too when served through h5grove,
-and its N-D slicing gives a time slider. Each row is a hard link to that
-step's own copy, under `/stream/.steps/`, so nothing is copied; the view grows
-as steps commit. The limits:
+Each row is a hard link to that step's own copy, under `/stream/.steps/`, so
+nothing is copied, and the view grows as steps commit.
 
-- only datasets whose shape cannot change (current dims equal max dims) and
-  whose type is not variable-length;
+A dataset that **grows along its first dimension**, such as a NeXus detector's
+`[nP, i, j]` frame stack, is viewed a row per *frame* rather than per step.
+`/stream/<path>/data` is `[frames, i, j]`, and each frame comes from the step
+that wrote it, because a step's own copy holds only the frames it wrote. Each
+frame is a small virtual dataset under `/stream/.frames/`, so again nothing is
+copied.
+
+The overlay is NeXus. `/stream` is an `NXentry`, and each `/stream/<path>` is
+an `NXdata` with `@signal = "data"`, `@axes = ["step", ".", ...]`, and a `step`
+dataset giving the step each row came from. `data@interpretation` is
+`spectrum` or `image`. `/stream@default` names the first dataset covered. So
+silx (`silx view stream.h5`, then *Synchronize* to pick up new steps) and
+H5Web plot it by default, with the step as the x axis or slider. The file's
+root `@default` is left to the application. The limits:
+
+- only datasets whose shape cannot change, or that grow along the first
+  dimension only (rank 2 or more), and whose type is not variable-length; a
+  frame rewritten by a later step keeps showing its first version;
 - not with a retention policy, whose pruned steps the links would keep alive;
 - not for a parallel writer yet;
 - a stream only ever read through the connector does not need it.

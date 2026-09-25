@@ -207,8 +207,10 @@ typedef struct H5VL_stream_path_steps_t {
  * H5VL__stream_overlay_step(). */
 typedef struct H5VL_stream_overlay_t {
     char    *path;       /* the dataset's logical path */
-    uint64_t first_step; /* the step of its row 0 */
+    uint64_t first_step; /* the step of its row 0 (fixed shape only) */
     int      dead;       /* not eligible, or its shape changed: no more rows */
+    int      growing;    /* [nP, ...] growing along dim 0: a row is a frame, not a step */
+    uint64_t frames;     /* growing: rows mapped so far */
 } H5VL_stream_overlay_t;
 
 /* M6.5/dictionary caching: the last type_enc (H5Tencode() bytes) sent for a
@@ -10952,8 +10954,8 @@ H5VL_stream_dataset_get(void *dset, H5VL_dataset_get_args_t *args, hid_t dxpl_id
  * the file natively (h5py, h5dump, H5Web through h5grove or h5wasm), which
  * otherwise see only the /step/<n>/ layout.
  *
- * /stream<path> is a virtual dataset shaped [rows, dims...]. Row j is the
- * dataset's state as of step first_step + j (an attribute on it). It reads
+ * /stream<path>/data is a virtual dataset shaped [rows, dims...]. Row j is
+ * the dataset's state as of step first_step + j (an attribute on it). It reads
  * /stream/.steps<path>/j, a hard link to the step's own copy -- or, for a
  * step that did not write the dataset, to the last copy that did. So a row
  * is "the state as of that step", no data is copied, and there is never a
@@ -10961,8 +10963,23 @@ H5VL_stream_dataset_get(void *dset, H5VL_dataset_get_args_t *args, hid_t dxpl_id
  * with an unlimited first dimension, so the view grows by itself as links
  * are added: one hard link per covered dataset per step.
  *
- * Covered: datasets whose shape cannot change (current dims == max dims) and
- * whose type is not variable-length. Not with a retention policy (the links
+ * A dataset growing along its first dimension -- the [nP, i, j] frame stack
+ * of a NeXus detector -- is covered differently, because its row is a frame,
+ * not a step, and each step's copy holds only the frames that step wrote
+ * (carry-forward is 1-D only). /stream<path>/data is then [frames, i, j], and row
+ * k reads /stream/.frames<path>/k: a one-mapping virtual dataset, made when
+ * the frame first appears, that selects row k of the copy of the step that
+ * wrote it. Still no data is copied -- one small object per frame. A frame
+ * rewritten by a later step keeps showing its first version.
+ *
+ * The layout is NeXus, so silx and H5Web plot it: /stream is an NXentry
+ * whose @default names the first dataset covered, and each /stream<path> an
+ * NXdata with the view as "data" (@interpretation spectrum or image) and a
+ * "step" axis, the step each row came from.
+ *
+ * Covered: datasets whose shape cannot change (current dims == max dims),
+ * or that grow along the first dimension only (rank 2 or more), and whose
+ * type is not variable-length. Not with a retention policy (the links
  * would keep pruned steps alive), and not for a parallel writer (every rank
  * would have to create the same objects collectively). Opt-in:
  * H5VL_stream_config_t.overlay or VOL_STREAM_OVERLAY.
@@ -10978,20 +10995,147 @@ H5VL__stream_overlay_enabled(const H5VL_stream_file_state_t *fs)
     return fs->cfg_overlay;
 } /* end H5VL__stream_overlay_enabled() */
 
-/* A name for H5Pset_virtual()'s source: '%' is its escape character. */
-static void
-H5VL__stream_overlay_src_name(char *out, size_t out_len, const char *path)
+/* path with '%' doubled: H5Pset_virtual()'s source names escape it. */
+static size_t
+H5VL__stream_vds_escape(char *out, size_t out_len, const char *path)
 {
     size_t o = 0;
 
-    o += (size_t)snprintf(out, out_len, "/stream/.steps");
     for (; *path && o + 3 < out_len; path++) {
         if (*path == '%')
             out[o++] = '%';
         out[o++] = *path;
     }
+    out[o] = '\0';
+    return o;
+} /* end H5VL__stream_vds_escape() */
+
+/* The printf source name /stream<dir><path>/%b, dir ".steps" or ".frames". */
+static void
+H5VL__stream_overlay_src_name(char *out, size_t out_len, const char *dir, const char *path)
+{
+    size_t o = (size_t)snprintf(out, out_len, "/stream%s", dir);
+
+    o += H5VL__stream_vds_escape(out + o, out_len - o, path);
     snprintf(out + o, out_len - o, "/%%b");
 } /* end H5VL__stream_overlay_src_name() */
+
+/* Does obj (a kind object in the under file) carry attribute aname? */
+static int
+H5VL__stream_overlay_attr_exists(H5VL_stream_file_state_t *fs, void *obj, H5I_type_t kind, const char *aname)
+{
+    H5VL_attr_specific_args_t args;
+    H5VL_loc_params_t         self;
+    hbool_t                   exists = 0;
+
+    memset(&self, 0, sizeof(self));
+    self.obj_type                = kind;
+    self.type                    = H5VL_OBJECT_BY_SELF;
+    args.op_type                 = H5VL_ATTR_EXISTS;
+    args.args.exists.name        = aname;
+    args.args.exists.exists      = &exists;
+    if (H5VLattr_specific(obj, &self, fs->file_under_vol_id, &args, H5P_DATASET_XFER_DEFAULT, NULL) < 0)
+        return -1;
+    return exists ? 1 : 0;
+} /* end H5VL__stream_overlay_attr_exists() */
+
+/* Attribute aname on obj: n UTF-8 strings (a scalar string if n is 0), or
+ * with vals NULL the scalar int *ival. */
+static int
+H5VL__stream_overlay_attr(H5VL_stream_file_state_t *fs, void *obj, H5I_type_t kind, const char *aname,
+                          const char *const *vals, size_t n, const int *ival)
+{
+    H5VL_loc_params_t self;
+    hsize_t           dn = n;
+    hid_t             type, space;
+    void             *a;
+    int               ret = -1;
+
+    memset(&self, 0, sizeof(self));
+    self.obj_type = kind;
+    self.type     = H5VL_OBJECT_BY_SELF;
+    if (vals) {
+        if ((type = H5Tcopy(H5T_C_S1)) < 0)
+            return -1;
+        if (H5Tset_size(type, H5T_VARIABLE) < 0 || H5Tset_cset(type, H5T_CSET_UTF8) < 0) {
+            H5Tclose(type);
+            return -1;
+        }
+    }
+    else if ((type = H5Tcopy(H5T_NATIVE_INT)) < 0)
+        return -1;
+    if ((space = n ? H5Screate_simple(1, &dn, NULL) : H5Screate(H5S_SCALAR)) < 0) {
+        H5Tclose(type);
+        return -1;
+    }
+    if ((a = H5VLattr_create(obj, &self, fs->file_under_vol_id, aname, type, space, H5P_ATTRIBUTE_CREATE_DEFAULT,
+                             H5P_ATTRIBUTE_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL))) {
+        ret = H5VLattr_write(a, fs->file_under_vol_id, type, vals ? (const void *)vals : (const void *)ival,
+                             H5P_DATASET_XFER_DEFAULT, NULL) < 0
+                  ? -1
+                  : 0;
+        H5VLattr_close(a, fs->file_under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+    }
+    H5Sclose(space);
+    H5Tclose(type);
+    return ret;
+} /* end H5VL__stream_overlay_attr() */
+
+/* The NXdata's axis: rows [row, row + nrows) of /stream<path>/step are step n. */
+static int
+H5VL__stream_overlay_axis(H5VL_stream_file_state_t *fs, const char *path, uint64_t row, uint64_t nrows,
+                          uint64_t n)
+{
+    H5VL_dataset_specific_args_t sargs;
+    H5VL_dataset_get_args_t      gargs;
+    H5VL_loc_params_t            loc;
+    char                         name[1100];
+    hsize_t                      ext = row + nrows, start = row, count = nrows;
+    hid_t                        fspace = H5I_INVALID_HID, mspace = H5I_INVALID_HID;
+    hid_t                        mtype = H5T_NATIVE_UINT64;
+    uint64_t                    *vals;
+    uint64_t                     i;
+    void                        *ds;
+    int                          ret = -1;
+
+    if (nrows == 0)
+        return 0;
+    if (NULL == (vals = (uint64_t *)malloc(nrows * sizeof(*vals))))
+        return -1;
+    for (i = 0; i < nrows; i++)
+        vals[i] = n;
+    memset(&loc, 0, sizeof(loc));
+    loc.obj_type = H5I_FILE;
+    loc.type     = H5VL_OBJECT_BY_SELF;
+    snprintf(name, sizeof(name), "/stream%s/step", path);
+    if (NULL == (ds = H5VLdataset_open(H5VL__stream_file_under(fs), &loc, fs->file_under_vol_id, name,
+                                        H5P_DATASET_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL))) {
+        free(vals);
+        return -1;
+    }
+    memset(&sargs, 0, sizeof(sargs));
+    sargs.op_type               = H5VL_DATASET_SET_EXTENT;
+    sargs.args.set_extent.size  = &ext;
+    gargs.op_type               = H5VL_DATASET_GET_SPACE;
+    if (H5VLdataset_specific(ds, fs->file_under_vol_id, &sargs, H5P_DATASET_XFER_DEFAULT, NULL) < 0 ||
+        H5VLdataset_get(ds, fs->file_under_vol_id, &gargs, H5P_DATASET_XFER_DEFAULT, NULL) < 0)
+        goto done;
+    fspace = gargs.args.get_space.space_id;
+    if (H5Sselect_hyperslab(fspace, H5S_SELECT_SET, &start, NULL, &count, NULL) < 0 ||
+        (mspace = H5Screate_simple(1, &count, NULL)) < 0 ||
+        H5VLdataset_write(1, &ds, fs->file_under_vol_id, &mtype, &mspace, &fspace, H5P_DATASET_XFER_DEFAULT,
+                          (const void **)&vals, NULL) < 0)
+        goto done;
+    ret = 0;
+done:
+    if (mspace >= 0)
+        H5Sclose(mspace);
+    if (fspace >= 0)
+        H5Sclose(fspace);
+    H5VLdataset_close(ds, fs->file_under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+    free(vals);
+    return ret;
+} /* end H5VL__stream_overlay_axis() */
 
 /* Start covering path, first written in step k. Returns the new entry,
  * dead if the dataset is not eligible or the objects could not be made. */
@@ -11021,6 +11165,8 @@ H5VL__stream_overlay_start(H5VL_stream_file_state_t *fs, const char *path, uint6
     e->path       = strdup(path);
     e->first_step = k;
     e->dead       = 1;
+    e->growing    = 0;
+    e->frames     = 0;
     if (!e->path)
         return NULL;
     fs->n_overlay++;
@@ -11049,58 +11195,137 @@ H5VL__stream_overlay_start(H5VL_stream_file_state_t *fs, const char *path, uint6
     if (H5VL__stream_type_vl_kind(type) != H5VL_STREAM_VL_NONE ||
         (rank = H5Sget_simple_extent_dims(space, dims, maxdims)) < 0 || rank >= H5S_MAX_RANK)
         goto done;
-    for (d = 0; d < rank; d++)
+    for (d = 1; d < rank; d++)
         if (maxdims[d] != dims[d])
-            goto done; /* its shape can change: rows would not line up */
-
-    /* The virtual dataset: [rows, dims...], rows unlimited. */
-    vdims[0] = 0;
-    vmax[0]  = H5S_UNLIMITED;
-    vstart[0] = 0;
-    vcount[0] = H5S_UNLIMITED;
-    vblock[0] = 1;
-    for (d = 0; d < rank; d++) {
-        vdims[d + 1] = vmax[d + 1] = vblock[d + 1] = dims[d];
-        vstart[d + 1]                              = 0;
-        vcount[d + 1]                              = 1;
+            goto done; /* a trailing dimension can change: rows would not line up */
+    if (maxdims[0] != dims[0]) {
+        if (rank < 2)
+            goto done; /* a growing 1-D series: one object per element is too many */
+        e->growing = 1;
     }
-    H5VL__stream_overlay_src_name(src, sizeof(src), path);
-    if ((vspace = H5Screate_simple(rank + 1, vdims, vmax)) < 0 ||
-        H5Sselect_hyperslab(vspace, H5S_SELECT_SET, vstart, NULL, vcount, vblock) < 0 ||
+
+    if (e->growing) {
+        /* [frames, dims[1..]...]: row k is /stream/.frames<path>/k, itself
+         * a virtual dataset of shape dims[1..] (H5VL__stream_overlay_frames()). */
+        vdims[0]  = 0;
+        vmax[0]   = H5S_UNLIMITED;
+        vstart[0] = 0;
+        vcount[0] = H5S_UNLIMITED;
+        vblock[0] = 1;
+        for (d = 1; d < rank; d++) {
+            vdims[d] = vmax[d] = vblock[d] = dims[d];
+            vstart[d]                      = 0;
+            vcount[d]                      = 1;
+        }
+        H5Sclose(space);
+        space = H5I_INVALID_HID;
+        H5VL__stream_overlay_src_name(src, sizeof(src), "/.frames", path);
+        if ((space = H5Screate_simple(rank - 1, dims + 1, NULL)) < 0 ||
+            (vspace = H5Screate_simple(rank, vdims, vmax)) < 0)
+            goto done;
+        rank--; /* the view's rank is rank + 1 below, as for a fixed-shape dataset */
+    }
+    else {
+        /* The virtual dataset: [rows, dims...], rows unlimited. */
+        vdims[0]  = 0;
+        vmax[0]   = H5S_UNLIMITED;
+        vstart[0] = 0;
+        vcount[0] = H5S_UNLIMITED;
+        vblock[0] = 1;
+        for (d = 0; d < rank; d++) {
+            vdims[d + 1] = vmax[d + 1] = vblock[d + 1] = dims[d];
+            vstart[d + 1]                              = 0;
+            vcount[d + 1]                              = 1;
+        }
+        H5VL__stream_overlay_src_name(src, sizeof(src), "/.steps", path);
+        if ((vspace = H5Screate_simple(rank + 1, vdims, vmax)) < 0)
+            goto done;
+    }
+    if (H5Sselect_hyperslab(vspace, H5S_SELECT_SET, vstart, NULL, vcount, vblock) < 0 ||
         (dcpl = H5Pcreate(H5P_DATASET_CREATE)) < 0 || H5Pset_virtual(dcpl, vspace, ".", src, space) < 0 ||
         (lcpl = H5Pcreate(H5P_LINK_CREATE)) < 0 || H5Pset_create_intermediate_group(lcpl, 1) < 0)
         goto done;
 
-    /* Where its rows' links live, and the overlay dataset's parent. Made
-     * with the replay's own helper: H5VLgroup_create() does not honor an
-     * LCPL's intermediate-group setting, which only an API call applies. */
-    snprintf(name, sizeof(name), "/stream/.steps%s", path);
+    /* Where its rows' links (or frames) live. Made with the replay's own
+     * helper: H5VLgroup_create() does not honor an LCPL's intermediate-group
+     * setting, which only an API call applies. */
+    snprintf(name, sizeof(name), "/stream/%s%s", e->growing ? ".frames" : ".steps", path);
+    if (NULL == (grp = H5VL__stream_replay_ensure_group(H5VL__stream_file_under(fs), fs->file_under_vol_id,
+                                                          name)))
+        goto done;
+    H5VLgroup_close(grp, fs->file_under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+    grp = NULL;
+
+    /* /stream is an NXentry whose default plot is the first dataset covered. */
+    if (NULL == (grp = H5VL__stream_replay_ensure_group(H5VL__stream_file_under(fs), fs->file_under_vol_id,
+                                                          "/stream")))
+        goto done;
+    {
+        int has = H5VL__stream_overlay_attr_exists(fs, grp, H5I_GROUP, "NX_class");
+        const char *nxentry = "NXentry", *def = path + 1;
+
+        if (has < 0 || (!has && (H5VL__stream_overlay_attr(fs, grp, H5I_GROUP, "NX_class", &nxentry, 0, NULL) < 0 ||
+                                 H5VL__stream_overlay_attr(fs, grp, H5I_GROUP, "default", &def, 0, NULL) < 0)))
+            goto done;
+    }
+    H5VLgroup_close(grp, fs->file_under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+    grp = NULL;
+
+    /* /stream<path> is an NXdata: the view as "data", plotted against the
+     * step each row came from, "step". */
+    snprintf(name, sizeof(name), "/stream%s", path);
     if (NULL == (grp = H5VL__stream_replay_ensure_group(H5VL__stream_file_under(fs), fs->file_under_vol_id,
                                                           name)))
         goto done;
     {
-        const char *slash = strrchr(path, '/');
+        const char *axes[H5S_MAX_RANK + 1], *nxdata = "NXdata", *signal = "data";
+        int         zero = 0;
 
-        if (slash && slash != path) {
-            void *parent;
+        axes[0] = "step";
+        for (d = 1; d <= rank; d++)
+            axes[d] = ".";
+        if (H5VL__stream_overlay_attr(fs, grp, H5I_GROUP, "NX_class", &nxdata, 0, NULL) < 0 ||
+            H5VL__stream_overlay_attr(fs, grp, H5I_GROUP, "signal", &signal, 0, NULL) < 0 ||
+            H5VL__stream_overlay_attr(fs, grp, H5I_GROUP, "axes", axes, (size_t)rank + 1, NULL) < 0 ||
+            H5VL__stream_overlay_attr(fs, grp, H5I_GROUP, "step_indices", NULL, 0, &zero) < 0)
+            goto done;
+    }
+    {
+        hsize_t zero = 0, unlim = H5S_UNLIMITED, chunk = 64;
+        hid_t   aspace = H5I_INVALID_HID, adcpl = H5I_INVALID_HID;
+        void   *axis   = NULL;
 
-            snprintf(name, sizeof(name), "/stream%.*s", (int)(slash - path), path);
-            if (NULL == (parent = H5VL__stream_replay_ensure_group(H5VL__stream_file_under(fs),
-                                                                     fs->file_under_vol_id, name)))
-                goto done;
-            H5VLgroup_close(parent, fs->file_under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
-        }
+        snprintf(name, sizeof(name), "/stream%s/step", path);
+        if ((aspace = H5Screate_simple(1, &zero, &unlim)) >= 0 && (adcpl = H5Pcreate(H5P_DATASET_CREATE)) >= 0 &&
+            H5Pset_chunk(adcpl, 1, &chunk) >= 0)
+            axis = H5VLdataset_create(H5VL__stream_file_under(fs), &loc, fs->file_under_vol_id, name,
+                                      H5P_LINK_CREATE_DEFAULT, H5T_STD_U64LE, aspace, adcpl,
+                                      H5P_DATASET_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL);
+        if (aspace >= 0)
+            H5Sclose(aspace);
+        if (adcpl >= 0)
+            H5Pclose(adcpl);
+        if (!axis)
+            goto done;
+        H5VLdataset_close(axis, fs->file_under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
     }
 
-    snprintf(name, sizeof(name), "/stream%s", path);
+    snprintf(name, sizeof(name), "/stream%s/data", path);
     if (H5Sset_extent_simple(vspace, rank + 1, vdims, vmax) < 0 ||
         NULL == (vds = H5VLdataset_create(H5VL__stream_file_under(fs), &loc, fs->file_under_vol_id, name, lcpl,
                                            type, vspace, dcpl, H5P_DATASET_ACCESS_DEFAULT,
                                            H5P_DATASET_XFER_DEFAULT, NULL)))
         goto done;
+    if (rank == 1 || rank == 2) {
+        /* One axis for rank + 1 dimensions: say how to draw the rest. */
+        const char *interp = rank == 1 ? "spectrum" : "image";
 
-    /* Row j is step first_step + j. */
-    {
+        if (H5VL__stream_overlay_attr(fs, vds, H5I_DATASET, "interpretation", &interp, 0, NULL) < 0)
+            goto done;
+    }
+
+    /* Row j is step first_step + j. (A growing dataset's row is a frame.) */
+    if (!e->growing) {
         H5VL_loc_params_t self;
         uint64_t          first = k;
 
@@ -11140,6 +11365,84 @@ done:
     e->dead = !ok;
     return e;
 } /* end H5VL__stream_overlay_start() */
+
+/* A growing dataset's new frames, from step n's copy: one virtual dataset
+ * per frame at /stream/.frames<path>/<k>, selecting row k of /step/n<path>.
+ * Returns -1 if a frame could not be mapped (the view would end there). */
+static int
+H5VL__stream_overlay_frames(H5VL_stream_file_state_t *fs, H5VL_stream_overlay_t *e, uint64_t n)
+{
+    H5VL_loc_params_t loc;
+    char              name[1100], src[1200];
+    void             *ds, *fds;
+    hid_t             type = H5I_INVALID_HID, space = H5I_INVALID_HID, fspace = H5I_INVALID_HID;
+    hid_t             dcpl = H5I_INVALID_HID;
+    hsize_t           dims[H5S_MAX_RANK], start[H5S_MAX_RANK], count[H5S_MAX_RANK];
+    uint64_t          j;
+    int               rank, d, ret = -1;
+
+    memset(&loc, 0, sizeof(loc));
+    loc.obj_type = H5I_FILE;
+    loc.type     = H5VL_OBJECT_BY_SELF;
+    snprintf(name, sizeof(name), "/step/%llu%s", (unsigned long long)n, e->path);
+    if (NULL == (ds = H5VLdataset_open(H5VL__stream_file_under(fs), &loc, fs->file_under_vol_id, name,
+                                        H5P_DATASET_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL)))
+        return -1;
+    {
+        H5VL_dataset_get_args_t g;
+
+        g.op_type = H5VL_DATASET_GET_TYPE;
+        if (H5VLdataset_get(ds, fs->file_under_vol_id, &g, H5P_DATASET_XFER_DEFAULT, NULL) < 0)
+            goto done;
+        type      = g.args.get_type.type_id;
+        g.op_type = H5VL_DATASET_GET_SPACE;
+        if (H5VLdataset_get(ds, fs->file_under_vol_id, &g, H5P_DATASET_XFER_DEFAULT, NULL) < 0)
+            goto done;
+        space = g.args.get_space.space_id;
+    }
+    if ((rank = H5Sget_simple_extent_dims(space, dims, NULL)) < 2 ||
+        (fspace = H5Screate_simple(rank - 1, dims + 1, NULL)) < 0)
+        goto done;
+    {
+        size_t o = (size_t)snprintf(src, sizeof(src), "/step/%llu", (unsigned long long)n);
+
+        H5VL__stream_vds_escape(src + o, sizeof(src) - o, e->path);
+    }
+    for (d = 0; d < rank; d++) {
+        start[d] = 0;
+        count[d] = dims[d];
+    }
+    count[0] = 1;
+    for (j = e->frames; j < dims[0]; j++) {
+        start[0] = j;
+        if ((dcpl = H5Pcreate(H5P_DATASET_CREATE)) < 0 ||
+            H5Sselect_hyperslab(space, H5S_SELECT_SET, start, NULL, count, NULL) < 0 ||
+            H5Pset_virtual(dcpl, fspace, ".", src, space) < 0)
+            goto done;
+        snprintf(name, sizeof(name), "/stream/.frames%s/%llu", e->path, (unsigned long long)j);
+        if (NULL == (fds = H5VLdataset_create(H5VL__stream_file_under(fs), &loc, fs->file_under_vol_id, name,
+                                               H5P_LINK_CREATE_DEFAULT, type, fspace, dcpl,
+                                               H5P_DATASET_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL)))
+            goto done;
+        H5VLdataset_close(fds, fs->file_under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+        H5Pclose(dcpl);
+        dcpl = H5I_INVALID_HID;
+        e->frames = j + 1;
+    }
+    ret = 0;
+
+done:
+    H5VLdataset_close(ds, fs->file_under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+    if (dcpl >= 0)
+        H5Pclose(dcpl);
+    if (fspace >= 0)
+        H5Sclose(fspace);
+    if (space >= 0)
+        H5Sclose(space);
+    if (type >= 0)
+        H5Tclose(type);
+    return ret;
+} /* end H5VL__stream_overlay_frames() */
 
 /* Step n just committed: start covering datasets it wrote first, and give
  * every covered dataset its row for n. */
@@ -11184,6 +11487,15 @@ H5VL__stream_overlay_step(H5VL_stream_file_state_t *fs, uint64_t n)
 
         if (e->dead || n < e->first_step || H5VL__stream_path_index_resolve(fs, e->path, n, &r) < 0)
             continue;
+        if (e->growing) {
+            /* Frames, not steps: only a step that wrote the dataset adds any. */
+            uint64_t before = e->frames;
+
+            if (r == n && (H5VL__stream_overlay_frames(fs, e, n) < 0 ||
+                           H5VL__stream_overlay_axis(fs, e->path, before, e->frames - before, n) < 0))
+                e->dead = 1;
+            continue;
+        }
         snprintf(target, sizeof(target), "/step/%llu%s", (unsigned long long)r, e->path);
         snprintf(link, sizeof(link), "/stream/.steps%s/%llu", e->path,
                  (unsigned long long)(n - e->first_step));
@@ -11201,7 +11513,8 @@ H5VL__stream_overlay_step(H5VL_stream_file_state_t *fs, uint64_t n)
         loc.loc_data.loc_by_name.name        = link;
         loc.loc_data.loc_by_name.lapl_id     = H5P_LINK_ACCESS_DEFAULT;
         if (H5VLlink_create(&args, H5VL__stream_file_under(fs), &loc, fs->file_under_vol_id,
-                            H5P_LINK_CREATE_DEFAULT, H5P_LINK_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL) < 0)
+                            H5P_LINK_CREATE_DEFAULT, H5P_LINK_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL) < 0 ||
+            H5VL__stream_overlay_axis(fs, e->path, n - e->first_step, 1, n) < 0)
             e->dead = 1; /* a missing row would end the view; stop here instead */
     }
 } /* end H5VL__stream_overlay_step() */
