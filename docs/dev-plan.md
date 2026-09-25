@@ -1399,6 +1399,12 @@ the one list. ★ marks what is being worked on next.
 - Per-subscriber precision is deflate only; other filters and chunk shape are
   not exposed.
 - A whole-dataset subscription follows growth along the first dimension only.
+- No strided selection (the C API has it) and no box that follows growth, so
+  a downsampled or ROI live view of a growing `[nP, i, j]` stack can't be
+  expressed (`examples/silx_live_view`).
+- A whole-dataset subscription on a growing dataset reassembles every row up to
+  the newest, plus a mask, on each step, though only the new row was sent. The
+  cost per step grows with the run.
 - `StreamDataset` is `num_workers=0` only (by design).
 - One process-wide HDF5 lock: a blocking wait on one `File` can delay a call on
   another by up to 100 ms.

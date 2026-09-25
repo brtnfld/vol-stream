@@ -107,6 +107,19 @@ if(VOL_STREAM_BUILD_TESTS)
       )
     endforeach()
 
+    # examples/silx_live_view without the window: the detector example's
+    # writer, the viewer joining late and backfilling, frames narrowed to
+    # int16. 8 frames, the first 4 hits (examples/detector_pipeline).
+    if(TARGET detector_writer)
+      add_test(NAME python_silx_live_view
+        COMMAND ${CMAKE_SOURCE_DIR}/examples/silx_live_view/run_live_view.sh "" 8 300
+                --no-gui --from-step 0 --expect-frames 8 --expect-hits 4)
+      set_tests_properties(python_silx_live_view PROPERTIES
+        ENVIRONMENT "${_py_env};DETECTOR_WRITER=$<TARGET_FILE:detector_writer>;PYTHON=${Python_EXECUTABLE}"
+        TIMEOUT 120
+      )
+    endif()
+
     # P3 exit gate: early exit without close(), Ctrl-C and other threads
     # during a wait, and fork().
     foreach(mode break interrupt fork)

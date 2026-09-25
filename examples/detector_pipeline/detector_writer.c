@@ -166,6 +166,9 @@ main(int argc, char **argv)
 {
     int nframes  = argc > 1 ? atoi(argv[1]) : DETECTOR_NFRAMES;
     int delay_ms = argc > 2 ? atoi(argv[2]) : 500;
+    /* How many consumers to wait for before acquiring; 0 starts at once and
+     * lets them join late (examples/silx_live_view runs with one or none). */
+    int nconsumers = argc > 3 ? atoi(argv[3]) : N_CONSUMERS;
 
     hid_t    vol_id, fapl, fid;
     hid_t    image = H5I_INVALID_HID, file_space = H5I_INVALID_HID;
@@ -206,13 +209,14 @@ main(int argc, char **argv)
            DETECTOR_MODULES, DETECTOR_MODULE_ROWS, DETECTOR_COLS, DETECTOR_ROWS, DETECTOR_COLS,
            (DETECTOR_FRAME_ELEMS * sizeof(int32_t)) / 1024);
     printf("writer: NeXus layout at %s -- structure is NEVER announced separately\n", DETECTOR_IMAGE_PATH);
-    printf("writer: waiting up to %ds for consumers (run pipeline_consumer in other terminals)...\n",
-           DETECTOR_BARRIER_TIMEOUT_MS / 1000);
-
-    if (H5Fwait_subscribers(fid, N_CONSUMERS, DETECTOR_BARRIER_TIMEOUT_MS) < 0)
-        printf("writer: proceeding without all %d consumers (fewer is fine for this demo)\n", N_CONSUMERS);
-    else
-        printf("writer: all %d consumers attached, starting acquisition\n", N_CONSUMERS);
+    if (nconsumers > 0) {
+        printf("writer: waiting up to %ds for %d consumer(s) (run pipeline_consumer in other terminals)...\n",
+               DETECTOR_BARRIER_TIMEOUT_MS / 1000, nconsumers);
+        if (H5Fwait_subscribers(fid, (uint64_t)nconsumers, DETECTOR_BARRIER_TIMEOUT_MS) < 0)
+            printf("writer: proceeding without all %d consumers (fewer is fine for this demo)\n", nconsumers);
+        else
+            printf("writer: all %d consumers attached, starting acquisition\n", nconsumers);
+    }
 
     /* One chunk per frame -- the layout EIGER's own writer produces, and the
      * one that makes a per-frame push exactly one chunk. */

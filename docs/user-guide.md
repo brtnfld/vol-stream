@@ -1673,6 +1673,7 @@ programs, not a test harness; each has its own `README.md`:
 | `examples/reaction_diffusion/` | Gray–Scott reaction–diffusion, same two-program shape |
 | `examples/narrowing_demo/` | One write per step, narrowed per subscriber at the writer: precision, filter, or a value condition |
 | `examples/detector_pipeline/` | A multi-module detector feeding five consumer roles that discover the stream's structure from its schema (RFC section A.2), including a monitor that turns per-frame status into decisions |
+| `examples/silx_live_view/` | The control-room live view beamlines run on silx (MAX IV, ESRF Flint), fed by pushes instead of HTTP polling: a Python subscriber gets `detector_pipeline`'s frames narrowed to int16 and redraws the newest one in a silx `ImageView` |
 | `examples/vfd_swmr/` | A proof of concept composing vol-stream with VFD SWMR so the live file itself becomes readable |
 
 Run either with its `run_demo.sh`, or by hand in two terminals:

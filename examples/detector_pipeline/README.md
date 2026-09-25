@@ -100,7 +100,7 @@ VOL_STREAM_NA=ofi+tcp ./pipeline_consumer hitfinder
 VOL_STREAM_NA=ofi+tcp ./pipeline_consumer monitor
 ```
 
-`detector_writer [nframes] [delay-ms]` -- defaults 8, 500.
+`detector_writer [nframes] [delay-ms] [nconsumers]` -- defaults 8, 500, 5. `nconsumers` 0 starts acquiring at once and lets consumers join late.
 `pipeline_consumer <mode> [module] [nmodules] [max-pushes] [step-timeout-ms]`.
 
 The single most direct thing to run is `pipeline_consumer discover` against a
