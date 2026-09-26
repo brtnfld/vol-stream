@@ -1527,13 +1527,16 @@ H5VL__stream_file_under(H5VL_stream_file_state_t *fs)
 static void
 H5VL__stream_pending_entry_clear(H5VL_stream_pending_entry_t *e)
 {
-    if (e->type_id > 0)
+    /* H5Iis_valid(): a step left open when HDF5 shuts down is discarded by
+     * the file close, which runs after the library has already closed every
+     * datatype, dataspace and property list ID (t_exit_midstep). */
+    if (e->type_id > 0 && H5Iis_valid(e->type_id) > 0)
         H5Tclose(e->type_id);
-    if (e->space_id > 0)
+    if (e->space_id > 0 && H5Iis_valid(e->space_id) > 0)
         H5Sclose(e->space_id);
-    if (e->dcpl_id > 0)
+    if (e->dcpl_id > 0 && H5Iis_valid(e->dcpl_id) > 0)
         H5Pclose(e->dcpl_id);
-    if (e->dapl_id > 0)
+    if (e->dapl_id > 0 && H5Iis_valid(e->dapl_id) > 0)
         H5Pclose(e->dapl_id);
     free(e->path);
     free(e->payload);
@@ -9485,10 +9488,38 @@ static hid_t H5VL_stream_standin_file_g = H5I_INVALID_HID;
 static hid_t H5VL_stream_standin_dset_g = H5I_INVALID_HID;
 static void *H5VL_stream_standin_obj_g  = NULL; /* the native H5D_t behind standin_dset_g */
 
+/* An open dataset ID other than the stand-in's own that resolves to the
+ * stand-in: a placeholder the application never closed. */
+static herr_t
+H5VL__stream_standin_user(hid_t id, void *udata)
+{
+    if (id != H5VL_stream_standin_dset_g && H5VLobject(id) == H5VL_stream_standin_obj_g) {
+        *(int *)udata = 1;
+        return 1; /* stop */
+    }
+    return 0;
+} /* end H5VL__stream_standin_user() */
+
 static void
 H5VL__stream_standin_close(void *ctx)
 {
+    int in_use = 0;
+
     (void)ctx;
+    /* A placeholder still open -- a writer that exits mid-step without
+     * closing a dataset it created -- would crash this: closing the stand-in's
+     * file walks every open dataset ID, the placeholder among them, and its
+     * stand-in would be gone. Leave both to the library's own teardown, which
+     * closes dataset IDs before files, so no file close walks a placeholder. */
+    if (H5VL_stream_standin_obj_g) {
+        H5E_BEGIN_TRY
+        {
+            H5Iiterate(H5I_DATASET, H5VL__stream_standin_user, &in_use);
+        }
+        H5E_END_TRY
+        if (in_use)
+            return;
+    }
     H5VL_stream_standin_obj_g = NULL;
     if (H5VL_stream_standin_dset_g >= 0)
         H5Dclose(H5VL_stream_standin_dset_g);

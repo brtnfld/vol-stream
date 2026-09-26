@@ -1356,6 +1356,17 @@ matches the code. Each item is documented for users in
   a time: CI hung. It now starts at the first row the push's range reaches,
   stops past its end, and takes a block spanning every trailing dimension
   as one run.
+- **A writer that exits mid-step no longer crashes, or loses committed
+  steps.** Returning with a step open and a dataset from it unclosed crashed
+  as HDF5 shut down: the connector's `H5atclose()` callback closed the
+  native stand-in that `get_object` returns for that dataset, and closing
+  the stand-in's file walks every open dataset ID, the leftover one included.
+  The crash also skipped the file's final flush, so steps that had already
+  committed were missing from the file. The callback now leaves the stand-in
+  to the library's own teardown when a placeholder is still open (dataset
+  IDs close before files there), and discarding the open step skips IDs the
+  teardown has already freed. `t_exit_midstep`, which fails both ways without
+  the fix.
 - **Group attributes written outside a step reach the stream.** A NeXus
   writer sets `NX_class`, `@signal` and `/@default` on its groups before the
   first step. Those writes passed through to the live groups and nothing more:
@@ -1441,12 +1452,6 @@ the one list. ★ marks what is being worked on next.
 - The ADIOS2 SST comparison is single-node, single-rank and statistically
   informal.
 - `precision_dual` (the literal M8 exit gate) is still `DISABLED`.
-
-- A writer that exits in the middle of a step, without closing a dataset it
-  created in that step, crashes in `H5D_flush_all` when the connector's exit
-  handler closes the file. Seen in CI after `detector_writer` returned early
-  on the `H5Dset_extent()` failure above. Only an application that is already
-  failing reaches it.
 
 **Python binding** (details in [`python-plan.md`](python-plan.md))
 
