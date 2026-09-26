@@ -1,0 +1,21 @@
+.github/workflows/ci.yml
+  s_3816fb7b7c4a27::t_8c07730d5c9143 416-418
+docs/dev-plan.md
+  s_3816fb7b7c4a27::t_47538b4f434147 1467-1468
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "aa52a255508869a1127455f61062c1f17549a661",
+  "prompts": {},
+  "sessions": {
+    "s_3816fb7b7c4a27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b5b5c72-aca3-496b-8412-0fb9ae85948c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
