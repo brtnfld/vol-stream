@@ -677,6 +677,7 @@ static const char *H5VL__stream_transport_na(const H5VL_stream_file_state_t *fs)
 static char *H5VL__stream_vsaddr_path(const char *filename);
 static void H5VL__stream_transport_start_writer(H5VL_stream_file_state_t *fs, const char *name);
 static void H5VL__stream_transport_start_reader(H5VL_stream_file_state_t *fs, const char *name);
+static void H5VL__stream_done_marker_write(const H5VL_stream_file_state_t *fs);
 /* M8.5 precision: see H5VL__stream_refilter_for_subscriber()'s comment --
  * vs_tr_refilter_fn's implementation, and H5VL__stream_unfilter_pushed_
  * data()'s the reverse operation, used in the get_subscribed_data handler. */
