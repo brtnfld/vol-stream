@@ -55,10 +55,15 @@ if(SKBUILD)
     endif()
   endforeach()
   list(REMOVE_DUPLICATES _hdf5_rpath)
+  # BUILD_WITH_INSTALL_RPATH: linked with the install RPATH from the start,
+  # so there is no build RPATH for install to strip. On macOS install could
+  # not strip it -- pip builds under /var, a symlink to /private/var, and
+  # CMake did not recognise the path -- so the installed extension kept
+  # pip's deleted temporary directory in its RPATH.
   set_target_properties(_volstream PROPERTIES INSTALL_RPATH "${_origin};${_hdf5_rpath}"
-                                              INSTALL_RPATH_USE_LINK_PATH FALSE)
+                                              INSTALL_RPATH_USE_LINK_PATH FALSE BUILD_WITH_INSTALL_RPATH ON)
   set_target_properties(vol_stream PROPERTIES INSTALL_RPATH "${VOL_STREAM_DEP_LIBDIRS}"
-                                              INSTALL_RPATH_USE_LINK_PATH TRUE)
+                                              INSTALL_RPATH_USE_LINK_PATH TRUE BUILD_WITH_INSTALL_RPATH ON)
   install(TARGETS _volstream vol_stream LIBRARY DESTINATION volstream COMPONENT python)
   list(TRANSFORM _volstream_py PREPEND volstream/)
   install(FILES ${_volstream_py} DESTINATION volstream COMPONENT python)

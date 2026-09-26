@@ -491,12 +491,15 @@ supported, or depends on something outside this binding.
 
 ### Packaging
 
-- **Stale RPATH entries on macOS.** Installed with Homebrew GCC, the
-  extension's RPATH still lists pip's temporary build directory (deleted
-  after the install) and GCC's library directories. The package imports and
-  its tests pass from outside the source tree, so this is cosmetic. Not
-  investigated further. On Linux, CI prints the installed extension's RPATH
-  and fails if it points into a temporary build directory.
+- **GCC's own RPATH entries on macOS.** Built with Homebrew GCC, the
+  installed extension and library list GCC's library directories in their
+  RPATH, because the GCC driver adds them to every link. Nothing loads
+  through them. pip's temporary build directory used to be listed too: CMake
+  could not strip the build RPATH at install, because pip builds under
+  `/var`, a symlink to `/private/var`. Both targets are now linked with their
+  install RPATH from the start (`BUILD_WITH_INSTALL_RPATH`). On Linux, CI
+  prints the installed extension's RPATH and fails if it points into a
+  temporary build directory.
 
 ## What this does not fix
 

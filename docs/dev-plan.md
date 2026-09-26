@@ -1509,7 +1509,9 @@ the one list. ★ marks what is being worked on next.
   another by up to 100 ms.
 - A step that arrives in several pushes is copied into one array.
 - Source build only, by design; no wheel.
-- Stale RPATH entries on macOS.
+- GCC's own library directories in the installed RPATH on macOS, from the
+  Homebrew GCC driver; nothing loads through them. (pip's temporary build
+  directory is no longer there: `BUILD_WITH_INSTALL_RPATH`.)
 
 **CI and upstream**
 
