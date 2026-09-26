@@ -1,0 +1,25 @@
+test/t_step_rewrite.c
+  s_3816fb7b7c4a27::t_d68c1f5c282b50 402-434,436
+docs/dev-plan.md
+  s_3816fb7b7c4a27::t_5da795d561d406 1359-1365
+docs/user-guide.md
+  s_3816fb7b7c4a27::t_5da795d561d406 417-420
+src/H5VLstream.c
+  s_3816fb7b7c4a27::t_d68c1f5c282b50 550-552,6162-6243,6902-6915,6927
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "04f119eec2697cbf3fd38881a676b83fa1670e31",
+  "prompts": {},
+  "sessions": {
+    "s_3816fb7b7c4a27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b5b5c72-aca3-496b-8412-0fb9ae85948c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
