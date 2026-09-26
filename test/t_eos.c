@@ -515,11 +515,14 @@ clean(void)
     unlink(BLOCKING_SENTINEL);
     unlink(NOSTEP_READY_SENTINEL);
     unlink(FNAME ".vsgroup");
+    unlink(FNAME ".vsdone");
     unlink(FNAME);
     unlink(FNAME_NOSTEP ".vsgroup");
+    unlink(FNAME_NOSTEP ".vsdone");
     unlink(FNAME_NOSTEP);
     unlink(KILLED_READY_SENTINEL);
     unlink(FNAME_KILLED ".vsgroup");
+    unlink(FNAME_KILLED ".vsdone");
     unlink(FNAME_KILLED);
 }
 

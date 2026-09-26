@@ -310,6 +310,7 @@ run_writer(void)
     int     i;
 
     unlink(FNAME ".vsgroup");
+    unlink(FNAME ".vsdone");
     unlink(FNAME);
 
     if ((vol_id = H5VL_stream_register()) < 0) {
@@ -457,6 +458,7 @@ main(void)
      * race rather than narrowing it. */
     unlink(FNAME);
     unlink(FNAME ".vsgroup");
+    unlink(FNAME ".vsdone");
     unlink(STEP0_DONE_SENTINEL);
     unlink(SUBSCRIBED_SENTINEL);
     unlink(WRITES_DONE_SENTINEL);

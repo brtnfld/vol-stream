@@ -269,6 +269,12 @@ clean_names(void)
 
     unlink(g_fname);
     unlink(g_group_file);
+    {
+        char done[96];
+
+        snprintf(done, sizeof(done), "%s.vsdone", g_fname);
+        unlink(done);
+    }
     unlink(g_writer_done_sentinel);
     unlink(g_refilter_log);
     for (i = 0; i < MAX_SUBS; i++) {

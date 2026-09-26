@@ -377,6 +377,9 @@ struct H5VL_stream_file_state_t {
      * H5VL__stream_fold_group_attrs(). */
     char                       **group_attrs;
     size_t                       n_group_attrs, cap_group_attrs;
+    /* "<file>.vsdone": a writer creates it when it closes the stream, a
+     * reader checks it -- see H5VL__stream_done_marker_path(). */
+    char                        *done_marker;
     /* Links replayed so far (Kind.Link): path -> target. A later step that
      * writes the target gets the link again -- H5VL__stream_fold_links(). */
     struct H5VL_stream_link_t   *links;
@@ -1673,9 +1676,14 @@ H5VL__stream_file_state_decref(H5VL_stream_file_state_t *fs)
 #ifdef VOL_STREAM_HAVE_MERCURY
     H5VL__stream_schema_clear(fs);
 
+    /* The writer is leaving: say so durably, for a reader that never learned
+     * which member it was -- see H5VL__stream_done_marker_path(). */
+    if (fs->transport && !fs->is_reader)
+        H5VL__stream_done_marker_write(fs);
     if (fs->transport)
         vs_tr_stop(fs->transport);
 #endif
+    free(fs->done_marker);
 
 #ifdef H5_HAVE_PARALLEL
     if (fs->has_comm)
@@ -1866,6 +1874,53 @@ H5VL__stream_ssg_group_path(const char *filename)
 } /* end H5VL__stream_ssg_group_path() */
 
 /*-------------------------------------------------------------------------
+ * Function:    H5VL__stream_done_marker_path
+ *
+ * Purpose:     "<filename>.vsdone", the writer's "closed" marker. The writer
+ *              removes a stale one when it starts the stream and creates it,
+ *              atomically, when the file state is torn down -- after its
+ *              last step was announced and before it leaves the group. So a
+ *              reader can tell a stream that has not started (no .vsgroup)
+ *              from one that is running (.vsgroup, no .vsdone) from one
+ *              that finished (.vsdone), which the membership updates alone
+ *              could not when the reader never learned which member was the
+ *              writer. A sidecar rather than an attribute in the file: a
+ *              reader that opened the file while the writer ran cannot see
+ *              metadata the writer adds later, and Flock owns and rewrites
+ *              the .vsgroup file. A writer that is killed leaves none; SWIM
+ *              covers it once the reader knows the writer.
+ *-------------------------------------------------------------------------
+ */
+static char *
+H5VL__stream_done_marker_path(const char *filename)
+{
+    size_t len  = strlen(filename) + strlen(".vsdone") + 1;
+    char  *path = (char *)malloc(len);
+
+    if (path)
+        snprintf(path, len, "%s.vsdone", filename);
+    return path;
+} /* end H5VL__stream_done_marker_path() */
+
+/* The writer's side of the marker: written to "<marker>.tmp" and renamed,
+ * so a reader never sees a partial one. */
+static void
+H5VL__stream_done_marker_write(const H5VL_stream_file_state_t *fs)
+{
+    char  tmp[4096];
+    FILE *f;
+
+    if (!fs->done_marker || snprintf(tmp, sizeof(tmp), "%s.tmp", fs->done_marker) >= (int)sizeof(tmp))
+        return;
+    if (NULL == (f = fopen(tmp, "w")))
+        return;
+    fprintf(f, "vol-stream: the writer closed this stream after %llu committed step(s)\n",
+            (unsigned long long)fs->physical_step);
+    if (fclose(f) != 0 || rename(tmp, fs->done_marker) != 0)
+        unlink(tmp);
+} /* end H5VL__stream_done_marker_write() */
+
+/*-------------------------------------------------------------------------
  * Function:    H5VL__stream_transport_start_writer
  *
  * Purpose:     If VOL_STREAM_NA is set, start the transport for a writer:
@@ -1915,6 +1970,12 @@ H5VL__stream_transport_start_writer(H5VL_stream_file_state_t *fs, const char *na
                            H5P_DATASET_XFER_DEFAULT, NULL);
     }
 
+    /* A marker from an earlier run of this file would say the stream about
+     * to start has already finished: remove it before a reader can find the
+     * new group file. */
+    if (NULL != (fs->done_marker = H5VL__stream_done_marker_path(name)))
+        unlink(fs->done_marker);
+
     if (NULL != (group_file = H5VL__stream_ssg_group_path(name))) {
         vs_tr_writer_start_group(fs->transport, group_file);
         free(group_file);
@@ -1960,12 +2021,20 @@ H5VL__stream_transport_start_reader(H5VL_stream_file_state_t *fs, const char *na
 
     if (NULL == (group_file = H5VL__stream_ssg_group_path(name)))
         return;
+    fs->done_marker = H5VL__stream_done_marker_path(name);
 
     for (attempt = 0; attempt < 50; attempt++) {
-        FILE *f = fopen(group_file, "r");
+        FILE *f;
 
-        if (f) {
+        /* The writer already closed the stream: there is no one to join (its
+         * group file may still name it), and the stream is at its end. */
+        if (fs->done_marker && access(fs->done_marker, F_OK) == 0) {
+            vs_tr_reader_set_done_marker(fs->transport, fs->done_marker, 1);
+            break;
+        }
+        if ((f = fopen(group_file, "r"))) {
             fclose(f);
+            vs_tr_reader_set_done_marker(fs->transport, fs->done_marker, 0);
             vs_tr_reader_join_group(fs->transport, group_file);
             break;
         }

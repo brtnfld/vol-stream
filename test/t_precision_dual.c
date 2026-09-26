@@ -453,6 +453,7 @@ main(void)
      * timeout while the same binary passed in 1.7s standalone, purely
      * because ctest ran from a directory holding a stale sidecar. */
     unlink(FNAME ".vsgroup");
+    unlink(FNAME ".vsdone");
     unlink(FNAME);
 
     unlink(READY_A_SENTINEL);

@@ -1375,6 +1375,11 @@ vs_tr_writer_push_opaque(vs_tr_t *, uint64_t, const char *, const void *, uint64
     return 0; /* not delivered on this backend, as before */
 }
 
+void
+vs_tr_reader_set_done_marker(vs_tr_t *, const char *, int)
+{
+}
+
 int
 vs_tr_writer_push_opaque_to(vs_tr_t *, uint64_t, uint64_t, const char *, const void *, uint64_t, uint64_t,
                             uint64_t, const uint8_t *, uint64_t, const uint8_t *, uint64_t, uint32_t)

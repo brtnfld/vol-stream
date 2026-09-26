@@ -28,7 +28,9 @@ main(void)
     printf("vol-stream: the transport turned on through the FAPL (na+sm)\n");
     unsetenv("VOL_STREAM_NA");
     unlink("t_config_na_on.h5.vsgroup");
+    unlink("t_config_na_on.h5.vsdone");
     unlink("t_config_na_off.h5.vsgroup");
+    unlink("t_config_na_off.h5.vsdone");
 
     H5VL_stream_config_init(&cfg);
     cfg.na         = "na+sm";
@@ -63,7 +65,9 @@ main(void)
     unlink("t_config_na_on.h5");
     unlink("t_config_na_off.h5");
     unlink("t_config_na_on.h5.vsgroup");
+    unlink("t_config_na_on.h5.vsdone");
     unlink("t_config_na_off.h5.vsgroup");
+    unlink("t_config_na_off.h5.vsdone");
     printf(rc ? "\nfailure\n" : "\nall checks passed\n");
     return rc;
 }

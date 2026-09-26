@@ -258,6 +258,7 @@ main(void)
      * ("can't retrieve stat info for file"). Same fix, and the same reason,
      * as t_precision_dual.c's own pre-fork cleanup. */
     unlink(FNAME ".vsgroup");
+    unlink(FNAME ".vsdone");
     unlink(FNAME);
 
     fflush(NULL);

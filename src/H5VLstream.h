@@ -733,9 +733,11 @@ H5VL_STREAM_API herr_t H5Ffree_stream_schema(size_t n_vars, H5F_stream_var_t *va
  * \p timeout_ms, and H5Fstep_status() reports H5F_STEP_EOS. A writer is
  * recognised from the step announcements it sends, the join seed, or its
  * answer to this reader's H5Fsubscribe(), H5Fget_stream_schema() or
- * H5Fack_stream_step(). Only a reader that did none of those, joined before
- * the writer's first commit, and saw no step announced cannot tell. A
- * parallel writer's stream ends when every rank has left.
+ * H5Fack_stream_step(). A writer that closes also leaves "<file>.vsdone",
+ * so a reader that never identified it -- one that opened the file after it
+ * left -- still sees the stream end. Only a writer killed before this reader
+ * identified it goes unnoticed. A parallel writer's stream ends when every
+ * rank has left.
  *
  * \param file_id       File opened through the vol-stream connector for
  *                      reading, with the transport enabled (see

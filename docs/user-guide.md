@@ -862,7 +862,16 @@ current with the group's members:
 ```
 example_series.h5           <- the HDF5 file
 example_series.h5.vsgroup   <- the Flock group file, how consumers find the writer
+example_series.h5.vsdone    <- written when the writer closes the stream
 ```
+
+The `.vsdone` marker is how a consumer tells a stream that has not started (no
+`.vsgroup`) from one that is running (`.vsgroup`, no `.vsdone`) from one that
+has finished (`.vsdone`). A consumer that opens the file after the writer left
+reports the end of the stream at once and does not try to join; it can still
+read every committed step from the file. The writer removes a stale marker when
+it starts, so a new run is not taken for a finished one. When cleaning up
+between runs, remove both sidecars.
 
 A consumer loads the sidecar and joins. Flock's SWIM failure detector handles
 liveness, so a consumer that dies is simply absent from the next group view —

@@ -292,6 +292,7 @@ clean(void)
     unlink(DONE_SENTINEL);
     unlink(STATS);
     unlink(FNAME ".vsgroup");
+    unlink(FNAME ".vsdone");
     unlink(FNAME);
 }
 

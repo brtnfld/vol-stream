@@ -60,6 +60,7 @@ main(int argc, char **argv)
     setenv("VOL_STREAM_DEBUG_REFILTER", "1", 0);
     unlink(NARROWING_FNAME);
     unlink(NARROWING_FNAME ".vsgroup");
+    unlink(NARROWING_FNAME ".vsdone");
 
     if (NULL == (vals = (double *)calloc((size_t)NARROWING_NELEM, sizeof(double)))) {
         fprintf(stderr, "writer: FAIL allocate\n");

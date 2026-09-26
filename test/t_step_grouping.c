@@ -556,6 +556,7 @@ main(void)
     /* A stale sidecar from an earlier run would send the reader to a dead
      * group -- see t_subvolume_strided.c's identical pre-fork cleanup. */
     unlink(FNAME ".vsgroup");
+    unlink(FNAME ".vsdone");
     unlink(FNAME);
 
     fflush(NULL);

@@ -147,6 +147,16 @@ if(VOL_STREAM_HAVE_MERCURY)
     )
   endforeach()
 
+  # A reader can tell a finished stream from one that has not started: the
+  # writer's "<file>.vsdone" marker.
+  add_executable(t_writer_done t_writer_done.c)
+  target_link_libraries(t_writer_done PRIVATE vol_stream)
+  add_test(NAME writer_done COMMAND t_writer_done)
+  set_tests_properties(writer_done PROPERTIES
+    ENVIRONMENT "HDF5_PLUGIN_PATH=$<TARGET_FILE_DIR:vol_stream>"
+    TIMEOUT 90
+  )
+
   # Backfill for a late joiner: H5Fsubscribe_from() delivers the missed steps
   # from the writer's file, then the live ones, each once and in order.
   add_executable(t_backfill t_backfill.c)

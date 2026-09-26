@@ -185,6 +185,7 @@ main(int argc, char **argv)
     setenv("VOL_STREAM_NA", "na+sm", 0);
     unlink(DETECTOR_FNAME);
     unlink(DETECTOR_FNAME ".vsgroup");
+    unlink(DETECTOR_FNAME ".vsdone");
 
     if (NULL == (frame = (int32_t *)calloc(DETECTOR_FRAME_ELEMS, sizeof(int32_t)))) {
         fprintf(stderr, "writer: FAIL allocate frame\n");

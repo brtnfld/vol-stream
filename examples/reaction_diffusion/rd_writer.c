@@ -125,6 +125,7 @@ main(int argc, char **argv)
     setenv("VOL_STREAM_NA", "na+sm", 0);
     unlink(RD_FNAME);
     unlink(RD_FNAME ".vsgroup");
+    unlink(RD_FNAME ".vsdone");
     unlink(RD_READY_SENTINEL);
 
     if ((vol_id = H5VL_stream_register()) < 0) {

@@ -251,6 +251,7 @@ main(void)
 
     remove(FNAME);
     remove(FNAME ".vsgroup");
+    remove(FNAME ".vsdone");
 
     /* Drain stdout before forking: the child inherits a copy of whatever is
      * still buffered, and its own flush would print this header a second
@@ -281,6 +282,7 @@ main(void)
 
     remove(FNAME);
     remove(FNAME ".vsgroup");
+    remove(FNAME ".vsdone");
 
     if (writer_rc || reader_rc) {
         printf("t_rendezvous_barrier: FAILED (writer=%d reader=%d)\n", writer_rc, reader_rc);

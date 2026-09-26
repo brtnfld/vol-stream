@@ -236,6 +236,7 @@ clean(void)
     unlink(READY_SENTINEL);
     unlink(DONE_SENTINEL);
     unlink(FNAME ".vsgroup");
+    unlink(FNAME ".vsdone");
     unlink(FNAME);
 }
 

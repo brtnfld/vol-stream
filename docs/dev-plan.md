@@ -1356,6 +1356,21 @@ matches the code. Each item is documented for users in
   a time: CI hung. It now starts at the first row the push's range reaches,
   stops past its end, and takes a block spanning every trailing dimension
   as one run.
+- **A reader can tell a finished stream from one that has not started.** A
+  reader recognises the writer from its announcements or answers, so one that
+  opened the file after the writer left had neither and waited forever: it
+  could not tell "not started" from "finished". The writer now leaves
+  `<file>.vsdone` when the file state is torn down, written atomically after
+  its last step was announced, and removes a stale one when it starts. A
+  reader that finds it at open does not join (the group file may still name
+  the departed writer), and reports the end of the stream once nothing is
+  queued. `H5Fwait_step_ready()` fails at once rather than waiting out its
+  timeout, and looks for the marker every 250 ms while no writer is known.
+  A sidecar rather than an attribute in the file: a reader that opened the
+  file while the writer ran cannot see metadata added later without SWMR,
+  and Flock owns and rewrites `.vsgroup`. Every test that removed `.vsgroup`
+  between runs now removes `.vsdone` too, or a rerun's early reader would
+  take the last run's marker for this one. `t_writer_done`.
 - **A step reader's `H5Lexists()` resolves to the step.** It passed through
   to the live namespace, where an object the stream carries does not live,
   so it answered false for everything the step had. It now answers from the
@@ -1468,8 +1483,8 @@ the one list. ★ marks what is being worked on next.
   timeout (1 s) per step until SWIM declares it dead -- about 5 s in CI, after
   which its subscriptions are dropped. Accepted as the bound: skipping a
   subscriber after one timeout would lose a slow-but-alive reader's data. A
-  writer that leaves before any step or answer reaches a reader is not
-  recognised as the end of the stream.
+  writer that is killed before a reader has identified it is not seen to
+  leave by that reader (a writer that closes leaves `<file>.vsdone`).
 - Error-stack coverage is complete for the step API's reachable failures,
   not yet for every interior helper of the object callbacks (dataset,
   attribute and group creation and I/O), which still mostly rely on HDF5's

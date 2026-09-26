@@ -315,6 +315,15 @@ int vs_tr_writer_push_opaque(vs_tr_t *tr, uint64_t physical_step, const char *pa
                              uint64_t type_enc_len, const uint8_t *space_enc, uint64_t space_enc_len,
                              uint32_t extra);
 
+/* Reader side: the path of the writer's "closed" marker, "<file>.vsdone",
+ * which the writer creates when it closes the stream (H5VLstream.c). A
+ * reader that never learned which member was the writer -- one that joined
+ * after it left, or saw no answer from it before it left -- cannot tell its
+ * departure from the membership updates, so vs_tr_reader_end_of_stream()
+ * also accepts the marker. already_done: it existed before joining, and the
+ * reader did not join at all. */
+void vs_tr_reader_set_done_marker(vs_tr_t *tr, const char *path, int already_done);
+
 /* vs_tr_writer_push_opaque() to one subscriber only: backfill. */
 int vs_tr_writer_push_opaque_to(vs_tr_t *tr, uint64_t member_id, uint64_t physical_step, const char *path,
                                 const void *bytes, uint64_t len, uint64_t write_start, uint64_t write_count,

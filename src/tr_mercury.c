@@ -490,6 +490,9 @@ struct vs_tr_t {
     size_t          n_eos_writers;
     size_t          cap_eos_writers;
     int             eos_untracked; /* a writer could not be recorded */
+    char           *done_path;     /* the writer's "closed" marker, or NULL -- see
+                                    * vs_tr_reader_set_done_marker() */
+    int             writer_done;   /* the marker existed before joining */
 
     /* M7, reader side: the group member that answered a get_current_step
      * query, cached the first time vs_tr_reader_get_current_step() finds it
@@ -922,6 +925,16 @@ vs_all_writers_gone(vs_tr_t *tr)
         if (!tr->eos_writer_gone[i])
             return 0;
     return 1;
+}
+
+/* The writer left its "closed" marker (see vs_tr_reader_set_done_marker()).
+ * It is written after the writer's last step was announced, so every step
+ * the writer will ever send is already queued by the time it exists: seen
+ * together with an empty queue, the stream is over. */
+static int
+vs_writer_marked_done(const vs_tr_t *tr)
+{
+    return tr->writer_done || (tr->done_path && access(tr->done_path, F_OK) == 0);
 }
 
 /* Record that member_id is the writer: only the writer answers the
@@ -1898,6 +1911,7 @@ vs_tr_stop(vs_tr_t *tr)
     free(tr->pending);
     free(tr->eos_writers);
     free(tr->eos_writer_gone);
+    free(tr->done_path);
     free(tr->lag_table);
     {
         size_t i;
@@ -2490,8 +2504,23 @@ vs_tr_reader_wait_step_ready(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physica
     vs_tr_compute_deadline(timeout_ms, &deadline);
 
     pthread_mutex_lock(&tr->pending_lock);
-    while (tr->n_pending == 0 && !tr->stopped && !vs_all_writers_gone(tr)) {
-        if (ETIMEDOUT == pthread_cond_timedwait(&tr->pending_cond, &tr->pending_lock, &deadline))
+    while (tr->n_pending == 0 && !tr->stopped && !vs_all_writers_gone(tr) && !vs_writer_marked_done(tr)) {
+        struct timespec until = deadline;
+        int             sliced = 0;
+
+        /* No writer known: its departure can only show as its "closed"
+         * marker, which wakes nobody -- look for it now and then. */
+        if (tr->done_path && tr->n_eos_writers == 0) {
+            struct timespec slice;
+
+            vs_tr_compute_deadline(250, &slice);
+            if (slice.tv_sec < deadline.tv_sec ||
+                (slice.tv_sec == deadline.tv_sec && slice.tv_nsec < deadline.tv_nsec)) {
+                until  = slice;
+                sliced = 1;
+            }
+        }
+        if (ETIMEDOUT == pthread_cond_timedwait(&tr->pending_cond, &tr->pending_lock, &until) && !sliced)
             break;
     }
 
@@ -2512,15 +2541,26 @@ vs_tr_reader_wait_step_ready(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physica
 int
 vs_tr_reader_end_of_stream(vs_tr_t *tr)
 {
-    int eos;
+    int gone, pending;
 
     if (!tr)
         return 0;
     pthread_mutex_lock(&tr->pending_lock);
-    eos = vs_all_writers_gone(tr) && tr->n_pending == 0;
+    gone    = vs_all_writers_gone(tr) || vs_writer_marked_done(tr);
+    pending = tr->n_pending > 0;
     pthread_mutex_unlock(&tr->pending_lock);
-    return eos;
+    return gone && !pending;
 }
+
+void
+vs_tr_reader_set_done_marker(vs_tr_t *tr, const char *path, int already_done)
+{
+    if (!tr)
+        return;
+    free(tr->done_path);
+    tr->done_path   = path ? strdup(path) : NULL;
+    tr->writer_done = already_done;
+} /* end vs_tr_reader_set_done_marker() */
 
 uint64_t
 vs_tr_writer_bytes_pushed(vs_tr_t *tr)

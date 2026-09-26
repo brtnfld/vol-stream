@@ -134,6 +134,12 @@ clean_names(int nsubs)
 
     unlink(g_fname);
     unlink(g_group_file);
+    {
+        char done[96];
+
+        snprintf(done, sizeof(done), "%s.vsdone", g_fname);
+        unlink(done);
+    }
     for (i = 0; i < nsubs; i++) {
         unlink(g_ready_sentinel[i]);
         unlink(g_done_sentinel[i]);

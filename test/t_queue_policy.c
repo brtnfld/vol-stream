@@ -360,6 +360,8 @@ run_scenario(hid_t vol_id, H5VL_stream_queue_policy_t policy, const char *policy
 
         snprintf(group_sidecar, sizeof(group_sidecar), "%s.vsgroup", fname);
         unlink(group_sidecar);
+        snprintf(group_sidecar, sizeof(group_sidecar), "%s.vsdone", fname);
+        unlink(group_sidecar);
         unlink(fname);
     }
 

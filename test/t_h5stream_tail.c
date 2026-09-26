@@ -174,6 +174,7 @@ main(int argc, char **argv)
     setenv("VOL_STREAM_NA", "na+sm", 0);
     unlink(FNAME);
     unlink(FNAME ".vsgroup");
+    unlink(FNAME ".vsdone");
     unlink(OUTFILE);
     unlink(DONE_SENTINEL);
 

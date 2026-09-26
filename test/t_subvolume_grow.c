@@ -386,6 +386,7 @@ main(void)
 
     unlink(FNAME);
     unlink(FNAME ".vsgroup");
+    unlink(FNAME ".vsdone");
     unlink(READY_SENTINEL);
     unlink(READER_DONE_SENTINEL);
 
@@ -409,6 +410,7 @@ main(void)
 
     unlink(FNAME);
     unlink(FNAME ".vsgroup");
+    unlink(FNAME ".vsdone");
     unlink(READY_SENTINEL);
     unlink(READER_DONE_SENTINEL);
 
