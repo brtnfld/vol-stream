@@ -2149,6 +2149,17 @@ connector readers. Two exceptions: an attribute *rewritten* outside a step
 (opened and written again) is not carried, so write it inside a step; and a
 parallel writer's out-of-step attributes are not carried at all.
 
+**Can I link to a dataset, as NeXus does with `/entry/data/data`?**
+
+Yes, inside a step. A hard or soft link created while a step is open goes into
+the step: `/step/<n>/entry/data/data` links to that step's copy of the target,
+and a connector reader opening `/entry/data/data` resolves it at whatever step
+it is on. A later step that writes the target gets the link again, so each
+step's native view is complete. Link to a dataset in the step that creates it,
+or any later one. Outside a step a link still goes straight to the live
+namespace, where a dataset does not exist. Subscribe to the target's path, not
+the link's: the writer routes pushes by the path it wrote.
+
 **Why is my data at `/step/0/foo` instead of `/foo`?**
 
 That is the on-disk stream layout ([§1.5](#15-what-the-file-on-disk-actually-looks-like)).

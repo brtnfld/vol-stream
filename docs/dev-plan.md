@@ -1356,6 +1356,18 @@ matches the code. Each item is documented for users in
   a time: CI hung. It now starts at the first row the push's range reaches,
   stops past its end, and takes a block spanning every trailing dimension
   as one run.
+- **Links made in a step go into the stream.** A NeXus writer links
+  `/entry/data/data` to its detector dataset in the step that creates it.
+  That went to the live namespace, where the target does not exist (a
+  dataset lives only under `/step/<k>/`), so a hard link failed and a soft
+  one dangled. A link made in a step is now a `Kind.Link` manifest entry, the
+  first use of that reserved kind. Replay makes it in `/step/<n>/`, naming
+  the target's copy as of that step, and the path index learns the link's
+  path, so a connector reader opening it resolves there. A later step that
+  writes the target gets the link again, so every step's native view is
+  complete. The overlay skips link paths, so data is not covered twice.
+  Still passed through: a link made outside a step. Not routed: a
+  subscription to a link's path (subscribe to the target). `t_links`.
 - **Variable-length data: backfilled, and strings in Python.** Backfill
   skipped a variable-length object. It now reads what the step wrote back from
   its copy, serializes it as capture does, and pushes it to the one

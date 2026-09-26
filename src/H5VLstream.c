@@ -201,7 +201,15 @@ typedef struct H5VL_stream_path_steps_t {
     uint64_t *steps;
     size_t    n_steps;
     size_t    cap_steps;
+    int       is_link; /* a link's path (Kind.Link), not an object's */
 } H5VL_stream_path_steps_t;
+
+/* A link the stream carries: see H5VL__stream_capture_link(). */
+typedef struct H5VL_stream_link_t {
+    char *path;   /* the link's logical path */
+    char *target; /* the logical path it names */
+    char  type;   /* 'h' hard, 's' soft */
+} H5VL_stream_link_t;
 
 /* One dataset the /stream overlay covers (or has given up on): see
  * H5VL__stream_overlay_step(). */
@@ -369,6 +377,10 @@ struct H5VL_stream_file_state_t {
      * H5VL__stream_fold_group_attrs(). */
     char                       **group_attrs;
     size_t                       n_group_attrs, cap_group_attrs;
+    /* Links replayed so far (Kind.Link): path -> target. A later step that
+     * writes the target gets the link again -- H5VL__stream_fold_links(). */
+    struct H5VL_stream_link_t   *links;
+    size_t                       n_links, cap_links;
     uint64_t                    *retain_bytes;
     size_t                       n_retain;
     size_t                       cap_retain;
@@ -547,6 +559,7 @@ static char *H5VL__stream_attr_path(const char *parent_path, const char *name);
 static void  H5VL__stream_note_group_attr(const struct H5VL_stream_t *o, const H5VL_loc_params_t *loc_params,
                                           const char *name);
 static void  H5VL__stream_fold_group_attrs(H5VL_stream_file_state_t *fs);
+static void  H5VL__stream_fold_links(H5VL_stream_file_state_t *fs);
 static size_t H5VL__stream_vds_escape(char *out, size_t out_len, const char *path);
 static void  *H5VL__stream_replay_alias_dataset(struct H5VL_stream_t *file_obj, const char *parent_path,
                                                 const char *full_parent, uint64_t physical_step);
@@ -1649,6 +1662,11 @@ H5VL__stream_file_state_decref(H5VL_stream_file_state_t *fs)
         for (k = 0; k < fs->n_group_attrs; k++)
             free(fs->group_attrs[k]);
         free(fs->group_attrs);
+        for (k = 0; k < fs->n_links; k++) {
+            free(fs->links[k].path);
+            free(fs->links[k].target);
+        }
+        free(fs->links);
     }
 
 #ifdef VOL_STREAM_HAVE_MERCURY
@@ -4825,6 +4843,16 @@ H5VL__stream_path_index_add(H5VL_stream_file_state_t *fs, const char *path, uint
     return 0;
 } /* end H5VL__stream_path_index_add() */
 
+/* Mark path, already in the path index, as a link's. */
+static void
+H5VL__stream_path_index_mark_link(H5VL_stream_file_state_t *fs, const char *path)
+{
+    size_t idx;
+
+    if (0 == H5VL__stream_pathmap_find(&fs->path_index_map, path, &idx))
+        fs->path_index[idx].is_link = 1;
+} /* end H5VL__stream_path_index_mark_link() */
+
 /* Forget step n in the path index: a replay that failed had added it for
  * the objects it got as far as replaying, and the step it describes is being
  * removed. Step n is the newest any path can carry, so it is always last. */
@@ -5013,9 +5041,11 @@ H5VL__stream_reader_index_one_step(H5VL_stream_file_state_t *fs, size_t p)
             vs_Kind_enum_t   kind  = vs_Entry_kind(e);
             const char      *epath = vs_Entry_path(e);
 
-            if ((kind == vs_Kind_DsetCreate || kind == vs_Kind_Attr) && epath &&
+            if ((kind == vs_Kind_DsetCreate || kind == vs_Kind_Attr || kind == vs_Kind_Link) && epath &&
                 H5VL__stream_path_index_add(fs, epath, (uint64_t)p) < 0)
                 goto done;
+            if (kind == vs_Kind_Link && epath)
+                H5VL__stream_path_index_mark_link(fs, epath);
         }
     }
 
@@ -6175,6 +6205,246 @@ H5VL__stream_carry_forward_resized(H5VL_stream_t *file_obj, vs_Entry_vec_t entri
     return 0;
 } /* end H5VL__stream_carry_forward_resized() */
 
+/*-------------------------------------------------------------------------
+ * Links.
+ *
+ * A link created while a step is open -- a NeXus writer's
+ * /entry/data/data -> /entry/instrument/detector/data -- used to go straight
+ * to the live namespace, where the target does not exist (a dataset lives
+ * only under /step/<k>/): a hard link failed and a soft link dangled. It is
+ * now a Kind.Link entry of the step, its payload the link type ('h' or 's')
+ * followed by the target's logical path. Replay makes the link in
+ * /step/<n>/, naming the target as of that step, and the path index learns
+ * the link's path, so a connector reader opening it resolves there. A later
+ * step that writes the target gets the link again (H5VL__stream_fold_links()),
+ * so every step's native view is complete and no link names a stale copy.
+ * Best effort at replay: a link that cannot be made does not fail the step.
+ *-------------------------------------------------------------------------
+ */
+
+/* name, relative to base unless it starts with '/', as a logical path. */
+static char *
+H5VL__stream_abs_path(const char *base, const char *name)
+{
+    if (!name)
+        return NULL;
+    if (name[0] == '/')
+        return strdup(name);
+    return H5VL__stream_child_path(base ? base : "", name);
+} /* end H5VL__stream_abs_path() */
+
+/* Append a Kind.Link entry for path -> target to the open step. */
+static herr_t
+H5VL__stream_pending_link(H5VL_stream_file_state_t *fs, const char *path, const char *target, char type)
+{
+    H5VL_stream_pending_entry_t e;
+    size_t                      tlen = strlen(target);
+
+    memset(&e, 0, sizeof(e));
+    e.kind     = vs_Kind_Link;
+    e.dcpl_id  = H5I_INVALID_HID;
+    e.dapl_id  = H5I_INVALID_HID;
+    /* no type or dataspace of its own; these keep the entry encodable */
+    e.type_id  = H5Tcopy(H5T_NATIVE_UCHAR);
+    e.space_id = H5Screate(H5S_SCALAR);
+    e.path     = strdup(path);
+    if (e.type_id < 0 || e.space_id < 0 || !e.path || NULL == (e.payload = (uint8_t *)malloc(tlen + 1))) {
+        H5VL__stream_pending_entry_clear(&e);
+        return -1;
+    }
+    e.payload[0] = (uint8_t)type;
+    memcpy(e.payload + 1, target, tlen);
+    e.payload_len = tlen + 1;
+    if (H5VL__stream_pending_append(fs, &e) == (size_t)-1) {
+        H5VL__stream_pending_entry_clear(&e);
+        return -1;
+    }
+    return 0;
+} /* end H5VL__stream_pending_link() */
+
+/* Capture a hard or soft link created in the open step. Returns 1 if it
+ * was captured, 0 if it should pass through, -1 on failure. */
+static int
+H5VL__stream_capture_link(H5VL_stream_t *o, const H5VL_link_create_args_t *args,
+                          const H5VL_loc_params_t *loc_params)
+{
+    H5VL_stream_file_state_t *fs = o ? o->file_state : NULL;
+    char                     *path = NULL, *target = NULL;
+    char                      type;
+    int                       ret = -1;
+
+    if (!fs || fs->is_reader || fs->step_state != H5F_STEP_IN_STEP || !o->path ||
+        loc_params->type != H5VL_OBJECT_BY_NAME ||
+        (args->op_type != H5VL_LINK_CREATE_HARD && args->op_type != H5VL_LINK_CREATE_SOFT))
+        return 0;
+    if (NULL == (path = H5VL__stream_abs_path(o->path, loc_params->loc_data.loc_by_name.name)))
+        return -1;
+
+    if (args->op_type == H5VL_LINK_CREATE_HARD) {
+        const H5VL_stream_t     *cur = (const H5VL_stream_t *)args->args.hard.curr_obj;
+        const H5VL_loc_params_t *cl  = &args->args.hard.curr_loc_params;
+        const char              *base = cur ? cur->path : o->path;
+
+        type = 'h';
+        if (!base || (cl->type != H5VL_OBJECT_BY_NAME && cl->type != H5VL_OBJECT_BY_SELF)) {
+            free(path);
+            return 0; /* a target named some other way: pass it through */
+        }
+        target = cl->type == H5VL_OBJECT_BY_SELF ? strdup(base)
+                                                  : H5VL__stream_abs_path(base, cl->loc_data.loc_by_name.name);
+    }
+    else {
+        const char *t = args->args.soft.target;
+        char       *dir;
+        char       *slash;
+
+        type = 's';
+        if (!t || NULL == (dir = strdup(path))) {
+            free(path);
+            return -1;
+        }
+        if ((slash = strrchr(dir, '/')))
+            *slash = '\0';
+        target = H5VL__stream_abs_path(dir, t);
+        free(dir);
+    }
+    if (target && H5VL__stream_pending_link(fs, path, target, type) >= 0)
+        ret = 1;
+    free(path);
+    free(target);
+    return ret;
+} /* end H5VL__stream_capture_link() */
+
+/* Remember a replayed link, so later steps that write its target get it. */
+static void
+H5VL__stream_links_note(H5VL_stream_file_state_t *fs, const char *path, const char *target, char type)
+{
+    size_t k;
+
+    for (k = 0; k < fs->n_links; k++)
+        if (!strcmp(fs->links[k].path, path)) {
+            char *t = strdup(target);
+
+            if (t) {
+                free(fs->links[k].target);
+                fs->links[k].target = t;
+                fs->links[k].type   = type;
+            }
+            return;
+        }
+    if (fs->n_links == fs->cap_links) {
+        size_t              cap   = fs->cap_links ? fs->cap_links * 2 : 8;
+        H5VL_stream_link_t *grown = (H5VL_stream_link_t *)realloc(fs->links, cap * sizeof(*grown));
+
+        if (!grown)
+            return;
+        fs->links     = grown;
+        fs->cap_links = cap;
+    }
+    fs->links[fs->n_links].path   = strdup(path);
+    fs->links[fs->n_links].target = strdup(target);
+    fs->links[fs->n_links].type   = type;
+    if (fs->links[fs->n_links].path && fs->links[fs->n_links].target)
+        fs->n_links++;
+    else {
+        free(fs->links[fs->n_links].path);
+        free(fs->links[fs->n_links].target);
+    }
+} /* end H5VL__stream_links_note() */
+
+/* Called by H5Fend_step() before it commits: a known link whose target this
+ * step writes, and which the step does not link itself, is linked again. */
+static void
+H5VL__stream_fold_links(H5VL_stream_file_state_t *fs)
+{
+    size_t k, i;
+
+    for (k = 0; k < fs->n_links; k++) {
+        int writes_target = 0, links_itself = 0;
+
+        for (i = 0; i < fs->n_pending; i++) {
+            const H5VL_stream_pending_entry_t *pe = &fs->pending[i];
+
+            if (!pe->path)
+                continue;
+            if (pe->kind == vs_Kind_DsetCreate && !strcmp(pe->path, fs->links[k].target))
+                writes_target = 1;
+            else if (pe->kind == vs_Kind_Link && !strcmp(pe->path, fs->links[k].path))
+                links_itself = 1;
+        }
+        if (writes_target && !links_itself)
+            (void)H5VL__stream_pending_link(fs, fs->links[k].path, fs->links[k].target, fs->links[k].type);
+    }
+} /* end H5VL__stream_fold_links() */
+
+/* Replay one Kind.Link entry into /step/<n>/: the link, naming its target as
+ * of this step -- the target's copy under /step/<r>/, or, for something the
+ * stream does not carry (a group), its own path. Best effort. */
+static void
+H5VL__stream_replay_link(H5VL_stream_t *file_obj, const char *path, const uint8_t *payload, uint64_t plen,
+                         const char *step_root, uint64_t physical_step)
+{
+    H5VL_stream_file_state_t *fs = file_obj->file_state;
+    H5VL_link_create_args_t   largs;
+    H5VL_loc_params_t         lloc;
+    char                      full[1100], tphys[1200], *target;
+    char                      type;
+    uint64_t                  r;
+    herr_t                    status;
+
+    if (!path || !payload || plen < 2 || ((type = (char)payload[0]) != 'h' && type != 's') ||
+        NULL == (target = (char *)malloc((size_t)plen)))
+        return;
+    memcpy(target, payload + 1, (size_t)plen - 1);
+    target[plen - 1] = '\0';
+
+    snprintf(full, sizeof(full), "%s%s", step_root, path);
+    {
+        const char *slash = strrchr(full, '/');
+
+        if (slash && slash != full) {
+            char  dir[1100];
+            void *grp;
+
+            snprintf(dir, sizeof(dir), "%.*s", (int)(slash - full), full);
+            if ((grp = H5VL__stream_replay_ensure_group(file_obj->under_object, file_obj->under_vol_id, dir)))
+                H5VLgroup_close(grp, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+        }
+    }
+    if (fs && H5VL__stream_path_index_resolve(fs, target, physical_step, &r) >= 0)
+        snprintf(tphys, sizeof(tphys), "/step/%llu%s", (unsigned long long)r, target);
+    else
+        snprintf(tphys, sizeof(tphys), "%s", target);
+
+    memset(&largs, 0, sizeof(largs));
+    memset(&lloc, 0, sizeof(lloc));
+    lloc.obj_type                     = H5I_FILE;
+    lloc.type                         = H5VL_OBJECT_BY_NAME;
+    lloc.loc_data.loc_by_name.name    = full;
+    lloc.loc_data.loc_by_name.lapl_id = H5P_LINK_ACCESS_DEFAULT;
+    if (type == 'h') {
+        largs.op_type                                           = H5VL_LINK_CREATE_HARD;
+        largs.args.hard.curr_obj                                = file_obj->under_object;
+        largs.args.hard.curr_loc_params.obj_type                = H5I_FILE;
+        largs.args.hard.curr_loc_params.type                    = H5VL_OBJECT_BY_NAME;
+        largs.args.hard.curr_loc_params.loc_data.loc_by_name.name    = tphys;
+        largs.args.hard.curr_loc_params.loc_data.loc_by_name.lapl_id = H5P_LINK_ACCESS_DEFAULT;
+    }
+    else {
+        largs.op_type          = H5VL_LINK_CREATE_SOFT;
+        largs.args.soft.target = tphys;
+    }
+    H5E_BEGIN_TRY
+    {
+        status = H5VLlink_create(&largs, file_obj->under_object, &lloc, file_obj->under_vol_id,
+                                 H5P_LINK_CREATE_DEFAULT, H5P_LINK_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL);
+    }
+    H5E_END_TRY
+    if (status >= 0 && fs && !fs->is_reader)
+        H5VL__stream_links_note(fs, path, target, type);
+    free(target);
+} /* end H5VL__stream_replay_link() */
+
 /* An attribute replayed onto a dataset this step did not write: step n has
  * no copy of the dataset to hold it. Alias the dataset's last written copy,
  * /step/<r><parent_path>, at full_parent as a virtual dataset mapping all of
@@ -6415,7 +6685,8 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
          * object, so moving attributes last cannot strand one. */
         for (k = 0; k < 2 * n_entries; k++)
             if (i = k % n_entries,
-                (vs_Entry_kind(vs_Entry_vec_at(entries, i)) == vs_Kind_Attr) == (k >= n_entries)) {
+                (vs_Entry_kind(vs_Entry_vec_at(entries, i)) == vs_Kind_Attr ||
+                 vs_Entry_kind(vs_Entry_vec_at(entries, i)) == vs_Kind_Link) == (k >= n_entries)) {
             vs_Entry_table_t        e     = vs_Entry_vec_at(entries, i);
             vs_Kind_enum_t           kind  = vs_Entry_kind(e);
             const char              *path  = vs_Entry_path(e);
@@ -6486,11 +6757,13 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
              * "/target", but the object only ever exists at
              * "/step/<k>/target", and only from the step that created it
              * onward. See H5VL__stream_resolve_physical_path(). */
-            if ((kind == vs_Kind_DsetCreate || kind == vs_Kind_Attr) && path &&
+            if ((kind == vs_Kind_DsetCreate || kind == vs_Kind_Attr || kind == vs_Kind_Link) && path &&
                 H5VL__stream_path_index_add(fs, path, physical_step) < 0) {
                 ret_value = -1;
                 goto done;
             }
+            if (kind == vs_Kind_Link && path)
+                H5VL__stream_path_index_mark_link(fs, path);
 
             if ((dtype = H5Tdecode2(type_enc_ptr, type_enc_actual_len)) < 0 ||
                 (dspace = H5Sdecode(space_enc)) < 0) {
@@ -7064,6 +7337,8 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                 else
                     H5VLattr_close(attr, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
             }
+            else if (kind == vs_Kind_Link)
+                H5VL__stream_replay_link(file_obj, path, entry_payload, plen, step_root, physical_step);
 
             H5Tclose(dtype);
             H5Sclose(dspace);
@@ -11820,7 +12095,7 @@ H5VL__stream_overlay_step(H5VL_stream_file_state_t *fs, uint64_t n)
     for (i = 0; i < fs->n_path_index; i++) {
         H5VL_stream_path_steps_t *pe = &fs->path_index[i];
 
-        if (strchr(pe->path, '@') || pe->n_steps == 0 || pe->steps[pe->n_steps - 1] != n)
+        if (strchr(pe->path, '@') || pe->is_link || pe->n_steps == 0 || pe->steps[pe->n_steps - 1] != n)
             continue;
         for (k = 0; k < fs->n_overlay; k++)
             if (!strcmp(fs->overlay[k].path, pe->path))
@@ -13183,6 +13458,7 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
         /* Group attributes written since the last step: see
          * H5VL__stream_note_group_attr(). */
         H5VL__stream_fold_group_attrs(o->file_state);
+        H5VL__stream_fold_links(o->file_state);
 
 #ifdef VOL_STREAM_HAVE_MERCURY
         /* A backfill requested while this step was open, served before the
@@ -14272,6 +14548,15 @@ H5VL_stream_link_create(H5VL_link_create_args_t *args, void *obj, const H5VL_loc
 #ifdef ENABLE_STREAM_LOGGING
     printf("------- VOL-STREAM LINK Create\n");
 #endif
+
+    /* A link made in the open step goes into the step, not the live
+     * namespace: see H5VL__stream_capture_link(). */
+    {
+        int c = H5VL__stream_capture_link(o, args, loc_params);
+
+        if (c != 0)
+            return c > 0 ? 0 : -1;
+    }
 
     /* Try to retrieve the "under" VOL id */
     if (o)

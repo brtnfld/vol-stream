@@ -2,7 +2,10 @@
 // change, so there is no reserved slot to guess the size of.
 //
 // M2 populates Kind.DsetCreate, Kind.DsetWrite and Kind.Attr, with
-// Payload.Raw only. Kind.Group, Kind.Link, Payload.FilteredChunks and
+// Payload.Raw only. Kind.Link is populated since 2026-09: a link made in a
+// step, its payload the link type ('h' hard, 's' soft) then the target's
+// logical path, and a placeholder uchar type and scalar dataspace so the
+// entry encodes like any other. Kind.Group, Payload.FilteredChunks and
 // Entry.predicate are left unpopulated -- reserved for later milestones
 // (M3 group provenance, a future filtered-chunk passthrough, and M8
 // subscription predicates respectively) without a schema change.

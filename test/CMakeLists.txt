@@ -1,7 +1,7 @@
 foreach(t t_smoke t_step t_replay t_reader t_deferred t_vl_reject t_manifest_cache t_ref_path t_ref_roundtrip
            t_vl_roundtrip t_attr_convert t_payload_compress t_step_rewrite t_reregister t_memspace t_manypaths
            t_dset_resize t_retention t_config t_flush_refresh t_open_step_objects t_overlay
-           t_error_messages t_placeholder_extend t_group_attrs t_exit_midstep t_failed_replay)
+           t_error_messages t_placeholder_extend t_group_attrs t_exit_midstep t_failed_replay t_links)
   add_executable(${t} ${t}.c)
   target_link_libraries(${t} PRIVATE vol_stream)
 endforeach()
@@ -48,6 +48,8 @@ add_test(NAME group_attrs COMMAND t_group_attrs)
 add_test(NAME exit_midstep COMMAND t_exit_midstep)
 # A step whose replay fails is removed; the next commits in its place.
 add_test(NAME failed_replay COMMAND t_failed_replay)
+# Links made in a step (NeXus's /entry/data/data) go into the stream.
+add_test(NAME links COMMAND t_links)
 add_test(NAME reregister COMMAND t_reregister)
 # Guards the capture path against ignoring mem_space_id -- see t_memspace.c's
 # own comment. Asserts bracketed and unbracketed writes agree, which is the
