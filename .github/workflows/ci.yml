@@ -407,6 +407,31 @@ jobs:
           LD_LIBRARY_PATH=$HOME/mochi-install/lib:$HOME/mochi-install/lib64:$LD_LIBRARY_PATH \
             python3 "$ROOT/python/tests/test_stream.py" "$ROOT/build/python/py_stream_writer" column
 
+      # An AddressSanitizer build with the transport, which Phase 1's gate
+      # asks for and the sanitizer job below cannot give: that job has no
+      # Mochi. Only vol-stream is rebuilt with -fsanitize=address; its
+      # dependencies are the unsanitized builds above. Leak detection is off,
+      # since Mercury and Margo keep allocations for the life of the process;
+      # the Python tests are left out, since the interpreter would need
+      # libasan preloaded. Non-blocking until a run shows ASan and Argobots'
+      # ucontext stack switching get along without false positives.
+      - name: Build with the transport and AddressSanitizer, and test (non-blocking for now)
+        continue-on-error: true
+        run: |
+          export PKG_CONFIG_PATH=$HOME/mochi-install/lib/pkgconfig:$HOME/mochi-install/lib64/pkgconfig:$PKG_CONFIG_PATH
+          cmake -S . -B build-asan -G Ninja \
+            -DCMAKE_PREFIX_PATH="$PWD/hdf5-install;$HOME/mochi-install" \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g" \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g" \
+            -DVOL_STREAM_ENABLE_MERCURY=ON \
+            -DVOL_STREAM_ENABLE_BAKE=ON \
+            -DVOL_STREAM_H5DIFF=$PWD/hdf5-install/bin/h5diff
+          cmake --build build-asan --parallel
+          ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 \
+          LD_LIBRARY_PATH=$HOME/mochi-install/lib:$HOME/mochi-install/lib64:$LD_LIBRARY_PATH \
+            ctest --test-dir build-asan --output-on-failure -E '^python_'
+
       # Second pass over the same build with a real network transport instead
       # of shared memory -- dev-plan.md's CI matrix calls for both, and na+sm
       # never exercises libfabric at all, so a whole transport's worth of

@@ -1443,8 +1443,9 @@ the one list. ★ marks what is being worked on next.
 
 - **Bulk transfer (RFC Phase 1) is built** (see *After M10*). Still open
   from its gate: the throughput comparison against a Phase 0 baseline (needs
-  an RDMA fabric), the 1 GiB run (`T_BULK_MIB=1024 t_bulk_push`, by hand),
-  and an ASan build with the transport.
+  an RDMA fabric) and the 1 GiB run (`T_BULK_MIB=1024 t_bulk_push`, by hand).
+  An ASan build with the transport runs in CI's transport job, non-blocking
+  until it shows ASan and Argobots' stack switching agree.
 - HMEM provider and device-direct delivery (RFC Phases 2 and 3), after Phase 1.
 - The payload-size sweep on a real RDMA fabric (RFC Phase 0), which needs
   multi-node hardware. It sets Phase 1's priority and threshold, not whether
