@@ -93,9 +93,15 @@ class Step:
         return f"<volstream.Step phys={self.phys} paths={sorted(self.arrays)}>"
 
 
-def _dtype(desc):
-    """A NumPy dtype for the extension's JSON type description, or None."""
+def _dtype(desc, top=True):
+    """A NumPy dtype for the extension's JSON type description, or None.
+
+    A variable-length string is an object dtype holding str (or None for an
+    unset one), at the top level only: inside a compound or array its
+    pointers could not be turned into str."""
     k = desc.get("k")
+    if k == "vls":
+        return np.dtype(object) if top else None
     if k in ("i", "u", "f"):
         return np.dtype(f"{desc['o']}{k}{desc['s']}")
     if k == "S":
@@ -103,12 +109,12 @@ def _dtype(desc):
     if k == "V":
         return np.dtype(f"V{desc['s']}")
     if k == "array":
-        base = _dtype(desc["base"])
+        base = _dtype(desc["base"], top=False)
         return None if base is None else np.dtype((base, tuple(desc["dims"])))
     if k == "compound":
         names, formats, offsets = [], [], []
         for m in desc["members"]:
-            t = _dtype(m["type"])
+            t = _dtype(m["type"], top=False)
             if t is None:
                 return None
             names.append(m["name"])
@@ -142,6 +148,10 @@ class _Subscription:
 
     def values(self, push_bytes, elem_count):
         """The push as a 1-D array in the subscribed dtype."""
+        if self.dtype == object:  # variable-length strings, decoded by the connector
+            out = np.empty(elem_count, dtype=object)
+            out[:] = _volstream.vl_strings(push_bytes, elem_count)
+            return out
         size = len(push_bytes)
         if size == elem_count * self.dtype.itemsize:
             return np.frombuffer(push_bytes, dtype=self.dtype, count=elem_count)
@@ -394,10 +404,12 @@ class File:
                 raise KeyError(f"{path!r} is not in the stream's schema")
             if var.dtype is None:
                 raise NotImplementedError(
-                    f"{path!r} has a type this binding cannot deliver (variable-length, reference, "
-                    "or bitfield)")
+                    f"{path!r} has a type this binding cannot deliver (a variable-length sequence, "
+                    "reference, bitfield, or a variable-length string inside a compound)")
             if var.is_attr and deflate is not None:
                 raise ValueError(f"{path!r} is an attribute; attributes cannot be delivered deflated")
+            if var.dtype == object and deflate is not None:
+                raise ValueError(f"{path!r} is variable-length; it cannot be delivered deflated")
             if var.shape is None:
                 raise NotImplementedError(f"{path!r} does not have a simple dataspace")
             if sel is None:
@@ -450,6 +462,8 @@ class File:
         restore the dataset's own type.
         """
         sub = self._sub(path)
+        if sub.native_dtype == object:
+            raise ValueError(f"{path!r} is variable-length; the writer cannot convert it")
         if dtype is None:
             self._raw.subscribe_type(path, None, 0)
             sub.dtype = sub.native_dtype
@@ -468,6 +482,8 @@ class File:
         as a masked array.
         """
         sub = self._sub(path)
+        if sub.native_dtype == object:
+            raise ValueError(f"{path!r} is variable-length; the writer cannot filter it by value")
         if op not in _OPS:
             raise ValueError(f"op must be one of {sorted(_OPS)}, not {op!r}")
         if isinstance(value, np.generic):

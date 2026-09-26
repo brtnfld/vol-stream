@@ -335,11 +335,13 @@ sb_json_string(sbuf_t *b, const char *str)
  * into a NumPy dtype:
  *   {"k":"i"|"u"|"f", "s":size, "o":"<"|">"}   integer or float
  *   {"k":"S", "s":size}                        fixed-length string
+ *   {"k":"vls", "s":size}                      variable-length string
  *   {"k":"V", "s":size}                        opaque
  *   {"k":"array", "dims":[...], "base":T}      array
  *   {"k":"compound", "s":size, "members":[{"name":..., "offset":..., "type":T}, ...]}
- *   {"k":null, "s":size}                       anything else (variable
- *                                              length, reference, bitfield)
+ *   {"k":null, "s":size}                       anything else (a variable-
+ *                                              length sequence, reference,
+ *                                              bitfield)
  * An enum is described as its base integer type. */
 static void
 describe_type(hid_t t, sbuf_t *b, int depth)
@@ -362,8 +364,9 @@ describe_type(hid_t t, sbuf_t *b, int depth)
             return;
         case H5T_STRING:
             if (H5Tis_variable_str(t) > 0)
-                break;
-            sb_printf(b, "{\"k\":\"S\",\"s\":%zu}", size);
+                sb_printf(b, "{\"k\":\"vls\",\"s\":%zu}", size);
+            else
+                sb_printf(b, "{\"k\":\"S\",\"s\":%zu}", size);
             return;
         case H5T_OPAQUE:
             sb_printf(b, "{\"k\":\"V\",\"s\":%zu}", size);
@@ -1096,9 +1099,55 @@ done:
     return (PyObject *)file;
 }
 
+/* vl_strings(buffer, count) -> [str | None, ...]
+ *
+ * A pushed variable-length string object arrives decoded into one
+ * allocation: count char * pointers, then the bytes they point to (see
+ * H5Fget_subscribed_data()). The pointers mean something only while that
+ * allocation lives, so they are turned into str objects here, from the
+ * Buffer that owns it. NULL (an unset string) becomes None. */
+static PyObject *
+vs_vl_strings(PyObject *Py_UNUSED(module), PyObject *args)
+{
+    PyObject   *obj, *list;
+    Py_ssize_t  count, i;
+    Py_buffer   view;
+    char *const *ptrs;
+
+    if (!PyArg_ParseTuple(args, "On:vl_strings", &obj, &count))
+        return NULL;
+    if (count < 0 || PyObject_GetBuffer(obj, &view, PyBUF_SIMPLE) < 0)
+        return count < 0 ? PyErr_Format(PyExc_ValueError, "negative count") : NULL;
+    if ((size_t)view.len < (size_t)count * sizeof(char *)) {
+        PyBuffer_Release(&view);
+        return PyErr_Format(PyExc_ValueError, "a %zd-byte buffer cannot hold %zd string pointers", view.len,
+                            count);
+    }
+    ptrs = (char *const *)view.buf;
+    if (NULL == (list = PyList_New(count))) {
+        PyBuffer_Release(&view);
+        return NULL;
+    }
+    for (i = 0; i < count; i++) {
+        PyObject *v = ptrs[i] ? PyUnicode_DecodeUTF8(ptrs[i], (Py_ssize_t)strlen(ptrs[i]), "surrogateescape")
+                              : Py_NewRef(Py_None);
+
+        if (!v) {
+            Py_DECREF(list);
+            PyBuffer_Release(&view);
+            return NULL;
+        }
+        PyList_SET_ITEM(list, i, v);
+    }
+    PyBuffer_Release(&view);
+    return list;
+}
+
 static PyMethodDef module_methods[] = {
     {"open", (PyCFunction)(void (*)(void))vs_open, METH_VARARGS | METH_KEYWORDS,
      "open(path) -> RawFile\n\nOpen a vol-stream file for reading."},
+    {"vl_strings", vs_vl_strings, METH_VARARGS,
+     "vl_strings(buffer, count) -> list\n\nThe strings of a pushed variable-length string object."},
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef volstream_module = {

@@ -15,6 +15,10 @@
  * for /x at step 1, which did not write it. A second H5Fsubscribe_from() on
  * the same file must be refused: it must be the reader's first subscription.
  *
+ * /s, two variable-length strings written every step, is subscribed too: a
+ * backfilled step carries it serialized, as the live push does, and it
+ * arrives decoded at every step.
+ *
  * Two processes, na+sm, same shape as test/t_subscribe.c.
  */
 
@@ -62,14 +66,26 @@ value(int s, int i)
     return s * 100 + i;
 }
 
+/* /s at step s: {"a<s>", "b<s>"}. */
+static int
+strs_right(const void *buf, size_t size, uint64_t ec, int s)
+{
+    char *const *v = (char *const *)buf;
+    char         a[16], b[16];
+
+    snprintf(a, sizeof(a), "a%d", s);
+    snprintf(b, sizeof(b), "b%d", s);
+    return size == 2 * sizeof(char *) && ec == 2 && v[0] && v[1] && !strcmp(v[0], a) && !strcmp(v[1], b);
+}
+
 static int
 run_reader(void)
 {
-    hid_t      vol_id, fapl, fid, space;
-    hsize_t    dims = N;
+    hid_t      vol_id, fapl, fid, space, sspace;
+    hsize_t    dims = N, sdims = 2;
     uint64_t   phys = 0, wall = 0;
     int        s, rc = 0;
-    const char *paths[1] = {"/x"};
+    const char *paths[2] = {"/x", "/s"};
 
     if ((vol_id = H5VL_stream_register()) < 0 || (fapl = H5Pcreate(H5P_FILE_ACCESS)) < 0 ||
         H5Pset_vol(fapl, vol_id, NULL) < 0 || H5Pset_file_locking(fapl, false, true) < 0) {
@@ -85,20 +101,20 @@ run_reader(void)
     while (H5Fwait_step_ready(fid, 0, &phys, &wall) >= 0)
         ;
 
-    if ((space = H5Screate_simple(1, &dims, NULL)) < 0) {
+    if ((space = H5Screate_simple(1, &dims, NULL)) < 0 || (sspace = H5Screate_simple(1, &sdims, NULL)) < 0) {
         printf("reader: FAIL dataspace\n");
         return 1;
     }
     {
-        const hid_t spaces[1] = {space};
+        const hid_t spaces[2] = {space, sspace};
 
-        if (H5Fsubscribe_from(fid, 0, 1, paths, spaces, NULL) < 0) {
+        if (H5Fsubscribe_from(fid, 0, 2, paths, spaces, NULL) < 0) {
             printf("  FAIL  H5Fsubscribe_from()\n");
             return 1;
         }
         H5E_BEGIN_TRY
         {
-            if (H5Fsubscribe_from(fid, 0, 1, paths, spaces, NULL) >= 0) {
+            if (H5Fsubscribe_from(fid, 0, 2, paths, spaces, NULL) >= 0) {
                 printf("  FAIL  a second H5Fsubscribe_from() was accepted\n");
                 rc = 1;
             }
@@ -108,6 +124,7 @@ run_reader(void)
         H5E_END_TRY
     }
     H5Sclose(space);
+    H5Sclose(sspace);
     touch(SUBSCRIBED_SENTINEL);
 
     /* A later step's push can already be queued when a step is announced --
@@ -121,7 +138,7 @@ run_reader(void)
     int      have_held = 0;
 
     for (s = 0; s < 4; s++) {
-        int got_x = 0, ok = 1;
+        int got_x = 0, got_s = 0, s_ok = 1, ok = 1;
 
         if (H5Fwait_step_ready(fid, 30000, &phys, &wall) < 0) {
             printf("  FAIL  step %d was never announced\n", s);
@@ -154,6 +171,13 @@ run_reader(void)
                 have_held = 1;
                 break;
             }
+            if (path && strcmp(path, "/s") == 0) {
+                s_ok = s_ok && p == (uint64_t)s && es == 0 && strs_right(buf, size, ec, s);
+                got_s++;
+                free(path);
+                free(buf);
+                continue;
+            }
             if (p != (uint64_t)s || !path || strcmp(path, "/x") != 0 || es != 0 || ec != N ||
                 size != N * sizeof(int))
                 ok = 0;
@@ -174,6 +198,14 @@ run_reader(void)
                    s == 1   ? "announced, with nothing for /x (it did not write /x)"
                    : s == 3 ? "arrived live, after the backfill"
                             : "backfilled from the writer's file, with the right values");
+        if (got_s != 1 || !s_ok) {
+            printf("  FAIL  step %d: %d push(es) for the strings /s, %s\n", s, got_s,
+                   s_ok ? "values right" : "values wrong");
+            rc = 1;
+        }
+        else
+            printf("  ok    step %d's variable-length strings arrived %s\n", s,
+                   s == 3 ? "live" : "backfilled, decoded");
     }
     if (!rc && H5Fwait_step_ready(fid, 500, &phys, &wall) >= 0) {
         printf("  FAIL  an extra step %llu was announced\n", (unsigned long long)phys);
@@ -193,9 +225,13 @@ run_reader(void)
 }
 
 static int
-write_step(hid_t fid, hid_t space, hid_t *xds, hid_t *yds, int s)
+write_step(hid_t fid, hid_t space, hid_t *xds, hid_t *yds, hid_t *sds, int s)
 {
-    int vals[N], i;
+    int         vals[N], i;
+    char        a[16], b[16];
+    const char *strs[2] = {a, b};
+    hsize_t     two     = 2;
+    hid_t       st, ssp;
 
     for (i = 0; i < N; i++)
         vals[i] = value(s, i);
@@ -209,13 +245,24 @@ write_step(hid_t fid, hid_t space, hid_t *xds, hid_t *yds, int s)
         return -1;
     if (H5Dwrite(*yds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, vals) < 0)
         return -1;
+    snprintf(a, sizeof(a), "a%d", s);
+    snprintf(b, sizeof(b), "b%d", s);
+    if ((st = H5Tcopy(H5T_C_S1)) < 0 || H5Tset_size(st, H5T_VARIABLE) < 0)
+        return -1;
+    if (s == 0 && ((ssp = H5Screate_simple(1, &two, NULL)) < 0 ||
+                   (*sds = H5Dcreate2(fid, "/s", st, ssp, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT)) < 0 ||
+                   H5Sclose(ssp) < 0))
+        return -1;
+    if (H5Dwrite(*sds, st, H5S_ALL, H5S_ALL, H5P_DEFAULT, strs) < 0)
+        return -1;
+    H5Tclose(st);
     return H5Fend_step(fid) < 0 ? -1 : 0;
 }
 
 static int
 run_writer(void)
 {
-    hid_t   vol_id, fapl, fid, space, xds = H5I_INVALID_HID, yds = H5I_INVALID_HID;
+    hid_t   vol_id, fapl, fid, space, xds = H5I_INVALID_HID, yds = H5I_INVALID_HID, sds = H5I_INVALID_HID;
     hsize_t dims = N;
     int     s;
 
@@ -227,7 +274,7 @@ run_writer(void)
         return 1;
     }
     for (s = 0; s < 3; s++)
-        if (write_step(fid, space, &xds, &yds, s) < 0) {
+        if (write_step(fid, space, &xds, &yds, &sds, s) < 0) {
             printf("writer: FAIL step %d\n", s);
             return 1;
         }
@@ -237,7 +284,7 @@ run_writer(void)
         return 1;
     }
     /* H5Fbegin_step() serves the backfill before this step's own data. */
-    if (write_step(fid, space, &xds, &yds, 3) < 0) {
+    if (write_step(fid, space, &xds, &yds, &sds, 3) < 0) {
         printf("writer: FAIL step 3\n");
         return 1;
     }
@@ -245,6 +292,7 @@ run_writer(void)
 
     H5Dclose(xds);
     H5Dclose(yds);
+    H5Dclose(sds);
     H5Sclose(space);
     H5Fclose(fid);
     H5Pclose(fapl);

@@ -194,16 +194,23 @@ done:
 static int
 write_types_step(hid_t fid, hid_t *ds, hid_t *attr, int s)
 {
-    rec_t   recs[NREC];
-    double  scale = s * 0.25;
-    hsize_t n     = NREC;
-    int     i;
+    static hid_t names = H5I_INVALID_HID, units = H5I_INVALID_HID, vls = H5I_INVALID_HID;
+    rec_t        recs[NREC];
+    double       scale = s * 0.25;
+    hsize_t      n     = NREC;
+    char         nbuf[NREC][16], ubuf[16];
+    const char  *nptr[NREC], *uptr = ubuf;
+    int          i;
 
     for (i = 0; i < NREC; i++) {
         recs[i].a = s * 10 + i;
         recs[i].b = s + i * 0.5;
         snprintf(recs[i].c, sizeof(recs[i].c), "%d%d", s, i);
+        snprintf(nbuf[i], sizeof(nbuf[i]), "n%d%d", s, i);
+        nptr[i] = nbuf[i];
     }
+    nptr[NREC - 1] = NULL; /* an unset string: None on the other side */
+    snprintf(ubuf, sizeof(ubuf), "u%d", s);
     if (H5Fbegin_step(fid, 0, NULL, 0) < 0)
         goto fail;
     if (s == 0) {
@@ -215,7 +222,11 @@ write_types_step(hid_t fid, hid_t *ds, hid_t *attr, int s)
             H5Tinsert(rt, "b", HOFFSET(rec_t, b), H5T_NATIVE_DOUBLE) < 0 ||
             H5Tinsert(rt, "c", HOFFSET(rec_t, c), str) < 0 ||
             (*ds = H5Dcreate2(fid, "/rec", rt, space, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT)) < 0 ||
-            (*attr = H5Acreate2(*ds, "scale", H5T_NATIVE_DOUBLE, scalar, H5P_DEFAULT, H5P_DEFAULT)) < 0)
+            (*attr = H5Acreate2(*ds, "scale", H5T_NATIVE_DOUBLE, scalar, H5P_DEFAULT, H5P_DEFAULT)) < 0 ||
+            /* variable-length strings: a dataset, and an attribute on /rec */
+            (vls = H5Tcopy(H5T_C_S1)) < 0 || H5Tset_size(vls, H5T_VARIABLE) < 0 ||
+            (names = H5Dcreate2(fid, "/names", vls, space, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT)) < 0 ||
+            (units = H5Acreate2(*ds, "units", vls, scalar, H5P_DEFAULT, H5P_DEFAULT)) < 0)
             goto fail;
         H5Tclose(str);
         H5Sclose(space);
@@ -223,7 +234,9 @@ write_types_step(hid_t fid, hid_t *ds, hid_t *attr, int s)
         g_rec_type = rt;
     }
     if (H5Dwrite(*ds, g_rec_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, recs) < 0 ||
-        H5Awrite(*attr, H5T_NATIVE_DOUBLE, &scale) < 0 || H5Fend_step(fid) < 0)
+        H5Awrite(*attr, H5T_NATIVE_DOUBLE, &scale) < 0 ||
+        H5Dwrite(names, vls, H5S_ALL, H5S_ALL, H5P_DEFAULT, nptr) < 0 || H5Awrite(units, vls, &uptr) < 0 ||
+        H5Fend_step(fid) < 0)
         goto fail;
     return 0;
 fail:

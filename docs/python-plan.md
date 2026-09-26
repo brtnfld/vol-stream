@@ -442,9 +442,14 @@ supported, or depends on something outside this binding.
 
 ### Not supported
 
-- **Variable-length types, references and bitfields.** `subscribe()`
-  raises `NotImplementedError` for them: their pushed bytes are not plain
-  values a dtype can describe. Attributes, compound types (as structured
+- **Variable-length sequences, references and bitfields.** `subscribe()`
+  raises `NotImplementedError` for them, and for a variable-length string
+  inside a compound or array: their pushed bytes are not plain values a
+  dtype can describe. A top-level variable-length string is delivered, as an
+  object array of `str` (`None` for an unset one): the connector decodes the
+  writer's serialized push into `char *` pointers and bytes in one
+  allocation, and the extension's `vl_strings()` reads them while it lives.
+  It cannot be deflated, converted or filtered by value. Attributes, compound types (as structured
   arrays, with HDF5's member offsets), fixed-length strings, enums (as their
   base integer), array types and opaque types are supported. An attribute
   cannot be delivered deflated.

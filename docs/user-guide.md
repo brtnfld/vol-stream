@@ -380,8 +380,10 @@ Stated plainly so you can plan around them:
   predicate or datatype narrowing cannot be applied to it element by element,
   so it arrives whole and the delivery flags say which were not applied.
   Only a write whose selection is one contiguous run is pushed (attributes
-  always are); nested variable-length types are not. The Python binding still
-  refuses variable-length types. `test/t_vl_push.c`.
+  always are); nested variable-length types are not. Backfill sends them the
+  same way. In Python a variable-length string arrives as an object array of
+  `str` (`None` for an unset one); a variable-length sequence is still
+  refused. `test/t_vl_push.c`, `test/t_backfill.c`.
 - **`h5py` cannot open a step.** The step API is optional operations; `h5py` has
   no binding for `H5VLfile_optional_op()`. Python reaches the stream through
   the separate `volstream` package instead, as a subscriber only; see

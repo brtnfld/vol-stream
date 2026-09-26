@@ -1356,6 +1356,17 @@ matches the code. Each item is documented for users in
   a time: CI hung. It now starts at the first row the push's range reaches,
   stops past its end, and takes a block spanning every trailing dimension
   as one run.
+- **Variable-length data: backfilled, and strings in Python.** Backfill
+  skipped a variable-length object. It now reads what the step wrote back from
+  its copy, serializes it as capture does, and pushes it to the one
+  subscriber flagged serialized, as the live push does
+  (`vs_tr_writer_push_opaque_to()`; not on the diaspora backend). The
+  Python binding refused every variable-length type. A top-level
+  variable-length string now arrives as an object array of `str`, `None` for
+  an unset one: the extension's `vl_strings()` reads the connector's decoded
+  pointers while their allocation lives. Sequences, and strings inside a
+  compound, are still refused. `t_backfill` (a string dataset through
+  backfill), `python_stream_types` (a string dataset and attribute).
 - **A step whose replay fails is removed.** `H5Fend_step()` does not advance
   the step number when replay fails, so the next step replays into the same
   `/step/<n>/`. The failed replay's objects stayed there, where the next
@@ -1430,8 +1441,8 @@ the one list. ★ marks what is being worked on next.
 **Protocol and semantics**
 
 - Variable-length data is pushed whole (no selection, predicate or type
-  narrowing), only for writes whose selection is one contiguous run, and the
-  Python binding still refuses it.
+  narrowing), only for writes whose selection is one contiguous run. The
+  Python binding delivers top-level strings, not sequences.
 - Backfill (`H5Fsubscribe_from()`) must be a reader's first subscription,
   waits for the writer's next step boundary, and is not on the diaspora
   backend.
@@ -1470,7 +1481,8 @@ the one list. ★ marks what is being worked on next.
 
 **Python binding** (details in [`python-plan.md`](python-plan.md))
 
-- Variable-length, reference and bitfield types are refused.
+- Variable-length sequences, reference and bitfield types are refused, and a
+  variable-length string inside a compound. Top-level strings are delivered.
 - Per-subscriber precision is deflate only; other filters and chunk shape are
   not exposed.
 - A whole-dataset subscription follows growth along the first dimension only.

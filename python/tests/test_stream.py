@@ -43,7 +43,10 @@ ctest entry per mode) so every scenario gets a fresh transport.
              with first_row naming the row.
   types      A compound dataset {int, double, char[4]} and a scalar double
              attribute on it, both rewritten every step: structured arrays
-             and attributes must arrive with every field right.
+             and attributes must arrive with every field right. Also a
+             variable-length string dataset (one element unset) and a
+             variable-length string attribute: object arrays of str, None
+             for the unset one.
   deflate    subscribe(deflate=6): the writer must actually re-filter this
              subscriber's data (its VOL_STREAM_DEBUG_REFILTER trace says so),
              and the values must arrive decoded and exact.
@@ -473,8 +476,11 @@ class TypesTest(StreamTest):
 
     def test_types(self):
         self.wait_for("committed")
-        with volstream.follow(self.path, ["/rec", "/rec@scale"]) as f:
+        with volstream.follow(self.path, ["/rec", "/rec@scale", "/names", "/rec@units"]) as f:
             schema = f.schema()
+            self.assertEqual(schema["/names"].dtype, np.dtype(object))
+            with self.assertRaises(ValueError):
+                f.subscribe_type("/names", np.int32)  # a string cannot be converted
             rec = schema["/rec"].dtype
             self.assertEqual(rec.names, ("a", "b", "c"))
             self.assertEqual((rec["a"], rec["b"], rec["c"]), (np.dtype("<i4"), np.dtype("<f8"), np.dtype("S4")))
@@ -491,6 +497,11 @@ class TypesTest(StreamTest):
             self.assertEqual(list(r["c"]), [f"{s}{i}".encode() for i in range(self.NREC)], f"step {s}")
             self.assertIn("/rec@scale", step, f"step {s}: the rewritten attribute was never sent")
             self.assertEqual(float(step["/rec@scale"]), s * 0.25, f"step {s}")
+            names = step["/names"]
+            self.assertEqual(names.dtype, np.dtype(object), f"step {s}")
+            self.assertEqual(list(names), [f"n{s}{i}" for i in range(self.NREC - 1)] + [None], f"step {s}")
+            self.assertIn("/rec@units", step, f"step {s}: the string attribute was never sent")
+            self.assertEqual(step["/rec@units"][()], f"u{s}", f"step {s}")
         self.touch("done")
         self.assertEqual(self.writer.wait(timeout=60), 0)
 

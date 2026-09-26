@@ -315,6 +315,12 @@ int vs_tr_writer_push_opaque(vs_tr_t *tr, uint64_t physical_step, const char *pa
                              uint64_t type_enc_len, const uint8_t *space_enc, uint64_t space_enc_len,
                              uint32_t extra);
 
+/* vs_tr_writer_push_opaque() to one subscriber only: backfill. */
+int vs_tr_writer_push_opaque_to(vs_tr_t *tr, uint64_t member_id, uint64_t physical_step, const char *path,
+                                const void *bytes, uint64_t len, uint64_t write_start, uint64_t write_count,
+                                const uint8_t *type_enc, uint64_t type_enc_len, const uint8_t *space_enc,
+                                uint64_t space_enc_len, uint32_t extra);
+
 /* M9: implemented by H5VLstream.c, registered via vs_tr_set_predicate_cb().
  * Same division of labour as vs_tr_refilter_fn -- this module carries
  * pred_enc and type_enc without ever decoding either.

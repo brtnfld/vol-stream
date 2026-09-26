@@ -3973,6 +3973,24 @@ vs_tr_writer_push_opaque(vs_tr_t *tr, uint64_t physical_step, const char *path, 
 } /* end vs_tr_writer_push_opaque() */
 
 int
+vs_tr_writer_push_opaque_to(vs_tr_t *tr, uint64_t member_id, uint64_t physical_step, const char *path,
+                            const void *bytes, uint64_t len, uint64_t write_start, uint64_t write_count,
+                            const uint8_t *type_enc, uint64_t type_enc_len, const uint8_t *space_enc,
+                            uint64_t space_enc_len, uint32_t extra)
+{
+    int ret;
+
+    if (!tr)
+        return -1;
+    tr->push_only_set    = 1;
+    tr->push_only_member = (vs_member_id_t)member_id;
+    ret = vs_tr_writer_push_opaque(tr, physical_step, path, bytes, len, write_start, write_count, type_enc,
+                                   type_enc_len, space_enc, space_enc_len, extra);
+    tr->push_only_set = 0;
+    return ret;
+} /* end vs_tr_writer_push_opaque_to() */
+
+int
 vs_tr_reader_wait_data(vs_tr_t *tr, uint64_t timeout_ms, uint64_t *physical_step, char **out_path,
                          void **out_buf, uint64_t *out_size, uint64_t *out_elem_start,
                          uint64_t *out_elem_count, uint8_t **out_dcpl_enc, uint64_t *out_dcpl_enc_len,

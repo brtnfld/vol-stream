@@ -12760,6 +12760,81 @@ H5VL__stream_step_manifest(H5VL_stream_file_state_t *fs, uint64_t k, vs_Step_tab
     return buf;
 } /* end H5VL__stream_step_manifest() */
 
+/* Backfill a variable-length object: read what step k wrote back from its
+ * copy, serialize it as capture does, and push that to the one subscriber,
+ * flagged as serialized -- the live push's form. An attribute goes whole; a
+ * dataset goes one DsetWrite selection at a time, and only a selection that
+ * is one flat run, as live (the serialized elements must be in the order of
+ * the range the push names). */
+static void
+H5VL__stream_backfill_vl(H5VL_stream_file_state_t *fs, uint64_t member, const char *path, uint64_t k, void *obj,
+                         int is_attr, hid_t mtype, hid_t space, vs_Step_table_t step, int vl_kind)
+{
+    uint8_t *tenc = NULL, *senc = NULL;
+    size_t   tlen = 0, slen = 0, esize = H5Tget_size(mtype);
+    hssize_t n;
+
+    H5VL__stream_encode_type(mtype, &tenc, &tlen);
+    H5VL__stream_encode_space(space, &senc, &slen);
+
+    if (is_attr) {
+        void    *buf = NULL;
+        uint8_t *ser = NULL;
+        size_t   slen2 = 0;
+
+        if ((n = H5Sget_simple_extent_npoints(space)) > 0 && NULL != (buf = calloc((size_t)n, esize)) &&
+            H5VLattr_read(obj, fs->file_under_vol_id, mtype, buf, H5P_DATASET_XFER_DEFAULT, NULL) >= 0) {
+            if (H5VL__stream_vl_serialize(buf, (size_t)n, mtype, vl_kind, &ser, &slen2) >= 0 && ser) {
+                vs_tr_writer_push_opaque_to(fs->transport, member, k, path, ser, (uint64_t)slen2, 0, (uint64_t)n,
+                                            tenc, (uint64_t)tlen, senc, (uint64_t)slen, VS_TR_DELIVERY_VL_SERIALIZED);
+                vs_tr_writer_release_sources(fs->transport); /* ser is freed next */
+            }
+            H5Treclaim(mtype, space, H5P_DEFAULT, buf);
+        }
+        free(ser);
+        free(buf);
+    }
+    else if (step) {
+        vs_Entry_vec_t entries = vs_Step_entries(step);
+        size_t         ne = entries ? vs_Entry_vec_len(entries) : 0, i;
+
+        for (i = 0; i < ne; i++) {
+            vs_Entry_table_t        e = vs_Entry_vec_at(entries, i);
+            flatbuffers_uint8_vec_t sp;
+            H5VL_stream_flat_run_t  run;
+            hid_t                   sel, mem = H5I_INVALID_HID;
+            hsize_t                 nm;
+            void                   *buf = NULL;
+            uint8_t                *ser = NULL;
+            size_t                  slen2 = 0;
+
+            if (vs_Entry_kind(e) != vs_Kind_DsetWrite || !vs_Entry_path(e) || strcmp(vs_Entry_path(e), path) ||
+                NULL == (sp = vs_Entry_space_enc(e)) || (sel = H5Sdecode(sp)) < 0)
+                continue;
+            if ((n = H5Sget_select_npoints(sel)) > 0 && H5VL__stream_space_flat_runs(sel, &run, 1) == 1 &&
+                (nm = (hsize_t)n, (mem = H5Screate_simple(1, &nm, NULL)) >= 0) &&
+                NULL != (buf = calloc((size_t)n, esize)) &&
+                H5VLdataset_read(1, &obj, fs->file_under_vol_id, &mtype, &mem, &sel, H5P_DATASET_XFER_DEFAULT,
+                                 &buf, NULL) >= 0) {
+                if (H5VL__stream_vl_serialize(buf, (size_t)n, mtype, vl_kind, &ser, &slen2) >= 0 && ser) {
+                    vs_tr_writer_push_opaque_to(fs->transport, member, k, path, ser, (uint64_t)slen2, run.start,
+                                                run.count, tenc, (uint64_t)tlen, senc, (uint64_t)slen,
+                                                VS_TR_DELIVERY_VL_SERIALIZED);
+                    vs_tr_writer_release_sources(fs->transport); /* ser is freed next */
+                }
+                H5Treclaim(mtype, mem, H5P_DEFAULT, buf);
+            }
+            free(ser);
+            free(buf);
+            if (mem >= 0)
+                H5Sclose(mem);
+            H5Sclose(sel);
+        }
+    }
+    free(tenc);
+    free(senc);
+} /* end H5VL__stream_backfill_vl() */
+
 /*-------------------------------------------------------------------------
  * Function:    H5VL__stream_backfill_one
  *
@@ -12772,8 +12847,8 @@ H5VL__stream_step_manifest(H5VL_stream_file_state_t *fs, uint64_t k, vs_Step_tab
  *              and sent as data they would overwrite earlier frames. Without
  *              a readable manifest, or for a selection too fragmented to
  *              send as runs, it goes whole. An attribute ("/T@scale") goes
- *              whole. A variable-length object is skipped, as the live push
- *              skips it.
+ *              whole. A variable-length object goes serialized, as the live
+ *              push sends it (H5VL__stream_backfill_vl()).
  *              Best-effort: a failure leaves that step without this path,
  *              which the subscriber sees exactly as a lost push.
  *-------------------------------------------------------------------------
@@ -12838,9 +12913,18 @@ H5VL__stream_backfill_one(H5VL_stream_file_state_t *fs, uint64_t member, const c
         space = g.args.get_space.space_id;
     }
 
-    if ((mtype = H5Tget_native_type(ftype, H5T_DIR_DEFAULT)) < 0 ||
-        H5VL__stream_type_vl_kind(mtype) != H5VL_STREAM_VL_NONE || (esize = H5Tget_size(mtype)) == 0 ||
-        (n = H5Sget_simple_extent_npoints(space)) <= 0 || NULL == (buf = malloc((size_t)n * esize)))
+    if ((mtype = H5Tget_native_type(ftype, H5T_DIR_DEFAULT)) < 0)
+        goto done;
+    {
+        int vl_kind = H5VL__stream_type_vl_kind(mtype);
+
+        if (vl_kind != H5VL_STREAM_VL_NONE) {
+            H5VL__stream_backfill_vl(fs, member, path, k, obj, at != NULL, mtype, space, step, vl_kind);
+            goto done;
+        }
+    }
+    if ((esize = H5Tget_size(mtype)) == 0 || (n = H5Sget_simple_extent_npoints(space)) <= 0 ||
+        NULL == (buf = malloc((size_t)n * esize)))
         goto done;
 
     if (!at && step) {
