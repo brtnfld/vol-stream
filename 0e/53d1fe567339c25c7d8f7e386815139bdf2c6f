@@ -1,0 +1,100 @@
+src/tr_diaspora.cpp
+  s_3816fb7b7c4a27::t_9f2a51c62d3838 1378-1382
+examples/narrowing_demo/narrowing_writer.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 63
+test/t_config_na.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 31,33,68,70
+src/tr_mercury.h
+  s_3816fb7b7c4a27::t_9f2a51c62d3838 318-326
+test/CMakeLists.txt
+  s_3816fb7b7c4a27::t_fc7f85ab854efb 150-159
+src/H5VLstream.c
+  s_3816fb7b7c4a27::t_9f2a51c62d3838 380-382,1679-1682,1686,1876-1922,1973-1978,2024,2027,2029-2035,2037
+test/t_precision.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 338
+examples/reaction_diffusion/rd_writer.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 128
+test/t_h5stream_tail.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 177
+test/t_precision_dual.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 456
+test/t_schema.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 313,461
+test/t_subvolume_grow.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 389,413
+test/t_bulk_push.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 295
+test/b_detector_narrowing.c
+  s_3816fb7b7c4a27::t_77c48c492a8122 272-277
+test/b_push_fanout.c
+  s_3816fb7b7c4a27::t_77c48c492a8122 137-142
+test/t_chunk_shape_split.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 378
+docs/user-guide.md
+  s_3816fb7b7c4a27::t_2176b8dd4ef47e 865,868-874
+  s_3816fb7b7c4a27::t_d01b3da22e68da 875
+src/tr_mercury.c
+  s_3816fb7b7c4a27::t_418670bb0cb84e 930-939,2507-2523,2549
+  s_3816fb7b7c4a27::t_9f2a51c62d3838 493-495,1914,2544,2550,2552,2555-2563
+  s_3816fb7b7c4a27::t_a80a03cf9f3d44 2564
+test/t_rendezvous.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 345
+test/t_bulk_regions.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 203
+test/t_step_grouping.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 559
+test/t_rendezvous_barrier.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 254,285
+test/t_subscribe.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 463
+examples/detector_pipeline/detector_writer.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 188
+test/t_backfill.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 310
+test/t_subvolume_strided.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 361
+test/t_subvolume_nd.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 261
+test/t_vl_push.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 239
+test/t_queue_policy.c
+  s_3816fb7b7c4a27::t_77c48c492a8122 363-364
+examples/heat_diffusion/heat_writer.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 107
+test/t_predicate.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 591
+test/t_eos.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 518,521,525
+test/t_strided_write.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 290
+src/H5VLstream.h
+  s_3816fb7b7c4a27::t_2176b8dd4ef47e 736-740
+docs/dev-plan.md
+  s_3816fb7b7c4a27::t_3b2920d19dbcfd 1359-1373,1486-1487
+test/b_stream_grow.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 392
+test/t_transport.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 260
+test/t_writer_done.c
+  s_3816fb7b7c4a27::t_3814222b70ba17 1-202
+test/b_stream_grow_tail.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 374
+test/t_chunk_zerocopy.c
+  s_3816fb7b7c4a27::t_97604cde404ac3 350
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0e53d1fe567339c25c7d8f7e386815139bdf2c6f",
+  "prompts": {},
+  "sessions": {
+    "s_3816fb7b7c4a27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b5b5c72-aca3-496b-8412-0fb9ae85948c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
