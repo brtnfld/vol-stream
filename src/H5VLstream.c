@@ -4825,6 +4825,22 @@ H5VL__stream_path_index_add(H5VL_stream_file_state_t *fs, const char *path, uint
     return 0;
 } /* end H5VL__stream_path_index_add() */
 
+/* Forget step n in the path index: a replay that failed had added it for
+ * the objects it got as far as replaying, and the step it describes is being
+ * removed. Step n is the newest any path can carry, so it is always last. */
+static void
+H5VL__stream_path_index_drop_step(H5VL_stream_file_state_t *fs, uint64_t n)
+{
+    size_t i;
+
+    for (i = 0; i < fs->n_path_index; i++) {
+        H5VL_stream_path_steps_t *e = &fs->path_index[i];
+
+        while (e->n_steps > 0 && e->steps[e->n_steps - 1] == n)
+            e->n_steps--;
+    }
+} /* end H5VL__stream_path_index_drop_step() */
+
 /*-------------------------------------------------------------------------
  * Function:    H5VL__stream_path_index_resolve
  *
@@ -13165,6 +13181,19 @@ H5VL__stream_file_optional_impl(void *file, H5VL_optional_args_t *args, hid_t dx
         }
 
         if (replay_ret < 0) {
+            /* The step is discarded, and the next one reuses its number and
+             * its /step/<n>/: remove what the failed replay made there, and
+             * its path-index entries, so neither the next replay nor a reader
+             * finds them. A parallel writer is left as it was -- the unlink
+             * would have to be collective, and a rank failure inside a
+             * commit is not handled anyway. */
+#ifdef H5_HAVE_PARALLEL
+            if (!o->file_state->has_comm)
+#endif
+            {
+                H5VL__stream_unlink_step(o, o->file_state->physical_step);
+                H5VL__stream_path_index_drop_step(o->file_state, o->file_state->physical_step);
+            }
             o->file_state->step_state = H5F_STEP_NOT_IN_STEP;
             H5VL_STREAM_GOTO_ERR(H5VL_stream_err_manifest_g,
                                  "the step could not be committed: replaying it into the file failed (see the "

@@ -1356,6 +1356,15 @@ matches the code. Each item is documented for users in
   a time: CI hung. It now starts at the first row the push's range reaches,
   stops past its end, and takes a block spanning every trailing dimension
   as one run.
+- **A step whose replay fails is removed.** `H5Fend_step()` does not advance
+  the step number when replay fails, so the next step replays into the same
+  `/step/<n>/`. The failed replay's objects stayed there, where the next
+  replay could collide with them and a native reader found them, and the
+  writer's path index still named step n for them. The failed step's group is
+  now unlinked and its path-index entries dropped, so the retried step
+  starts clean (serial writers; a parallel writer's unlink would have to be
+  collective). `t_failed_replay`, which provokes the failure with a real name
+  collision.
 - **An attribute-only step shows a dataset natively, not a group.** An
   attribute written in a step that does not write its dataset had no copy of
   the dataset in `/step/<n>/` to attach to, so replay made a group of that
@@ -1437,7 +1446,11 @@ the one list. ★ marks what is being worked on next.
   attribute and group creation and I/O), which still mostly rely on HDF5's
   own frames.
 - No fault tolerance for a rank failure inside a collective commit.
-- Objects from a failed replay are never reclaimed.
+- A step reader's link queries are not resolved to the step. `H5Lexists()`
+  on a logical path returns false even for an object the step has, because
+  the connector translates opens (`H5Dopen2()`, `H5Aopen()`) to
+  `/step/<k>/` but passes link queries through to the live namespace.
+  Found while writing `t_failed_replay`, which opens instead.
 - Writer and reader cannot cross an HDF5 major.minor boundary.
 
 **Configuration and release**
