@@ -399,8 +399,41 @@ main(void)
             printf("  FAIL  /step/1/temp is not a dataset\n");
             nerrors++;
         }
-        if (nfid >= 0)
+        /* Natively, step 2 wrote only the attribute: /step/2/temp is a
+         * dataset -- a virtual one over step 1's copy -- holding step 1's
+         * data and step 2's attribute, not a group of that name. */
+        if (nfid >= 0) {
+            hid_t n2ds, n2at;
+            int   n2[NELEM], n2a = -1, same = 1;
+
+            if (H5Oget_info_by_name3(nfid, "/step/2/temp", &oi, H5O_INFO_BASIC, H5P_DEFAULT) < 0 ||
+                oi.type != H5O_TYPE_DATASET) {
+                printf("  FAIL  natively, /step/2/temp is not a dataset\n");
+                nerrors++;
+            }
+            else if ((n2ds = H5Dopen2(nfid, "/step/2/temp", H5P_DEFAULT)) < 0 ||
+                     H5Dread(n2ds, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, n2) < 0 ||
+                     (n2at = H5Aopen(n2ds, "scale", H5P_DEFAULT)) < 0 ||
+                     H5Aread(n2at, H5T_NATIVE_INT, &n2a) < 0) {
+                printf("  FAIL  natively, /step/2/temp or its attribute cannot be read\n");
+                nerrors++;
+            }
+            else {
+                for (i = 0; i < NELEM; i++)
+                    same = same && n2[i] == val_for(1, i);
+                if (same && n2a == attr_for(2))
+                    printf("  ok    natively, an attribute-only step holds a dataset with the last data and "
+                           "the new attribute\n");
+                else {
+                    printf("  FAIL  natively, /step/2/temp[0]=%d scale=%d, expected %d and %d\n", n2[0], n2a,
+                           val_for(1, 0), attr_for(2));
+                    nerrors++;
+                }
+                H5Aclose(n2at);
+                H5Dclose(n2ds);
+            }
             H5Fclose(nfid);
+        }
 
         /* Through the connector at step 2: step 1's data, step 2's attribute. */
         if ((rfid = H5Fopen("t_step_rewrite_order.h5", H5F_ACC_RDONLY, fapl)) < 0 ||

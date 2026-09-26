@@ -547,6 +547,9 @@ static char *H5VL__stream_attr_path(const char *parent_path, const char *name);
 static void  H5VL__stream_note_group_attr(const struct H5VL_stream_t *o, const H5VL_loc_params_t *loc_params,
                                           const char *name);
 static void  H5VL__stream_fold_group_attrs(H5VL_stream_file_state_t *fs);
+static size_t H5VL__stream_vds_escape(char *out, size_t out_len, const char *path);
+static void  *H5VL__stream_replay_alias_dataset(struct H5VL_stream_t *file_obj, const char *parent_path,
+                                                const char *full_parent, uint64_t physical_step);
 static H5VL_stream_t *H5VL__stream_new_child_obj(void *under_obj, hid_t under_vol_id,
                              H5VL_stream_file_state_t *file_state, const char *parent_path,
                              const char *name);
@@ -6156,6 +6159,88 @@ H5VL__stream_carry_forward_resized(H5VL_stream_t *file_obj, vs_Entry_vec_t entri
     return 0;
 } /* end H5VL__stream_carry_forward_resized() */
 
+/* An attribute replayed onto a dataset this step did not write: step n has
+ * no copy of the dataset to hold it. Alias the dataset's last written copy,
+ * /step/<r><parent_path>, at full_parent as a virtual dataset mapping all of
+ * it, so a native reader of step n finds a dataset there -- with that
+ * copy's data, and this step's attribute -- rather than a group of its
+ * name. Returns the alias, or NULL if parent_path was not a dataset written
+ * in an earlier step (a group: the caller makes one). */
+static void *
+H5VL__stream_replay_alias_dataset(H5VL_stream_t *file_obj, const char *parent_path, const char *full_parent,
+                                  uint64_t physical_step)
+{
+    H5VL_stream_file_state_t *fs = file_obj->file_state;
+    H5VL_loc_params_t         loc;
+    H5VL_dataset_get_args_t   g;
+    char                      name[1100], src[1200];
+    hsize_t                   dims[H5S_MAX_RANK];
+    hid_t                     type = H5I_INVALID_HID, space = H5I_INVALID_HID, vspace = H5I_INVALID_HID;
+    hid_t                     dcpl = H5I_INVALID_HID;
+    void                     *prev, *alias = NULL;
+    uint64_t                  r;
+    int                       rank;
+
+    if (!fs || physical_step == 0 || H5VL__stream_path_index_resolve(fs, parent_path, physical_step - 1, &r) < 0)
+        return NULL;
+
+    memset(&loc, 0, sizeof(loc));
+    loc.obj_type = H5I_FILE;
+    loc.type     = H5VL_OBJECT_BY_SELF;
+    snprintf(name, sizeof(name), "/step/%llu%s", (unsigned long long)r, parent_path);
+    if (NULL == (prev = H5VLdataset_open(file_obj->under_object, &loc, file_obj->under_vol_id, name,
+                                         H5P_DATASET_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL)))
+        return NULL;
+    g.op_type = H5VL_DATASET_GET_TYPE;
+    if (H5VLdataset_get(prev, file_obj->under_vol_id, &g, H5P_DATASET_XFER_DEFAULT, NULL) < 0)
+        goto done;
+    type      = g.args.get_type.type_id;
+    g.op_type = H5VL_DATASET_GET_SPACE;
+    if (H5VLdataset_get(prev, file_obj->under_vol_id, &g, H5P_DATASET_XFER_DEFAULT, NULL) < 0)
+        goto done;
+    space = g.args.get_space.space_id;
+    if ((rank = H5Sget_simple_extent_dims(space, dims, NULL)) < 0 ||
+        (vspace = rank == 0 ? H5Screate(H5S_SCALAR) : H5Screate_simple(rank, dims, NULL)) < 0 ||
+        H5Sselect_all(space) < 0)
+        goto done;
+    {
+        size_t o = (size_t)snprintf(src, sizeof(src), "/step/%llu", (unsigned long long)r);
+
+        H5VL__stream_vds_escape(src + o, sizeof(src) - o, parent_path);
+    }
+    if ((dcpl = H5Pcreate(H5P_DATASET_CREATE)) < 0 || H5Pset_virtual(dcpl, vspace, ".", src, space) < 0)
+        goto done;
+    {
+        /* its parent group under /step/<n>/, which this step may not have */
+        const char *slash = strrchr(full_parent, '/');
+
+        if (slash && slash != full_parent) {
+            void *grp;
+
+            snprintf(name, sizeof(name), "%.*s", (int)(slash - full_parent), full_parent);
+            if (NULL == (grp = H5VL__stream_replay_ensure_group(file_obj->under_object, file_obj->under_vol_id,
+                                                                name)))
+                goto done;
+            H5VLgroup_close(grp, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+        }
+    }
+    alias = H5VLdataset_create(file_obj->under_object, &loc, file_obj->under_vol_id, full_parent,
+                               H5P_LINK_CREATE_DEFAULT, type, vspace, dcpl, H5P_DATASET_ACCESS_DEFAULT,
+                               H5P_DATASET_XFER_DEFAULT, NULL);
+
+done:
+    H5VLdataset_close(prev, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+    if (dcpl >= 0)
+        H5Pclose(dcpl);
+    if (vspace >= 0)
+        H5Sclose(vspace);
+    if (space >= 0)
+        H5Sclose(space);
+    if (type >= 0)
+        H5Tclose(type);
+    return alias;
+} /* end H5VL__stream_replay_alias_dataset() */
+
 /*-------------------------------------------------------------------------
  * Function:    H5VL__stream_replay_manifest
  *
@@ -6783,7 +6868,6 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                     }
                     snprintf(full_parent, full_parent_len, "%s%s", step_root, parent_path);
                 }
-                free(parent_path);
 
                 memset(&loc_params, 0, sizeof(loc_params));
                 loc_params.obj_type                     = H5I_FILE;
@@ -6816,6 +6900,20 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                 }
 
                 if (!attr) {
+                    /* A dataset this step did not write: alias its last copy
+                     * rather than make a group of its name. */
+                    void *alias =
+                        H5VL__stream_replay_alias_dataset(file_obj, parent_path, full_parent, physical_step);
+
+                    if (alias) {
+                        attr = H5VLattr_create(file_obj->under_object, &loc_params, file_obj->under_vol_id,
+                                               at + 1, dtype, dspace,
+                                               ddcpl >= 0 ? ddcpl : H5P_ATTRIBUTE_CREATE_DEFAULT,
+                                               H5P_ATTRIBUTE_ACCESS_DEFAULT, H5P_DATASET_XFER_DEFAULT, NULL);
+                        H5VLdataset_close(alias, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
+                    }
+                }
+                if (!attr) {
                     void *grp = H5VL__stream_replay_ensure_group(file_obj->under_object,
                                                                    file_obj->under_vol_id, full_parent);
                     if (grp) {
@@ -6826,6 +6924,7 @@ H5VL__stream_replay_manifest(H5VL_stream_t *file_obj, const uint8_t *manifest_bu
                         H5VLgroup_close(grp, file_obj->under_vol_id, H5P_DATASET_XFER_DEFAULT, NULL);
                     }
                 }
+                free(parent_path);
                 free(full_parent);
 
                 if (!attr) {

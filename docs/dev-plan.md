@@ -1356,6 +1356,13 @@ matches the code. Each item is documented for users in
   a time: CI hung. It now starts at the first row the push's range reaches,
   stops past its end, and takes a block spanning every trailing dimension
   as one run.
+- **An attribute-only step shows a dataset natively, not a group.** An
+  attribute written in a step that does not write its dataset had no copy of
+  the dataset in `/step/<n>/` to attach to, so replay made a group of that
+  name, and a native reader found a group where the dataset should be. Replay
+  now makes `/step/<n>/<path>` a virtual dataset mapping all of the dataset's
+  last written copy, `/step/<r>/<path>`, and attaches the attribute to that.
+  Group parents (`/entry@NX_class`) still get a group. `t_step_rewrite`.
 - **A writer that exits mid-step no longer crashes, or loses committed
   steps.** Returning with a step open and a dataset from it unclosed crashed
   as HDF5 shut down: the connector's `H5atclose()` callback closed the
@@ -1425,11 +1432,6 @@ the one list. ★ marks what is being worked on next.
   subscriber after one timeout would lose a slow-but-alive reader's data. A
   writer that leaves before any step or answer reaches a reader is not
   recognised as the end of the stream.
-- An attribute written in a step that does not write its dataset is held on a
-  group of that name under `/step/<n>/`. Reads through the connector are
-  correct; only a native view of the step sees a group (user guide §2.3). A
-  virtual dataset mapped onto the last real copy would make the native view
-  right too.
 - Error-stack coverage is complete for the step API's reachable failures,
   not yet for every interior helper of the object callbacks (dataset,
   attribute and group creation and I/O), which still mostly rely on HDF5's

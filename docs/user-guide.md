@@ -414,13 +414,10 @@ Stated plainly so you can plan around them:
 - **An attribute written in a step where its dataset is not, seen natively.** A
   step's copy of an attribute is attached to that step's copy of its parent
   under `/step/<n>/`. If the parent is a dataset from an earlier step that this
-  step does not write, replay has no copy of it and holds the attribute on a
-  *group* of that name. Reading through the connector is unaffected: at that
-  step `/T` resolves to the dataset's last written copy, and its attribute to
-  this step's value. Only a native look at `/step/<n>/` (h5dump, `H5Oopen()` by
-  the physical path) finds a group where the dataset would be. (Writing the
-  attribute *before* the dataset in the same step used to lose the step; replay
-  now does a step's attributes last, `test/t_step_rewrite.c`.)
+  step does not write, `/step/<n>/<path>` is a virtual dataset over the
+  dataset's last written copy, carrying this step's attribute. A native reader
+  sees the right data and the new attribute. The data is not copied, so the
+  alias follows that earlier copy.
 - **A subscriber is invisible to the queue policy unless it acks.** The
   policies act on acks. A reader advancing with `H5Fbegin_step()` acks
   automatically; a subscriber that reads through
