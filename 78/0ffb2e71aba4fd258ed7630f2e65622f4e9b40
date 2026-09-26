@@ -1,0 +1,42 @@
+src/tr_diaspora.cpp
+  s_3816fb7b7c4a27::t_cf013cdb3d86b2 1378-1384
+test/t_backfill.c
+  s_3816fb7b7c4a27::t_809bc5d3168c2d 18-21,69-80,84-85,88,104,109,111,117,127,141,174-180,201-208,228,230-234,248-258,265,277,287,295
+python/_volstream.c
+  s_3816fb7b7c4a27::t_41dc0a18202864 338,342-344,367-369,1102-1145,1149-1150
+src/tr_mercury.h
+  s_3816fb7b7c4a27::t_6c87e6a3995e33 318-323
+python/tests/test_stream.py
+  s_3816fb7b7c4a27::t_878bd327d07b23 46-49,479,481-483,500-504
+docs/python-plan.md
+  s_3816fb7b7c4a27::t_19f62b50e28ffc 445-452
+src/tr_mercury.c
+  s_3816fb7b7c4a27::t_6c87e6a3995e33 3976-3992
+  s_3816fb7b7c4a27::t_10e96cc902b440 3975
+python/volstream/_file.py
+  s_3816fb7b7c4a27::t_c111b4bef4f30d 96-101,103-104,112,117,151-154,407-408,411-412,465-466,485-486
+python/tests/stream_writer.c
+  s_3816fb7b7c4a27::t_878bd327d07b23 197-203,209-210,212-213,225-229,237-239
+docs/dev-plan.md
+  s_3816fb7b7c4a27::t_19f62b50e28ffc 1359-1369,1444-1445,1484-1485
+docs/user-guide.md
+  s_3816fb7b7c4a27::t_b91beb184f022f 383-386
+src/H5VLstream.c
+  s_3816fb7b7c4a27::t_ff6e4434e98fb8 12763-12837,12850-12851,12916-12927
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "780ffb2e71aba4fd258ed7630f2e65622f4e9b40",
+  "prompts": {},
+  "sessions": {
+    "s_3816fb7b7c4a27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3b5b5c72-aca3-496b-8412-0fb9ae85948c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "M. Scot Breitenfeld <brtnfld@hdfgroup.org>"
+    }
+  }
+}
