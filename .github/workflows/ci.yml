@@ -413,10 +413,9 @@ jobs:
       # dependencies are the unsanitized builds above. Leak detection is off,
       # since Mercury and Margo keep allocations for the life of the process;
       # the Python tests are left out, since the interpreter would need
-      # libasan preloaded. Non-blocking until a run shows ASan and Argobots'
-      # ucontext stack switching get along without false positives.
-      - name: Build with the transport and AddressSanitizer, and test (non-blocking for now)
-        continue-on-error: true
+      # libasan preloaded. Its first run was clean (68/68, no reports), so
+      # ASan and Argobots' ucontext stack switching get along here: it gates.
+      - name: Build with the transport and AddressSanitizer, and test
         run: |
           export PKG_CONFIG_PATH=$HOME/mochi-install/lib/pkgconfig:$HOME/mochi-install/lib64/pkgconfig:$PKG_CONFIG_PATH
           cmake -S . -B build-asan -G Ninja \
