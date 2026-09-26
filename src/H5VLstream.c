@@ -556,6 +556,7 @@ static void  H5VL__stream_pending_entry_clear(H5VL_stream_pending_entry_t *e);
 static void  H5VL__stream_pending_discard_all(H5VL_stream_file_state_t *fs);
 static char *H5VL__stream_child_path(const char *parent_path, const char *name);
 static char *H5VL__stream_attr_path(const char *parent_path, const char *name);
+static char *H5VL__stream_abs_path(const char *base, const char *name);
 static void  H5VL__stream_note_group_attr(const struct H5VL_stream_t *o, const H5VL_loc_params_t *loc_params,
                                           const char *name);
 static void  H5VL__stream_fold_group_attrs(H5VL_stream_file_state_t *fs);
@@ -14731,6 +14732,25 @@ H5VL_stream_link_specific(void *obj, const H5VL_loc_params_t *loc_params,
 #ifdef ENABLE_STREAM_LOGGING
     printf("------- VOL-STREAM LINK Specific\n");
 #endif
+
+    /* A step reader asking whether a logical path exists: an object the
+     * stream carries lives under /step/<k>/, not at its logical path, so
+     * answer from the path index as opens resolve (a dataset, an
+     * attribute's object, a link). Anything else -- a live group -- is asked
+     * of the file. */
+    if (args->op_type == H5VL_LINK_EXISTS && o->file_state && o->file_state->step_state == H5F_STEP_READING &&
+        o->path && loc_params->type == H5VL_OBJECT_BY_NAME) {
+        char    *path = H5VL__stream_abs_path(o->path, loc_params->loc_data.loc_by_name.name);
+        uint64_t r;
+        int      found = path && H5VL__stream_path_index_resolve(o->file_state, path, o->file_state->current_step,
+                                                                 &r) >= 0;
+
+        free(path);
+        if (found) {
+            *args->args.exists.exists = true;
+            return 0;
+        }
+    }
 
     ret_value = H5VLlink_specific(o->under_object, loc_params, o->under_vol_id, args, dxpl_id, req);
 

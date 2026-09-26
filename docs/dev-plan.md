@@ -1356,6 +1356,11 @@ matches the code. Each item is documented for users in
   a time: CI hung. It now starts at the first row the push's range reaches,
   stops past its end, and takes a block spanning every trailing dimension
   as one run.
+- **A step reader's `H5Lexists()` resolves to the step.** It passed through
+  to the live namespace, where an object the stream carries does not live,
+  so it answered false for everything the step had. It now answers from the
+  path index as opens resolve, and asks the file only for what the stream
+  does not carry (a live group). `t_links`.
 - **Links made in a step go into the stream.** A NeXus writer links
   `/entry/data/data` to its detector dataset in the step that creates it.
   That went to the live namespace, where the target does not exist (a
@@ -1470,11 +1475,6 @@ the one list. ★ marks what is being worked on next.
   attribute and group creation and I/O), which still mostly rely on HDF5's
   own frames.
 - No fault tolerance for a rank failure inside a collective commit.
-- A step reader's link queries are not resolved to the step. `H5Lexists()`
-  on a logical path returns false even for an object the step has, because
-  the connector translates opens (`H5Dopen2()`, `H5Aopen()`) to
-  `/step/<k>/` but passes link queries through to the live namespace.
-  Found while writing `t_failed_replay`, which opens instead.
 - Writer and reader cannot cross an HDF5 major.minor boundary.
 
 **Configuration and release**

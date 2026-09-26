@@ -135,7 +135,7 @@ main(void)
 {
     H5VL_stream_config_t cfg;
     hid_t                fapl, nf, rf;
-    int                  s, want[3] = {100, 200, 200}, ok = 1;
+    int                  s, want[3] = {100, 200, 200}, ok = 1, exists_ok = 1;
 
     printf("vol-stream: links made in a step go into the stream\n");
     unlink(FNAME);
@@ -181,8 +181,17 @@ main(void)
             printf("  FAIL  a reader at step %d opened /entry/data/data and got %d, expected %d\n", s, got, want[s]);
             ok = 0;
         }
+        /* H5Lexists() resolves to the step as opens do: /other exists from
+         * step 2 only; the link, the dataset and the live group throughout. */
+        if (H5Lexists(rf, "/entry/data/data", H5P_DEFAULT) <= 0 || H5Lexists(rf, DET, H5P_DEFAULT) <= 0 ||
+            H5Lexists(rf, "/entry/data", H5P_DEFAULT) <= 0 ||
+            (H5Lexists(rf, "/other", H5P_DEFAULT) > 0) != (s == 2)) {
+            printf("  FAIL  at step %d a reader's H5Lexists() answers wrongly\n", s);
+            exists_ok = 0;
+        }
     }
     CHECK(ok, "a connector reader opening /entry/data/data gets frame 0, 1, 1 at steps 0, 1, 2");
+    CHECK(exists_ok, "and its H5Lexists() resolves to the step too (/other only from step 2)");
     H5Fclose(rf);
     H5Pclose(fapl);
     unlink(FNAME);

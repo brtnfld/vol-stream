@@ -130,8 +130,7 @@ main(void)
     {
         hid_t e, d;
 
-        /* H5Dopen2(), not H5Lexists(): a step reader resolves opens to the
-         * step, but not link queries (dev-plan.md). */
+        /* An open, the strictest check: it must reach a real object. */
         H5E_BEGIN_TRY
         {
             e = H5Dopen2(fid, "/e", H5P_DEFAULT);
